@@ -1,0 +1,37 @@
+{
+  "$comment": "omp example: four tool profiles, skills hinted, Laya on a shared GPU host. Copy to ~/.omp/loadout.json.",
+  "backend": "laya",
+  "laya": {
+    "transport": "http",
+    "endpoint": "https://gpu-host.internal/v1/systemone",
+    "apiKeyEnvVar": "LAYA_ENDPOINT_TOKEN",
+    "timeoutMs": 4000
+  },
+  "tools": {
+    "question": {
+      "type": "choice",
+      "instructions": "Which tools does an AI coding agent need to handle this request?",
+      "criteria": {
+        "answer": "explain, review, or answer a question about code; nothing is changed or executed",
+        "research": "look something up on the web or in documentation",
+        "edit": "change files directly; no commands, tests, or builds need to run",
+        "full": "run commands, tests, builds, git, subagents, or anything not covered above"
+      }
+    },
+    "profiles": {
+      "answer": ["read", "grep", "glob", "lsp"],
+      "research": ["read", "grep", "glob", "web_search"],
+      "edit": ["read", "grep", "glob", "lsp", "edit", "write", "ast_edit"],
+      "full": "*"
+    },
+    "alwaysOn": ["todo"],
+    "confidenceThreshold": 0.6
+  },
+  "skills": {
+    "mode": "hint",
+    "threshold": 0.6,
+    "maxSkills": 3,
+    "alwaysInclude": [],
+    "exclude": []
+  }
+}
