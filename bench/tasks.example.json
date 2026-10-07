@@ -1,0 +1,27 @@
+[
+  {
+    "id": "explain-entrypoint",
+    "prompt": "Where does this project start executing, and what happens on startup? Answer briefly; do not change any files.",
+    "check": "git diff --quiet"
+  },
+  {
+    "id": "find-usages",
+    "prompt": "List every place that reads environment variables, with file and line.",
+    "check": "git diff --quiet"
+  },
+  {
+    "id": "small-edit",
+    "prompt": "Add a short 'Development' section to README.md explaining how to run the tests.",
+    "check": "grep -qi 'development' README.md"
+  },
+  {
+    "id": "fix-failing-test",
+    "prompt": "Run the test suite and fix whatever is failing. Do not skip or delete tests.",
+    "check": "npm test"
+  },
+  {
+    "id": "skill-shaped",
+    "prompt": "Review the current changes for bugs and summarize them.",
+    "check": "git diff --quiet"
+  }
+]

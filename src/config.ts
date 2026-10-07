@@ -3,6 +3,8 @@
  *
  * Search order is project before global, JSON before YAML:
  *   <cwd>/.omp/loadout.{json,yml,yaml}, then ~/.omp/loadout.{json,yml,yaml}
+ * `LOADOUT_CONFIG=<file>` replaces the search with that one file, which lets
+ * a benchmark or CI run pin each session's config from outside the project.
  *
  * Project files are read only when the host trusts the project: a config picks
  * the executable the Laya sidecar runs and the endpoint that receives prompts,
@@ -86,7 +88,7 @@ export function defaultConfig(): LoadoutConfig {
 
 export interface ConfigSource {
   path: string;
-  scope: "project" | "global";
+  scope: "project" | "global" | "explicit";
 }
 
 export interface LoadResult {
@@ -102,6 +104,8 @@ export interface LoadOptions {
   home?: string;
   /** YAML parser; defaults to `Bun.YAML.parse` when running on Bun. */
   parseYaml?: ((text: string) => unknown) | null;
+  /** Load exactly this file instead of searching (from `LOADOUT_CONFIG`). */
+  explicitPath?: string;
 }
 
 function bunYaml(): ((text: string) => unknown) | null {
@@ -123,8 +127,14 @@ export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
   const warnings: string[] = [];
   const projectIsHome = path.resolve(cwd) === path.resolve(home);
 
-  for (const source of configCandidates(cwd, home)) {
-    if (!fs.existsSync(source.path)) continue;
+  const candidates: ConfigSource[] = options.explicitPath
+    ? [{ path: path.resolve(options.explicitPath), scope: "explicit" }]
+    : configCandidates(cwd, home);
+  for (const source of candidates) {
+    if (!fs.existsSync(source.path)) {
+      if (source.scope === "explicit") errors.push(`${source.path}: LOADOUT_CONFIG names a file that does not exist`);
+      continue;
+    }
     if (source.scope === "project" && (projectIsHome || !options.projectTrusted)) {
       if (!projectIsHome) warnings.push(`${source.path}: ignored because this project is not trusted`);
       continue;

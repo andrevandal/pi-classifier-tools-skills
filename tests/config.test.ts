@@ -96,3 +96,19 @@ test("unknown keys warn, $ keys are annotations", () => {
   assert.deepEqual(errors, []);
   assert.deepEqual(warnings, ['unknown key "skils" (ignored)', 'unknown key "tools.treshold" (ignored)']);
 });
+
+test("an explicit path replaces the search, and a missing one is an error", () => {
+  const { home, project } = tempDirs();
+  write(home, "loadout.json", { dryRun: true });
+  const explicit = path.join(project, "arm.json");
+  fs.writeFileSync(explicit, JSON.stringify({ notify: false }));
+
+  const found = loadConfig(project, { projectTrusted: true, home, explicitPath: explicit });
+  assert.equal(found.source, explicit);
+  assert.equal(found.config.notify, false);
+  assert.equal(found.config.dryRun, false);
+
+  const missing = loadConfig(project, { projectTrusted: true, home, explicitPath: path.join(project, "nope.json") });
+  assert.equal(missing.source, null);
+  assert.match(missing.errors.join("\n"), /LOADOUT_CONFIG/);
+});

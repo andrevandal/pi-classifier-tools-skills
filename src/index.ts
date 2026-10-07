@@ -157,7 +157,7 @@ function ensureSession(ctx: ExtensionContext): SessionState {
   const existing = sessions.get(key);
   if (existing && existing.cwd === ctx.cwd && existing.projectTrusted === projectTrusted) return existing;
 
-  const result = loadConfig(ctx.cwd, { projectTrusted });
+  const result = loadConfig(ctx.cwd, { projectTrusted, explicitPath: process.env.LOADOUT_CONFIG || undefined });
   for (const error of result.errors) notify(ctx, result.config, `config error: ${error}`, "error");
   for (const warning of result.warnings) notify(ctx, result.config, `config warning: ${warning}`, "warning");
 

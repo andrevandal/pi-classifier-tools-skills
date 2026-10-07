@@ -8,16 +8,33 @@
   "engines": {
     "node": ">=22.18"
   },
-  "keywords": ["pi-package", "omp-extension", "pi-extension", "jev", "laya", "tools", "skills"],
+  "keywords": [
+    "pi-package",
+    "omp-extension",
+    "pi-extension",
+    "jev",
+    "laya",
+    "tools",
+    "skills"
+  ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
-  "files": ["src", "python", "examples", "README.md"],
+  "files": [
+    "src",
+    "python",
+    "examples",
+    "README.md"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.ts",
     "lint": "biome check .",
-    "format": "biome format --write ."
+    "format": "biome format --write .",
+    "bench": "node scripts/bench.ts",
+    "decisions": "node scripts/decisions.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

@@ -121,6 +121,9 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `skills.alwaysInclude` | `[]` | always selected, never asked about |
 | `skills.exclude` | `[]` | never asked about, never hidden |
 
+Set `LOADOUT_CONFIG=/path/to/file.json` to use exactly that file and skip the
+search, e.g. to pin one session's config from outside the project.
+
 The `jev` and `laya` sections are the same as in pi-classifier-router (endpoint,
 token variable, timeouts, local sidecar or HTTP transport).
 
@@ -170,6 +173,77 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
   text (clipped to `maxPromptChars`) and skill names and descriptions are sent
   to TypeSafe.
 
+## Benchmarking
+
+Does selection actually help on *your* work? Two scripts answer that from the
+session transcripts omp already writes.
+
+### A/B benchmark: `npm run bench`
+
+Runs the same tasks headless (`omp -p`) in two git worktrees of your project:
+
+| arm | config | purpose |
+| --- | --- | --- |
+| `loadout` | your config | the plugin selects tools and skills |
+| `control` | your config + `dryRun: true` | classifies and records, changes nothing |
+
+Both arms pay the classifier's overhead, so differences come from the selection
+itself. Each arm gets its config through `LOADOUT_CONFIG` (so the worktrees stay
+clean). It also runs in its own folder, so `omp stats` shows the arms separately.
+
+```bash
+cp bench/tasks.example.json my-tasks.json    # then write tasks from your real work
+npm run bench -- --repo ~/code/my-project --tasks my-tasks.json --model <model> --runs 2 --setup "npm ci"
+```
+
+A task is `{ "id", "prompt", "check"? }`. `check` runs in the worktree after the
+agent finishes, and exit 0 counts as a pass, e.g. `npm test`, or `git diff --quiet`
+for "should not have changed anything". Before every run the worktree is reset
+to `--ref` (`git reset --hard` + `git clean -fd`; ignored files such as
+`node_modules` are kept). The arm that goes first alternates per task.
+
+Output in `bench-results/<timestamp>/`:
+
+- `summary.md`: pass rate, cost, input tokens, cache rate, requests, errors,
+  tool calls and wall time per arm and per task, plus `loadout vs control`
+  deltas.
+- `results.jsonl`: one row per run, including the chosen profile, confidence,
+  selected skills and classifier latency.
+- `logs/`: agent output and check output per run.
+
+How to read it:
+
+| result | meaning |
+| --- | --- |
+| lower cost and input, same pass rate | selection helps |
+| lower input, but flat cost and lower cache rate | tool churn is breaking the prompt cache; use fewer, broader profiles |
+| lower pass rate | wrong narrowing; raise `tools.confidenceThreshold` or fix the profiles |
+| no difference | selection rarely acts; check confidence with `npm run decisions` |
+
+Limits: use `--runs 2` or more, since LLM runs vary. Each run is a fresh
+single-prompt session, so this understates the cache cost of changing tools
+mid-conversation; compare a few long interactive sessions too. Subagents that
+omp writes outside its sessions directory are not counted.
+
+### Decision report: `npm run decisions`
+
+Summarizes every `loadout.decision` entry: profile distribution, confidence
+p10/p50/p90, low-confidence rate, selected skills and classifier latency.
+Useful on your normal day-to-day sessions, or on one benchmark arm:
+
+```bash
+npm run decisions -- --since 7d
+npm run decisions -- --folder wt-control --json
+```
+
+### `omp stats`
+
+`omp stats` (dashboard) or `omp stats --json` breaks cost, tokens, cache rate
+and errors down by folder, so the two benchmark worktrees appear as two rows.
+It does not know about loadout decisions or task success, and its tool-usage
+view is per tool and model rather than per folder. The scripts above cover
+those.
+
 ## What has been tested
 
 | Path | omp 18.6.1 | pi 0.87.1 |
@@ -200,6 +274,7 @@ npm run lint
 | `src/select.ts` | pure logic: questions, tool/skill decisions, prompt clipping |
 | `src/config.ts` | discovery, trust gate, validation, defaults |
 | `src/classify/*`, `python/` | Jev/Laya clients and the Laya worker (from pi-classifier-router) |
+| `scripts/bench.ts`, `scripts/decisions.ts` | A/B benchmark and decision report over session transcripts |
 
 ## License
 
