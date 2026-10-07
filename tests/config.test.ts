@@ -26,10 +26,15 @@ test("no file means the defaults", () => {
   assert.deepEqual(result.config, defaultConfig());
 });
 
+test("Laya's local sidecar is the default backend", () => {
+  assert.equal(defaultConfig().backend, "laya");
+  assert.equal(defaultConfig().laya.transport, "python");
+});
+
 test("sections merge over the defaults", () => {
-  const { config, errors } = parseConfig({ backend: "laya", skills: { maxSkills: 2 }, dryRun: true });
+  const { config, errors } = parseConfig({ backend: "jev", skills: { maxSkills: 2 }, dryRun: true });
   assert.deepEqual(errors, []);
-  assert.equal(config.backend, "laya");
+  assert.equal(config.backend, "jev");
   assert.equal(config.skills.maxSkills, 2);
   assert.equal(config.skills.threshold, defaultConfig().skills.threshold);
   assert.equal(config.dryRun, true);

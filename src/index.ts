@@ -60,6 +60,8 @@ interface SessionState {
   /** What this extension last activated, to notice changes made by anyone else. */
   lastApplied: string[] | null;
   lastDecision: (LoadoutDecision & { latencyMs: number }) | null;
+  /** Last failure already reported; repeats stay quiet until a turn succeeds. */
+  lastFailure: string | null;
 }
 
 interface SharedClassifier {
@@ -173,6 +175,7 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     baseline: existing?.baseline ?? null,
     lastApplied: existing?.lastApplied ?? null,
     lastDecision: existing?.lastDecision ?? null,
+    lastFailure: null,
   };
   sessions.set(key, state);
   // Start Laya's multi-second weight load now rather than on the first prompt.
@@ -281,6 +284,7 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     };
     const latencyMs = Date.now() - startedAt;
     state.lastDecision = { ...decision, latencyMs };
+    state.lastFailure = null;
 
     pi.appendEntry(DECISION_ENTRY, { ...decision, backend: config.backend, dryRun: config.dryRun, latencyMs });
     notify(ctx, config, `${config.dryRun ? "(dry run) " : ""}${summarize(decision, baseline.length)}`, "info");
@@ -304,14 +308,17 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     if (!state) return;
     const reason =
       error instanceof ClassifierError
-        ? `classification failed (${error.code})`
+        ? `classification failed (${error.code}): ${error.message}`
         : `selection error: ${errorText(error)}`;
-    notify(
-      ctx,
-      state.config,
-      `${reason}; using the full loadout`,
-      error instanceof ClassifierError ? "warning" : "error",
-    );
+    if (reason !== state.lastFailure) {
+      state.lastFailure = reason;
+      notify(
+        ctx,
+        state.config,
+        `${reason}; using the full loadout until it recovers`,
+        error instanceof ClassifierError ? "warning" : "error",
+      );
+    }
     try {
       await restoreBaseline(pi, state);
     } catch {

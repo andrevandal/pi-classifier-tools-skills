@@ -31,7 +31,7 @@ let sessionCounter = 0;
 function writeConfig(config: Record<string, unknown>): void {
   const endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/systemone`;
   const file = path.join(home, ".omp", "loadout.json");
-  fs.writeFileSync(file, JSON.stringify({ ...config, jev: { endpoint, apiKeyEnvVar: TOKEN_VAR } }));
+  fs.writeFileSync(file, JSON.stringify({ backend: "jev", ...config, jev: { endpoint, apiKeyEnvVar: TOKEN_VAR } }));
 }
 
 before(async () => {
@@ -198,5 +198,21 @@ test("/loadout off restores the baseline and stops classifying", async () => {
 
   await host.prompt("explain that");
   assert.equal(requests.length, 1);
+  host.shutdown();
+});
+
+test("a failure that repeats is reported once, and again after a recovery", async () => {
+  const host = fakeHost("pi");
+  reply = { status: 500, answers: {} };
+  await host.prompt("one");
+  await host.prompt("two");
+  const failures = () => host.notes.filter((note) => note.includes("classification failed")).length;
+  assert.equal(failures(), 1);
+
+  reply = { status: 200, answers: {} };
+  await host.prompt("three");
+  reply = { status: 500, answers: {} };
+  await host.prompt("four");
+  assert.equal(failures(), 2);
   host.shutdown();
 });

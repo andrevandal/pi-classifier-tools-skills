@@ -26,7 +26,7 @@ const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "glob", "lsp", "web_searc
 export function defaultConfig(): LoadoutConfig {
   return {
     enabled: true,
-    backend: "jev",
+    backend: "laya",
     jev: {
       endpoint: "https://api.typesafe.ai/v1/systemone",
       model: "jev-latest",

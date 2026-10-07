@@ -1,0 +1,16 @@
+{
+  "name": "andrevandal",
+  "owner": { "name": "andrevandal" },
+  "metadata": { "description": "omp plugins by andrevandal" },
+  "plugins": [
+    {
+      "name": "pi-classifier-tools-skills",
+      "source": "./",
+      "description": "Classifier-driven tool and skill selection with Laya (local) or Jev (TypeSafe)",
+      "version": "0.1.0",
+      "repository": "https://github.com/andrevandal/pi-classifier-tools-skills",
+      "license": "MIT",
+      "keywords": ["laya", "jev", "tools", "skills", "classifier"]
+    }
+  ]
+}

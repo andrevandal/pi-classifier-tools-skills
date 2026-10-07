@@ -1,8 +1,8 @@
 # pi-classifier-tools-skills
 
 An extension for **Oh My Pi (omp)** and **pi** that uses a System-One classifier
-(**Jev** from TypeSafe, or **Laya**) to choose the **tools** and **skills** the
-model gets on each turn.
+(**Laya** by default, running locally, or **Jev** from TypeSafe) to choose the
+**tools** and **skills** the model gets on each turn.
 
 Before each turn, the prompt is classified once:
 
@@ -21,7 +21,7 @@ flowchart LR
   P[prompt] --> S{slash command,<br/>empty, or disabled?}
   S -- yes --> B[restore baseline tools]
   S -- no --> Q[build questions<br/>tool_profile + skill:*]
-  Q --> C[Jev / Laya]
+  Q --> C[Laya / Jev]
   C -- error / timeout --> B
   C --> D[decide<br/>pure, no I/O]
   D --> T[setActiveTools<br/>subset of baseline]
@@ -43,20 +43,40 @@ flowchart LR
 
 ## Quick start
 
-```bash
-omp install /path/to/pi-classifier-tools-skills      # omp
-pi install /path/to/pi-classifier-tools-skills       # pi
-omp -e /path/to/pi-classifier-tools-skills/src/index.ts   # one run, no install
+1. **Install the plugin.** This repository is also an omp marketplace:
 
-export TYPESAFE_API_KEY=...    # default backend is Jev
-```
+   ```bash
+   omp plugin marketplace add andrevandal/pi-classifier-tools-skills
+   omp plugin install pi-classifier-tools-skills@andrevandal
+   ```
 
-Start a new session (extensions load at session start), then run `/loadout status`.
-To see what it would choose before letting it act, add `"dryRun": true` to the config.
+   Or from a checkout:
+
+   ```bash
+   omp plugin install /path/to/pi-classifier-tools-skills   # omp
+   pi install /path/to/pi-classifier-tools-skills           # pi
+   omp -e /path/to/pi-classifier-tools-skills/src/index.ts  # one run, no install
+   ```
+
+2. **Install Laya** (the default backend). It runs as a local Python sidecar, so
+   prompts never leave the machine. It needs Python 3.10+, and the first run
+   downloads a multi-GB checkpoint from Hugging Face:
+
+   ```bash
+   pip install -r python/requirements.txt   # installs laya (and torch)
+   ```
+
+   Until Laya is installed, every turn keeps the full loadout and one warning
+   says why (`laya import failed: ModuleNotFoundError`). To use Jev instead, set
+   `"backend": "jev"` and `export TYPESAFE_API_KEY=...`.
+
+3. **Start a new session** (extensions load at session start) and run
+   `/loadout status`. To see what it would choose before letting it act, add
+   `"dryRun": true` to `~/.omp/loadout.json`.
+
+Upgrade a marketplace install with `omp plugin upgrade pi-classifier-tools-skills@andrevandal`.
 
 ## Host support
-
-Tested against **omp 18.6.1** and **pi 0.87.1**:
 
 | | omp | pi |
 | --- | --- | --- |
@@ -84,7 +104,7 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | key | default | meaning |
 | --- | --- | --- |
 | `enabled` | `true` | classify prompts at all |
-| `backend` | `"jev"` | `"jev"` or `"laya"` |
+| `backend` | `"laya"` | `"laya"` (local sidecar by default, or a shared host via `laya.transport: "http"`) or `"jev"` |
 | `dryRun` | `false` | classify and record, never change anything |
 | `notify` | `true` | show a one-line decision per turn; errors always show |
 | `maxPromptChars` | `8000` | longest prompt sent to the classifier (min 200; `null` = no limit) |
@@ -130,8 +150,9 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
 ## Trade-offs
 
 - **Latency.** One classifier round trip per turn, bounded by the backend's
-  `timeoutMs` (+250 ms guard). Jev is about 3 s worst case; Laya on a GPU is
-  tens of ms.
+  `timeoutMs` (+250 ms guard). Laya's sidecar costs roughly 200-460 ms per
+  prompt on CPU and tens of ms on a GPU, after a slow first weight load that
+  runs in the background at session start. Jev is a network call (3 s budget).
 - **Prompt cache.** Changing tools or skills changes the system prompt and tool
   list, which can invalidate the provider's cached prefix. Fewer, coarser
   profiles mean fewer changes. Nothing is called when the selection already
@@ -145,9 +166,24 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
   tune profiles against your real prompts.
 - **Laya accuracy.** Base checkpoints are close to chance on custom questions.
   Use Jev, or a Laya checkpoint fine-tuned on your question set.
-- **Privacy.** With Jev, prompt text (clipped to `maxPromptChars`) and skill
-  names and descriptions are sent to TypeSafe. Use the local Laya sidecar to keep
-  them on the machine.
+- **Privacy.** The default Laya sidecar keeps everything local. With Jev, prompt
+  text (clipped to `maxPromptChars`) and skill names and descriptions are sent
+  to TypeSafe.
+
+## What has been tested
+
+| Path | omp 18.6.1 | pi 0.87.1 |
+| --- | --- | --- |
+| Unit and end-to-end tests (`npm test`, fake host + stub server) | yes | yes |
+| Loaded with `-e src/index.ts`, real binary | yes | yes |
+| Installed from the `npm pack` tarball, no `-e` | yes | not yet |
+| Installed via `.omp-plugin/marketplace.json` (local clone) | yes | n/a |
+| Default config: Laya sidecar spawned, NDJSON round trip | yes, with a stand-in `laya` module | not yet |
+| Real Laya checkpoints | **not yet** | **not yet** |
+| Real Jev API | **not yet** | **not yet** |
+
+The model-quality question, whether a base Laya checkpoint picks good profiles
+and skills, is still open (see Trade-offs). Run with `dryRun: true` first.
 
 ## Development
 
