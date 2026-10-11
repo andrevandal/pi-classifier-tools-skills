@@ -120,10 +120,16 @@ export function metricsFor(files: string[]): UsageMetrics {
   return files.reduce(addFile, emptyMetrics());
 }
 
-/** Share of prompt tokens served from cache, as omp stats computes it. */
-export function cacheRate(metrics: Pick<UsageMetrics, "input" | "cacheRead">): number {
-  const prompt = metrics.input + metrics.cacheRead;
+/** Share of all prompt tokens read from cache; cache writes count as prompt tokens, not hits. */
+export function cacheRate(metrics: Pick<UsageMetrics, "input" | "cacheRead" | "cacheWrite">): number {
+  const prompt = metrics.input + metrics.cacheRead + metrics.cacheWrite;
   return prompt === 0 ? 0 : metrics.cacheRead / prompt;
+}
+
+/** Prompt tokens sent per model request, fresh and cached alike. */
+export function promptTokensPerRequest(metrics: UsageMetrics): number {
+  const prompt = metrics.input + metrics.cacheRead + metrics.cacheWrite;
+  return metrics.requests === 0 ? 0 : prompt / metrics.requests;
 }
 
 export function totalToolCalls(metrics: Pick<UsageMetrics, "toolCalls">): number {

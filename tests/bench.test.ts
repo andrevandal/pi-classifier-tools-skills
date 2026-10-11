@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cacheRate, metricsFor } from "../scripts/lib/sessions.ts";
+import { cacheRate, metricsFor, promptTokensPerRequest } from "../scripts/lib/sessions.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FAKE_OMP = path.join(ROOT, "tests", "fixtures", "fake-omp.mjs");
@@ -51,7 +51,7 @@ test("bench runs every task in both arms, resets worktrees, and summarizes", () 
   const result = runScript(
     "bench.ts",
     [
-      ...["--repo", ctx.repo, "--tasks", ctx.tasks, "--config", ctx.config, "--runs", "2"],
+      ...["--repo", ctx.repo, "--tasks", ctx.tasks, "--config", ctx.config, "--runs", "2", "--model", "fake"],
       ...["--omp", FAKE_OMP, "--sessions-dir", ctx.sessions, "--out", ctx.out],
     ],
     { FAKE_SESSIONS_DIR: ctx.sessions },
@@ -89,6 +89,8 @@ test("bench runs every task in both arms, resets worktrees, and summarizes", () 
   const summary = fs.readFileSync(path.join(ctx.out, "summary.md"), "utf8");
   assert.match(summary, /\| loadout \| 2\/4 \|/);
   assert.match(summary, /\| loadout vs control \| {2}\| -38\.1% \| -38\.1% \|/);
+  assert.match(summary, /## Selection/);
+  assert.match(summary, /\| accuracy/);
   assert.equal(spawnSync("git", ["-C", ctx.repo, "status", "--porcelain"], { encoding: "utf8" }).stdout, "");
 });
 
@@ -96,7 +98,11 @@ test("bench refuses to reuse a non-empty results directory", () => {
   const ctx = setup();
   fs.mkdirSync(ctx.out);
   fs.writeFileSync(path.join(ctx.out, "x"), "");
-  const result = runScript("bench.ts", ["--repo", ctx.repo, "--tasks", ctx.tasks, "--out", ctx.out], {});
+  const result = runScript(
+    "bench.ts",
+    ["--repo", ctx.repo, "--tasks", ctx.tasks, "--out", ctx.out, "--model", "fake"],
+    {},
+  );
   assert.equal(result.status, 1);
   assert.match(result.stderr, /not empty/);
 });
@@ -106,7 +112,7 @@ test("decisions reports profiles, failures and skills across sessions", () => {
   runScript(
     "bench.ts",
     [
-      ...["--repo", ctx.repo, "--tasks", ctx.tasks, "--config", ctx.config],
+      ...["--repo", ctx.repo, "--tasks", ctx.tasks, "--config", ctx.config, "--model", "fake"],
       ...["--omp", FAKE_OMP, "--sessions-dir", ctx.sessions, "--out", ctx.out],
     ],
     { FAKE_SESSIONS_DIR: ctx.sessions },
@@ -150,5 +156,26 @@ test("session metrics sum usage, tool calls and cache rate", () => {
     [1, 1, 100, 300, 1],
   );
   assert.deepEqual(metrics.toolCalls, { bash: 1 });
-  assert.equal(cacheRate(metrics), 0.75);
+  assert.equal(cacheRate(metrics), 300 / 405);
+  assert.equal(promptTokensPerRequest(metrics), 405);
+});
+
+test("bench refuses to run without --model, so the arms cannot differ in model", () => {
+  const ctx = setup();
+  const result = runScript("bench.ts", ["--repo", ctx.repo, "--tasks", ctx.tasks], {});
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--model is required/);
+});
+
+test("bench rejects an expect label that is not a profile id", () => {
+  const ctx = setup();
+  const labeled = path.join(ctx.dir, "labeled.json");
+  fs.writeFileSync(labeled, JSON.stringify([{ id: "q", prompt: "hi", expect: "nope" }]));
+  const result = runScript(
+    "bench.ts",
+    ["--repo", ctx.repo, "--tasks", labeled, "--config", ctx.config, "--model", "fake"],
+    {},
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /every expect must be a profile id/);
 });

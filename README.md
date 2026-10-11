@@ -196,7 +196,7 @@ cp bench/tasks.example.json my-tasks.json    # then write tasks from your real w
 npm run bench -- --repo ~/code/my-project --tasks my-tasks.json --model <model> --runs 2 --setup "npm ci"
 ```
 
-A task is `{ "id", "prompt", "check"? }`. `check` runs in the worktree after the
+A task is `{ "id", "prompt", "check"?, "expect"? }`. `check` runs in the worktree after the
 agent finishes, and exit 0 counts as a pass, e.g. `npm test`, or `git diff --quiet`
 for "should not have changed anything". `$BENCH_LOG` holds the agent's output,
 so a question can be graded too, e.g. ask for a final `ANSWER: ...` line and
@@ -206,9 +206,10 @@ to `--ref` (`git reset --hard` + `git clean -fd`; ignored files such as
 
 Output in `bench-results/<timestamp>/`:
 
-- `summary.md`: pass rate, cost, input tokens, cache rate, requests, errors,
-  tool calls and wall time per arm and per task, plus `loadout vs control`
-  deltas.
+- `summary.md`: a `## Selection` section (below), then pass rate, cost, input tokens, cache
+  rate, requests, errors, tool calls and wall time per arm and per task, plus `loadout vs control`
+  deltas. If a run has no usable decision, or the two arms chose different profiles for the
+  same prompt, the summary starts with `**INVALID**` and the script exits 2.
 - `results.jsonl`: one row per run, including the chosen profile, its risk, the classifier
   failure (if any), selected skills and classifier latency.
 - `logs/`: agent output and check output per run.
@@ -226,6 +227,16 @@ Limits: use `--runs 2` or more, since LLM runs vary. Each run is a fresh
 single-prompt session, so this understates the cache cost of changing tools
 mid-conversation; compare a few long interactive sessions too. Subagents that
 omp writes outside its sessions directory are not counted.
+
+**Selection** asks whether the selector chose well, apart from cost. `expect` is the
+profile a prompt needs (`answer`, `edit` or `full`); label it by hand from what the prompt
+requires. Accuracy scores the control arm's classifier choice against `expect`. Over-narrowed
+counts runs where the loadout applied a narrower profile than `expect`. Needed tool missing
+counts tools the control run used that the loadout's active set lacked. Prompt tokens per
+request compares the arms with a 95% bootstrap interval. The verdict is `PASS` only when no
+needed tool was missing, the loadout passed at least as many checks as control, and that
+interval lies below zero. Otherwise it reads `NOT PROVEN` with the reasons. Over-narrowing
+is reported but does not decide the verdict.
 
 ### Benchmarking with a warm Laya server
 

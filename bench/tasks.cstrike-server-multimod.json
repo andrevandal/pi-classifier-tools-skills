@@ -1,56 +1,67 @@
 [
   {
     "id": "q-bot-count",
+    "expect": "answer",
     "prompt": "With the default bot settings, a map starts with 3 humans on T and 1 human on CT. How many bots does each team get, and why? Point to the code that decides it. Do not change any files. End your reply with one line exactly in the form `ANSWER: T=<bots on T> CT=<bots on CT>`; if it depends on something random, give either valid outcome.",
     "check": "test -z \"$(git status --porcelain)\" && grep -Eq 'ANSWER: T=(4 CT=5|3 CT=6)' \"$BENCH_LOG\""
   },
   {
     "id": "q-drain-timings",
+    "expect": "answer",
     "prompt": "What happens, step by step, when the cstrike container receives SIGTERM during a match? Cite the files involved. Do not change any files. End your reply with one line exactly in the form `ANSWER: countdown=<seconds of the final restart countdown> maxwait=<seconds the drain waits for a vote result before exiting>`.",
     "check": "test -z \"$(git status --porcelain)\" && grep -Eq 'ANSWER: countdown=10 maxwait=300' \"$BENCH_LOG\""
   },
   {
     "id": "q-prefix-flow",
+    "expect": "answer",
     "prompt": "Explain how the map prefix selects the game mode: trace what happens from a map load to which plugins and cvars end up active, and why mode cvars must also be reset in the baseline config. Do not change any files.",
     "check": "test -z \"$(git status --porcelain)\""
   },
   {
     "id": "e-vampire-cvar-descriptions",
+    "expect": "edit",
     "prompt": "The three cvars in nostalgia_vampire.sma have no .description, unlike armoury_respawn_time in nostalgia_armoury_respawn.sma. Add a short .description to each of the three, in the same style. Change nothing else.",
     "check": "f=server/plugins/addons/amxmodx/scripting/nostalgia_vampire.sma; test \"$(grep -c '\\.description' $f)\" -ge 3 && test -z \"$(git status --porcelain -- . \":!$f\")\""
   },
   {
     "id": "e-add-de-nuke",
+    "expect": "edit",
     "prompt": "Add the stock map de_nuke to the desired map rotation, right after de_aztec. It ships with HLDS, so no download entry is needed.",
-    "check": "f=server/cstrike/mapcycle.all.txt; sed -n '/^de_aztec$/{n;p;}' $f | grep -qx de_nuke && test -z \"$(git status --porcelain -- . \":!$f\")\""
+    "check": "f=server/cstrike/mapcycle.all.txt; sed -n '/^de_aztec$/{n;p;}' $f | grep -qx de_nuke && test -z \"$(git status --porcelain -- . \":!$f\" \":!server/cstrike/addons/amxmodx/configs/maps.ini\")\""
   },
   {
     "id": "e-floor-roundtime",
+    "expect": "edit",
     "prompt": "Change the round time on the floor-weapon modes (fy_, aim_ and awp_ maps) from 1.5 to 2.5 minutes. Follow the repo's conventions, including keeping the docs in step.",
     "check": "d=server/cstrike/addons/amxmodx/configs/maps; for p in fy aim awp; do grep -qx 'mp_roundtime 2.5' $d/prefix_$p.cfg || exit 1; done; grep -q '2.5 min rounds' docs/ARCHITECTURE.md && ! grep -q '1.5 min rounds' docs/ARCHITECTURE.md && test -z \"$(git status --porcelain -- . \":!$d/prefix_fy.cfg\" \":!$d/prefix_aim.cfg\" \":!$d/prefix_awp.cfg\" ':!docs/ARCHITECTURE.md' ':!README.md')\""
   },
   {
     "id": "e-readme-vampire",
+    "expect": "edit",
     "prompt": "The README Operations table never mentions the vampire plugin. Document it there: which modes it runs on, what it does, and its three cvars with their defaults. Only edit README.md.",
     "check": "grep -q vampire_kill_hp README.md && grep -q vampire_headshot_hp README.md && grep -q vampire_max_hp README.md && test -z \"$(git status --porcelain -- . ':!README.md')\""
   },
   {
     "id": "f-unit-classic-edges",
+    "expect": "full",
     "prompt": "Add unit tests for nl_is_classic_map covering two more edge cases: the bare prefix \"cs_\" and the mixed-case name \"Cs_Office\". Decide the expected results from the current implementation. Then run the unit test level with `scripts/test.sh --no-build --only unit` and make sure it passes.",
     "check": "t=tests/unit/nostalgia_logic_test.sma; grep -q 'Cs_Office' $t && test \"$(grep -c 'check_classic_map(\"' $t)\" -ge 9 && scripts/test.sh --no-build --only unit"
   },
   {
     "id": "f-vampire-logic-include",
+    "expect": "full",
     "prompt": "Following AGENTS.md, move the health calculation in nostalgia_vampire.sma into nostalgia_logic.inc as a pure stock `nl_vampire_health(Float:current, bonus, maxHealth)` that returns the new health as a Float, use it from the plugin, and add unit tests for it (normal kill, capped at max, already above max). Run `scripts/test.sh --no-build --only compile` and `scripts/test.sh --no-build --only unit` and make both pass.",
     "check": "s=server/plugins/addons/amxmodx/scripting; grep -q 'nl_vampire_health' $s/include/nostalgia_logic.inc && grep -q 'nl_vampire_health' $s/nostalgia_vampire.sma && grep -q 'nl_vampire_health' tests/unit/nostalgia_logic_test.sma && ! grep -q floatmin $s/nostalgia_vampire.sma && scripts/test.sh --no-build --only compile && scripts/test.sh --no-build --only unit"
   },
   {
     "id": "f-vampire-status-cmd",
+    "expect": "full",
     "prompt": "Add a server command `vampire_status` to nostalgia_vampire.sma that prints the current kill, headshot and max HP values, in the style of `armoury_status`. Document it in the README Operations table, then run `scripts/test.sh --no-build --only compile` and make it pass.",
     "check": "grep -q 'register_srvcmd(\"vampire_status\"' server/plugins/addons/amxmodx/scripting/nostalgia_vampire.sma && grep -q vampire_status README.md && scripts/test.sh --no-build --only compile"
   },
   {
     "id": "r-review-last-commit",
+    "expect": "full",
     "prompt": "Review the most recent commit (HEAD~1..HEAD) for bugs, regressions or risky changes, and report your findings with file and line. Do not change any files.",
     "check": "test -z \"$(git status --porcelain)\""
   }

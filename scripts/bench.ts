@@ -23,12 +23,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
+import { parseConfig } from "../src/config.ts";
+import { profileOrder } from "../src/select.ts";
 import {
   cacheRate,
   defaultSessionsDir,
   listSessionFiles,
   metricsFor,
   percentile,
+  promptTokensPerRequest,
   sessionCwd,
   totalToolCalls,
   type UsageMetrics,
@@ -37,9 +40,9 @@ import {
 const USAGE = `usage: node scripts/bench.ts --repo <path> --tasks <file.json> [options]
 
   --repo <path>          git repository the tasks run against (required)
-  --tasks <file>         JSON array of { id, prompt, check? } (required)
+  --tasks <file>         JSON array of { id, prompt, check?, expect? } (required)
   --ref <rev>            commit every run starts from (default: HEAD)
-  --model <model>        pin the model for both arms (recommended)
+  --model <model>        model both arms run (required, so the arms are comparable)
   --runs <n>             repetitions per task and arm (default: 1)
   --config <file>        base loadout config (default: ~/.omp/loadout.json, else built-in defaults)
   --setup <cmd>          run once in each new worktree, e.g. "npm ci"
@@ -69,6 +72,7 @@ if (values.help || !values.repo || !values.tasks) {
   console.log(USAGE);
   process.exit(values.help ? 0 : 1);
 }
+if (!values.model) fail("--model is required so both arms use the same model");
 
 interface Task {
   id: string;
@@ -78,6 +82,8 @@ interface Task {
    * `$BENCH_LOG` is the agent's output, so a check can grade an answer too.
    */
   check?: string;
+  /** Profile the classifier should pick for this prompt; unlabeled tasks skip the accuracy checks. */
+  expect?: string;
 }
 
 type Arm = "loadout" | "control";
@@ -108,6 +114,8 @@ interface RunResult {
   risk: number | null;
   activeTools: number | null;
   activeToolNames: string[] | null;
+  applied: string | null;
+  ptpr: number;
   skills: string[] | null;
   classifierMs: number | null;
   warning: string | null;
@@ -125,7 +133,7 @@ function git(cwd: string, ...args: string[]): string {
   return result.stdout.trim();
 }
 
-function loadTasks(file: string): Task[] {
+function loadTasks(file: string, order: string[]): Task[] {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   const tasks = Array.isArray(raw) ? raw : raw?.tasks;
   if (!Array.isArray(tasks) || tasks.length === 0) fail(`${file}: expected a non-empty array of tasks`);
@@ -135,6 +143,9 @@ function loadTasks(file: string): Task[] {
       fail(`${file}: every task needs id and prompt`);
     if (ids.has(task.id)) fail(`${file}: duplicate task id "${task.id}"`);
     ids.add(task.id);
+    if (task.expect !== undefined && !order.includes(task.expect)) {
+      fail(`${file}: every expect must be a profile id (${order.join(", ")}); "${task.id}" has "${task.expect}"`);
+    }
   }
   return tasks;
 }
@@ -187,6 +198,7 @@ function summarizeRun(metrics: UsageMetrics, expectDryRun: boolean): Partial<Run
     mismatch,
     decided: decision !== undefined,
     failure,
+    applied: decision?.applied ?? null,
     profile: decision?.tools?.profile ?? null,
     risk: decision?.tools?.risk ?? null,
     activeTools: decision?.tools?.active?.length ?? null,
@@ -198,7 +210,11 @@ function summarizeRun(metrics: UsageMetrics, expectDryRun: boolean): Partial<Run
 }
 
 const repo = path.resolve(values.repo);
-const tasks = loadTasks(path.resolve(values.tasks));
+const base = loadBaseConfig(values.config);
+const parsed = parseConfig(base);
+if (parsed.errors.length > 0) fail(`base config: ${parsed.errors.join("; ")}`);
+const order = profileOrder(parsed.config.tools);
+const tasks = loadTasks(path.resolve(values.tasks), order);
 const runs = Number.parseInt(values.runs!, 10);
 const timeoutMs = Number(values["timeout-min"]) * 60_000;
 if (!(runs >= 1)) fail("--runs must be at least 1");
@@ -210,7 +226,6 @@ const out = path.resolve(values.out ?? path.join("bench-results", stamp));
 if (fs.existsSync(out) && fs.readdirSync(out).length > 0) fail(`${out} already exists and is not empty`);
 fs.mkdirSync(path.join(out, "logs"), { recursive: true });
 
-const base = loadBaseConfig(values.config);
 // Forget worktrees whose directories were deleted, e.g. an earlier results dir.
 git(repo, "worktree", "prune");
 const worktrees = {} as Record<Arm, string>;
@@ -282,12 +297,14 @@ for (let run = 1; run <= runs; run++) {
         cacheRead: metrics.cacheRead,
         cacheWrite: metrics.cacheWrite,
         cacheRate: cacheRate(metrics),
+        ptpr: promptTokensPerRequest(metrics),
         cost: metrics.cost,
         toolCalls: totalToolCalls(metrics),
         toolErrors: metrics.toolErrors,
         toolsUsed: metrics.toolCalls,
         decided: false,
         failure: null,
+        applied: null,
         profile: null,
         risk: null,
         activeTools: null,
@@ -352,7 +369,7 @@ const money = (n: number) => `$${n.toFixed(4)}`;
 const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
 
 function armRow(label: string, rows: RunResult[]) {
-  const totals = { input: sum(rows, "input"), cacheRead: sum(rows, "cacheRead") };
+  const totals = { input: sum(rows, "input"), cacheRead: sum(rows, "cacheRead"), cacheWrite: sum(rows, "cacheWrite") };
   return [
     label,
     passRate(rows),
@@ -371,6 +388,110 @@ const mdRow = (cells: string[]) => `| ${cells.join(" | ")} |`;
 const byArm = (arm: Arm, rows = results) => rows.filter((r) => r.arm === arm);
 const A = byArm("loadout");
 const B = byArm("control");
+
+// ---------------------------------------------------------------------------
+// Selection: did the loadout arm choose what the labels expect, and what did it cost?
+// ---------------------------------------------------------------------------
+
+interface Pair {
+  task: string;
+  run: number;
+  loadout: RunResult;
+  control: RunResult;
+}
+
+/** mulberry32: a small seeded PRNG, so the bootstrap is reproducible. */
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** 95% percentile bootstrap interval for the mean. */
+function bootstrapMean(values: number[], resamples = 2000): { low: number; high: number } {
+  const random = mulberry32(1);
+  const means = Array.from({ length: resamples }, () => {
+    let total = 0;
+    for (let i = 0; i < values.length; i++) total += values[Math.floor(random() * values.length)] ?? 0;
+    return total / values.length;
+  });
+  return { low: percentile(means, 2.5), high: percentile(means, 97.5) };
+}
+
+const signedPct = (n: number) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)}%`;
+
+const pairs: Pair[] = [];
+for (const task of tasks) {
+  for (let run = 1; run <= runs; run++) {
+    const loadout = A.find((r) => r.task === task.id && r.run === run);
+    const control = B.find((r) => r.task === task.id && r.run === run);
+    if (loadout && control) pairs.push({ task: task.id, run, loadout, control });
+  }
+}
+
+const labeled = pairs.flatMap((pair) => {
+  const expect = tasks.find((task) => task.id === pair.task)?.expect;
+  return expect === undefined ? [] : [{ ...pair, expect }];
+});
+const accurate = labeled.filter((p) => p.control.profile === p.expect).length;
+const overNarrowed = labeled.filter(
+  (p) => p.loadout.applied !== null && order.indexOf(p.loadout.applied) < order.indexOf(p.expect),
+);
+const overNarrowedTasks = [...new Set(overNarrowed.map((p) => p.task))];
+
+const missing = pairs.flatMap((p) => {
+  if (p.loadout.activeToolNames === null) return [];
+  const active = new Set(p.loadout.activeToolNames);
+  const tools = Object.keys(p.control.toolsUsed).filter((name) => !active.has(name));
+  return tools.length === 0 ? [] : [{ task: p.task, run: p.run, tools }];
+});
+const missingTotal = missing.reduce((s, m) => s + m.tools.length, 0);
+
+const ratios = pairs.flatMap((p) => (p.control.ptpr > 0 ? [p.loadout.ptpr / p.control.ptpr - 1] : []));
+const meanRatio = ratios.reduce((s, r) => s + r, 0) / ratios.length;
+const interval = bootstrapMean(ratios);
+
+const passes = (rows: RunResult[]) => rows.filter((r) => r.pass === true).length;
+const failedTests: string[] = [];
+if (missingTotal > 0) failedTests.push(`needed tool missing in ${missingTotal} case(s)`);
+if (passes(A) < passes(B)) failedTests.push(`loadout passes ${passes(A)} < control ${passes(B)}`);
+if (!(interval.high < 0)) failedTests.push(`prompt-token CI upper bound ${signedPct(interval.high)} is not below 0`);
+const verdict =
+  invalid.length > 0
+    ? "not assessed: the run is INVALID (see above)"
+    : failedTests.length === 0
+      ? "PASS"
+      : `NOT PROVEN: ${failedTests.join("; ")}`;
+
+const selection = [
+  `## Selection`,
+  ``,
+  mdRow(["check", "result"]),
+  mdRow(["---", "---"]),
+  mdRow(["accuracy (control arm, labeled runs)", labeled.length === 0 ? "-" : `${accurate}/${labeled.length}`]),
+  mdRow([
+    "over-narrowed (applied narrower than expected)",
+    `${overNarrowed.length}/${labeled.length}${overNarrowedTasks.length > 0 ? `: ${overNarrowedTasks.join(", ")}` : ""}`,
+  ]),
+  mdRow([
+    "needed tool missing (loadout lacked a tool control used)",
+    missingTotal === 0
+      ? "0"
+      : `${missingTotal}: ${missing.map((m) => `${m.task} run ${m.run} ${m.tools.join(", ")}`).join("; ")}`,
+  ]),
+  mdRow([
+    "prompt tokens/request, loadout vs control",
+    `${signedPct(meanRatio)} (95% CI ${signedPct(interval.low)} to ${signedPct(interval.high)})`,
+  ]),
+  ``,
+  `**Verdict: ${verdict}**`,
+  ``,
+];
 
 const lines = [
   `# loadout benchmark`,
@@ -396,6 +517,7 @@ const lines = [
     delta(median(A, "wallMs"), median(B, "wallMs")),
   ]),
   ``,
+  ...selection,
   `## Per task`,
   ``,
   mdRow([
