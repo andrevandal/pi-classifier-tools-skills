@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { profileOrder } from "./select.ts";
 import type { LoadoutConfig, LoadoutConfigInput, ToolList } from "./types.ts";
 
 export const CONFIG_BASENAME = "loadout";
@@ -59,7 +60,7 @@ export function defaultConfig(): LoadoutConfig {
         type: "choice",
         instructions: "Which tools does an AI coding agent need to handle this request?",
         criteria: {
-          answer: "explain, review, or answer a question about code; nothing is changed or executed",
+          answer: "explain or answer a question by reading code; needs no shell, git, or file changes",
           edit: "change files directly; no commands, tests, or builds need to run",
           full: "run commands, tests, builds, git, or anything not covered above",
         },
@@ -71,7 +72,7 @@ export function defaultConfig(): LoadoutConfig {
         full: "*",
       },
       alwaysOn: [],
-      confidenceThreshold: 0.6,
+      maxRisk: 0.1,
     },
     skills: {
       enabled: true,
@@ -273,7 +274,7 @@ export function parseConfig(raw: unknown): { config: LoadoutConfig; errors: stri
   if (!["auto", "filter", "hint"].includes(config.skills.mode)) {
     errors.push(`"skills.mode" must be "auto", "filter" or "hint"`);
   }
-  checkRange(errors, "tools.confidenceThreshold", config.tools.confidenceThreshold, 0, 1);
+  checkRange(errors, "tools.maxRisk", config.tools.maxRisk, 0, 1);
   checkRange(errors, "skills.threshold", config.skills.threshold, 0, 1);
   checkRange(errors, "skills.maxSkills", config.skills.maxSkills, 1);
   checkRange(errors, "skills.maxCandidates", config.skills.maxCandidates, 1);
@@ -281,6 +282,13 @@ export function parseConfig(raw: unknown): { config: LoadoutConfig; errors: stri
   checkRange(errors, "laya.timeoutMs", config.laya.timeoutMs, 1, MAX_BACKEND_TIMEOUT_MS);
   if (config.maxPromptChars !== null) checkRange(errors, "maxPromptChars", config.maxPromptChars, MIN_PROMPT_CHARS);
   validateTools(config, errors);
+  if (errors.length === 0) {
+    try {
+      profileOrder(config.tools);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   return errors.length > 0 ? { config: defaults, errors, warnings } : { config, errors, warnings };
 }

@@ -20,12 +20,12 @@
     },
     "profiles": {
       "answer": ["read", "grep", "glob", "lsp"],
-      "research": ["read", "grep", "glob", "web_search"],
-      "edit": ["read", "grep", "glob", "lsp", "edit", "write", "ast_edit"],
+      "research": ["read", "grep", "glob", "lsp", "web_search"],
+      "edit": ["read", "grep", "glob", "lsp", "web_search", "edit", "write", "ast_edit"],
       "full": "*"
     },
     "alwaysOn": ["todo"],
-    "confidenceThreshold": 0.6
+    "maxRisk": 0.1
   },
   "skills": {
     "mode": "hint",

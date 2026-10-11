@@ -8,6 +8,7 @@ import {
   decideSkills,
   decideTools,
   isSlashCommand,
+  profileOrder,
   skillCandidates,
   skillQuestionId,
   TOOLS_QUESTION_ID,
@@ -21,8 +22,8 @@ const SKILLS: SkillCandidate[] = [
   { name: "review", description: "review a diff" },
 ];
 
-function choice(value: string, confidence: number): ChoiceAnswer {
-  return { type: "choice", choice: value, probabilities: { [value]: confidence }, confidence };
+function choice(value: string, probabilities: Record<string, number>): ChoiceAnswer {
+  return { type: "choice", choice: value, probabilities, confidence: probabilities[value] ?? 0 };
 }
 
 function nouls(scores: Record<string, number>): Answers {
@@ -33,32 +34,58 @@ function nouls(scores: Record<string, number>): Answers {
   return answers;
 }
 
-test("a profile narrows tools to its intersection with the baseline", () => {
-  const decision = decideTools(defaultConfig().tools, BASELINE, choice("answer", 0.9));
+test("the narrowest profile within maxRisk is chosen, and its risk is the mass on broader profiles", () => {
+  const decision = decideTools(
+    defaultConfig().tools,
+    BASELINE,
+    choice("answer", { answer: 0.95, edit: 0.03, full: 0.02 }),
+  );
+  assert.equal(decision.profile, "answer");
   assert.deepEqual(decision.active, ["read", "grep", "find", "ls"]);
-  assert.equal(decision.reason, "selected");
+  assert.ok(Math.abs((decision.risk ?? Number.NaN) - 0.05) < 1e-9);
+});
+
+test("a small margin between two narrow profiles does not block narrowing", () => {
+  const decision = decideTools(
+    defaultConfig().tools,
+    BASELINE,
+    choice("answer", { answer: 0.5, edit: 0.45, full: 0.05 }),
+  );
+  assert.equal(decision.profile, "edit");
+  assert.ok(Math.abs((decision.risk ?? Number.NaN) - 0.05) < 1e-9);
+});
+
+test("mass above maxRisk on broader profiles keeps the baseline", () => {
+  const decision = decideTools(
+    defaultConfig().tools,
+    BASELINE,
+    choice("answer", { answer: 0.42, edit: 0.31, full: 0.27 }),
+  );
+  assert.equal(decision.reason, "low-confidence");
+  assert.equal(decision.active, null);
 });
 
 test("a profile never grants a tool missing from the baseline", () => {
-  const decision = decideTools(defaultConfig().tools, ["read", "bash"], choice("edit", 0.9));
+  const decision = decideTools(defaultConfig().tools, ["read", "bash"], choice("edit", { answer: 0.1, edit: 0.9 }));
   assert.deepEqual(decision.active, ["read"]);
 });
 
-test('"*" keeps the whole baseline and alwaysOn adds to a profile', () => {
+test("the broadest profile is the baseline, and alwaysOn adds to a narrower one", () => {
   const config = defaultConfig().tools;
-  assert.deepEqual(decideTools(config, BASELINE, choice("full", 0.9)).active, BASELINE);
+  assert.equal(decideTools(config, BASELINE, choice("full", { full: 1 })).active, null);
   config.alwaysOn = ["bash"];
-  assert.deepEqual(decideTools(config, BASELINE, choice("answer", 0.9)).active, ["read", "bash", "grep", "find", "ls"]);
+  const decision = decideTools(config, BASELINE, choice("answer", { answer: 0.95, edit: 0.05 }));
+  assert.deepEqual(decision.active, ["read", "bash", "grep", "find", "ls"]);
 });
 
-test("low confidence, unknown profiles and missing answers keep the baseline", () => {
+test("a missing answer, or one with no probabilities, keeps the baseline", () => {
   const config = defaultConfig().tools;
-  assert.equal(decideTools(config, BASELINE, choice("answer", 0.3)).reason, "low-confidence");
-  assert.equal(decideTools(config, BASELINE, choice("nope", 0.9)).reason, "unknown-profile");
   assert.equal(decideTools(config, BASELINE, undefined).reason, "missing-answer");
-  for (const answer of [choice("answer", 0.3), choice("nope", 0.9), undefined]) {
-    assert.equal(decideTools(config, BASELINE, answer).active, null);
-  }
+  assert.equal(decideTools(config, BASELINE, choice("answer", {})).active, null);
+});
+
+test("profiles are ordered narrowest first, with the wildcard last", () => {
+  assert.deepEqual(profileOrder(defaultConfig().tools), ["answer", "edit", "full"]);
 });
 
 test("skills above the threshold are selected, highest first, capped at maxSkills", () => {

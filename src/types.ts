@@ -215,8 +215,8 @@ export interface ToolsSelectorConfig {
   profiles: Record<string, ToolList>;
   /** Tools kept active under every profile (still intersected with the baseline). */
   alwaysOn: string[];
-  /** Below this confidence the baseline is kept. */
-  confidenceThreshold: number;
+  /** Most probability mass allowed on profiles broader than the chosen one; above it the baseline is kept. */
+  maxRisk: number;
 }
 
 /**
@@ -274,7 +274,7 @@ export interface SkillCandidate {
   description: string;
 }
 
-export type ToolsReason = "selected" | "disabled" | "missing-answer" | "low-confidence" | "unknown-profile";
+export type ToolsReason = "selected" | "disabled" | "missing-answer" | "low-confidence";
 export type SkillsReason = "selected" | "disabled" | "no-candidates" | "too-many-candidates" | "missing-answer";
 
 export interface ToolsDecision {

@@ -60,9 +60,51 @@ export function buildQuestions(config: LoadoutConfig, candidates: SkillCandidate
 }
 
 /**
- * Map the tool-profile answer to the tools to activate. The result is always a
- * subset of `baseline`, so the selector can narrow the session's tools but
- * never grant one the user did not enable.
+ * Profile ids from narrowest to broadest. Each profile's tools (with `alwaysOn`)
+ * must fit inside the next one's, so "narrower" is well defined; the wildcard
+ * `"*"` is the broadest and always comes last.
+ */
+export function profileOrder(tools: ToolsSelectorConfig): string[] {
+  const wildcards = Object.keys(tools.profiles).filter((id) => tools.profiles[id] === "*");
+  if (wildcards.length > 1) throw new Error(`"tools.profiles" may have only one "*" profile`);
+  const sets = Object.entries(tools.profiles).flatMap(([id, list]) =>
+    list === "*" ? [] : [{ id, names: new Set([...list, ...tools.alwaysOn]) }],
+  );
+  sets.sort((a, b) => a.names.size - b.names.size);
+  for (let i = 0; i + 1 < sets.length; i++) {
+    const narrower = sets[i]!;
+    const broader = sets[i + 1]!;
+    if (![...narrower.names].every((name) => broader.names.has(name))) {
+      throw new Error(`"tools.profiles" must be nested: "${narrower.id}" is not a subset of "${broader.id}"`);
+    }
+  }
+  return [...sets.map(({ id }) => id), ...wildcards];
+}
+
+/**
+ * The narrowest profile whose risk is within `maxRisk`, where a profile's risk is
+ * the probability mass on the profiles broader than it. The broadest profile is
+ * never picked: it stands for the baseline. Null when no profile qualifies.
+ */
+export function pickProfile(
+  order: string[],
+  probabilities: Record<string, number>,
+  maxRisk: number,
+): { profile: string; risk: number } | null {
+  // No probability for any profile would read as zero risk everywhere and pick the narrowest.
+  if (!order.some((id) => id in probabilities)) return null;
+  for (let i = 0; i < order.length - 1; i++) {
+    const risk = order.slice(i + 1).reduce((sum, id) => sum + (probabilities[id] ?? 0), 0);
+    if (risk <= maxRisk) return { profile: order[i]!, risk };
+  }
+  return null;
+}
+
+/**
+ * Map the classifier's probabilities over profiles to the tools to activate: the
+ * narrowest profile whose risk is within `maxRisk`, else the baseline. The result
+ * is always a subset of `baseline`, so the selector can narrow the session's tools
+ * but never grant one the user did not enable.
  */
 export function decideTools(
   config: ToolsSelectorConfig,
@@ -74,19 +116,19 @@ export function decideTools(
     return { active: null, profile: null, probabilities: {}, risk: null, reason: "missing-answer" };
   }
 
-  const { choice: profile, confidence } = answer;
   const probabilities = answer.probabilities ?? {};
-  if (confidence < config.confidenceThreshold) {
-    return { active: null, profile, probabilities, risk: null, reason: "low-confidence" };
+  const order = profileOrder(config);
+  const picked = pickProfile(order, probabilities, config.maxRisk);
+  if (picked === null) {
+    return { active: null, profile: order.at(-1) ?? null, probabilities, risk: null, reason: "low-confidence" };
   }
 
-  const tools = config.profiles[profile];
-  if (tools === undefined) return { active: null, profile, probabilities, risk: null, reason: "unknown-profile" };
-  if (tools === "*") return { active: [...baseline], profile, probabilities, risk: null, reason: "selected" };
+  const { profile, risk } = picked;
+  const tools = config.profiles[profile]!;
+  if (tools === "*") return { active: [...baseline], profile, probabilities, risk, reason: "selected" };
 
   const wanted = new Set([...tools, ...config.alwaysOn]);
-  const active = baseline.filter((name) => wanted.has(name));
-  return { active, profile, probabilities, risk: null, reason: "selected" };
+  return { active: baseline.filter((name) => wanted.has(name)), profile, probabilities, risk, reason: "selected" };
 }
 
 export function decideSkills(

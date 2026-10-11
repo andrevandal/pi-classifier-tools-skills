@@ -37,9 +37,9 @@ flowchart LR
 - **It never adds a tool.** A selection is always a subset of the **baseline**,
   the tools that were active before this extension changed anything. If you or
   another extension change tools mid-session, that becomes the new baseline.
-- **"Don't know" keeps everything.** Low confidence, an unknown profile, a
-  missing answer, or too many skills to ask about keeps all tools or all skills.
-- **Every decision is recorded** as a `loadout.decision` session entry.
+- **"Don't know" keeps everything.** When no profile's risk is within `tools.maxRisk`,
+  the answer is missing, or too many skills are candidates, all tools or all skills stay.
+- **Every turn is recorded** as a `loadout.decision` session entry, failures included.
 
 ## Quick start
 
@@ -112,7 +112,7 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `tools.question` | `answer` / `edit` / `full` choice | the `choice` question; its options are the profile ids |
 | `tools.profiles` | see below | profile id -> tool names, or `"*"` for the whole baseline |
 | `tools.alwaysOn` | `[]` | tools added to every profile (still limited to the baseline) |
-| `tools.confidenceThreshold` | `0.6` | below this the baseline is kept |
+| `tools.maxRisk` | `0.1` | most probability mass allowed on profiles broader than the chosen one; above it the baseline is kept. Profiles must be nested: each one's tools fit inside the next |
 | `skills.enabled` | `true` | select skills |
 | `skills.mode` | `"auto"` | `"auto"`, `"filter"` (pi only), or `"hint"` |
 | `skills.threshold` | `0.5` | minimum yes-probability for a skill to be selected |
@@ -165,7 +165,7 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
   take skills out of the question set.
 - **Wrong narrowing costs more than no narrowing.** Taking `bash` away from a
   turn that needed it hurts more than leaving it available. Keep
-  `confidenceThreshold` conservative and use `dryRun` + `/loadout explain` to
+  `tools.maxRisk` conservative and use `dryRun` + `/loadout explain` to
   tune profiles against your real prompts.
 - **Laya accuracy.** Base checkpoints are close to chance on custom questions.
   Use Jev, or a Laya checkpoint fine-tuned on your question set.
@@ -209,8 +209,8 @@ Output in `bench-results/<timestamp>/`:
 - `summary.md`: pass rate, cost, input tokens, cache rate, requests, errors,
   tool calls and wall time per arm and per task, plus `loadout vs control`
   deltas.
-- `results.jsonl`: one row per run, including the chosen profile, confidence,
-  selected skills and classifier latency.
+- `results.jsonl`: one row per run, including the chosen profile, its risk, the classifier
+  failure (if any), selected skills and classifier latency.
 - `logs/`: agent output and check output per run.
 
 How to read it:
@@ -219,8 +219,8 @@ How to read it:
 | --- | --- |
 | lower cost and input, same pass rate | selection helps |
 | lower input, but flat cost and lower cache rate | tool churn is breaking the prompt cache; use fewer, broader profiles |
-| lower pass rate | wrong narrowing; raise `tools.confidenceThreshold` or fix the profiles |
-| no difference | selection rarely acts; check confidence with `npm run decisions` |
+| lower pass rate | wrong narrowing; lower `tools.maxRisk` or fix the profiles |
+| no difference | selection rarely acts; check risk with `npm run decisions` |
 
 Limits: use `--runs 2` or more, since LLM runs vary. Each run is a fresh
 single-prompt session, so this understates the cache cost of changing tools

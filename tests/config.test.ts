@@ -67,7 +67,7 @@ test("bad values reject the file and fall back to the defaults", () => {
   const cases: unknown[] = [
     { backend: "gpt" },
     { skills: { threshold: 2 } },
-    { tools: { confidenceThreshold: "high" } },
+    { tools: { maxRisk: "high" } },
     { tools: { profiles: { answer: ["read"], edit: ["edit"] } } },
     { tools: { profiles: { answer: ["read"], edit: "all", full: "*" } } },
     { maxPromptChars: 10 },
@@ -120,4 +120,14 @@ test("a file with errors disables the plugin instead of running on defaults", ()
   const result = loadConfig(project, { projectTrusted: true, home });
   assert.equal(result.config.enabled, false);
   assert.match(result.errors.join("\n"), /"jev\.timeoutMs" must be between 1 and 20000/);
+});
+
+test("tools.profiles must nest: each profile's tools fit inside the next", () => {
+  const { errors } = parseConfig({
+    tools: {
+      question: { type: "choice", instructions: "?", criteria: { answer: null, edit: null, full: null } },
+      profiles: { answer: ["read"], edit: ["edit"], full: "*" },
+    },
+  });
+  assert.match(errors.join("\n"), /"tools\.profiles" must be nested/);
 });

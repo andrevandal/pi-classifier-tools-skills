@@ -211,7 +211,7 @@ function summarize(record: TurnRecord, baselineSize: number): string {
   const toolPart =
     tools.active === null
       ? `tools: all (${tools.reason})`
-      : `tools: ${tools.profile} -> ${tools.active.length}/${baselineSize}`;
+      : `tools: ${tools.profile} (risk ${tools.risk?.toFixed(2) ?? "-"}) -> ${tools.active.length}/${baselineSize}`;
   const skillPart =
     skills.selected === null
       ? `skills: all (${skills.reason})`
@@ -340,7 +340,7 @@ function commandExplain(ctx: ExtensionContext, state: SessionState): void {
     .map(([name, p]) => `${name}=${p.toFixed(2)}`)
     .join(", ");
   const lines = [
-    `tools: profile ${tools.profile ?? "-"} | reason ${tools.reason}`,
+    `tools: profile ${tools.profile ?? "-"} | risk ${tools.risk?.toFixed(2) ?? "-"} | reason ${tools.reason}`,
     `profile probabilities: ${probabilities || "none"}`,
     `active: ${tools.active?.join(", ") ?? "baseline"}`,
     `skills: reason ${skills.reason} | selected ${skills.selected?.join(", ") ?? "all"}`,
