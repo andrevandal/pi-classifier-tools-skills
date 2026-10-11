@@ -206,8 +206,9 @@ to `--ref` (`git reset --hard` + `git clean -fd`; ignored files such as
 
 Output in `bench-results/<timestamp>/`:
 
-- `summary.md`: pass rate, cost, input tokens, cache rate, requests, errors, tool calls and wall
-  time per arm and per task, plus `loadout vs control` deltas, then a `## Selection` section (below).
+- `summary.md`: header, per-arm totals and `loadout vs control` deltas (pass rate, cost, input
+  tokens, cache rate, requests, errors, tool calls, wall time), then a `## Selection` section
+  (below), then the per-task tables.
   If more than 5% of runs have no usable decision, or the two arms chose different profiles for
   any prompt, the summary starts with `**INVALID**` and the script exits 2.
 - `results.jsonl`: one row per run, including the chosen profile, its risk, the classifier
