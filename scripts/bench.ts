@@ -102,9 +102,12 @@ interface RunResult {
   toolCalls: number;
   toolErrors: number;
   toolsUsed: Record<string, number>;
+  decided: boolean;
+  failure: string | null;
   profile: string | null;
-  confidence: number | null;
+  risk: number | null;
   activeTools: number | null;
+  activeToolNames: string[] | null;
   skills: string[] | null;
   classifierMs: number | null;
   warning: string | null;
@@ -178,14 +181,19 @@ function runOmp(task: Task, cwd: string, configFile: string, logFile: string, ti
 function summarizeRun(metrics: UsageMetrics, expectDryRun: boolean): Partial<RunResult> & { mismatch: boolean } {
   const decision = metrics.decisions[0];
   const mismatch = metrics.decisions.some((d) => d.dryRun !== expectDryRun);
+  const failure = decision?.failure ?? null;
+  const warning = failure === null ? null : `classifier failed (${failure}): ${decision?.message ?? ""}`;
   return {
     mismatch,
-    profile: decision?.tools.profile ?? null,
-    confidence: decision?.tools.confidence ?? null,
-    activeTools: decision?.tools.active?.length ?? null,
-    skills: decision?.skills.selected ?? null,
+    decided: decision !== undefined,
+    failure,
+    profile: decision?.tools?.profile ?? null,
+    risk: decision?.tools?.risk ?? null,
+    activeTools: decision?.tools?.active?.length ?? null,
+    activeToolNames: decision?.tools?.active ?? null,
+    skills: decision?.skills?.selected ?? null,
     classifierMs: decision?.latencyMs ?? null,
-    warning: decision ? null : "no loadout.decision recorded (plugin not loaded, or the classifier failed)",
+    warning: decision ? warning : "no loadout.decision recorded (plugin not loaded)",
   };
 }
 
@@ -278,9 +286,12 @@ for (let run = 1; run <= runs; run++) {
         toolCalls: totalToolCalls(metrics),
         toolErrors: metrics.toolErrors,
         toolsUsed: metrics.toolCalls,
+        decided: false,
+        failure: null,
         profile: null,
-        confidence: null,
+        risk: null,
         activeTools: null,
+        activeToolNames: null,
         skills: null,
         classifierMs: null,
         warning: null,
@@ -299,6 +310,28 @@ for (let run = 1; run <= runs; run++) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Validity: a run without a usable decision, or arms that chose different
+// profiles for the same prompt, is not a fair comparison.
+// ---------------------------------------------------------------------------
+
+const invalid: string[] = [];
+const unusable = results.filter((r) => !r.decided || r.failure !== null);
+if (unusable.length / results.length > 0.05) {
+  invalid.push(`**INVALID**: ${unusable.length}/${results.length} runs have no usable decision`);
+}
+for (const task of tasks) {
+  for (let run = 1; run <= runs; run++) {
+    const loadout = results.find((r) => r.task === task.id && r.run === run && r.arm === "loadout");
+    const control = results.find((r) => r.task === task.id && r.run === run && r.arm === "control");
+    if (loadout?.profile !== control?.profile) {
+      invalid.push(`**INVALID**: profiles differ across arms for ${task.id} run ${run}`);
+    }
+  }
+}
+for (const line of invalid) console.log(line);
+if (invalid.length > 0) process.exitCode = 2;
 
 // ---------------------------------------------------------------------------
 // Summary
@@ -399,6 +432,6 @@ lines.push(
   `Remove the worktrees when done: \`git -C ${repo} worktree remove --force ${worktrees.loadout}\` (and the control one).`,
 );
 
-const summary = `${lines.join("\n")}\n`;
+const summary = `${[...invalid, ...(invalid.length > 0 ? [""] : []), ...lines].join("\n")}\n`;
 fs.writeFileSync(path.join(out, "summary.md"), summary);
 console.log(`\n${summary}`);

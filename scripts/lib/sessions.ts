@@ -8,17 +8,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { TurnRecord } from "../../src/types.ts";
+
 export const DECISION_ENTRY = "loadout.decision";
 
-export interface Decision {
-  tools: { active: string[] | null; profile: string | null; confidence: number; reason: string };
-  skills: { selected: string[] | null; scores: Record<string, number>; reason: string };
-  backend: string;
-  dryRun: boolean;
-  latencyMs: number;
-  timestamp?: string;
-  file?: string;
-}
+/** One `loadout.decision` entry, read back from a session transcript. */
+export type Decision = TurnRecord & { timestamp?: string; file?: string };
 
 export interface UsageMetrics {
   requests: number;

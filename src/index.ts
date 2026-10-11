@@ -21,25 +21,15 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
-import {
-  buildQuestions,
-  clipPrompt,
-  decideSkills,
-  decideTools,
-  isSlashCommand,
-  skillCandidates,
-  TOOLS_QUESTION_ID,
-} from "./select.ts";
-import { ClassifierError } from "./types.ts";
-import type { Classifier, LoadoutConfig, LoadoutDecision, SkillCandidate } from "./types.ts";
+import { buildQuestions, isSlashCommand, skillCandidates } from "./select.ts";
+import { errorText, runTurn } from "./turn.ts";
+import type { Classifier, LoadoutConfig, SkillCandidate, TurnRecord } from "./types.ts";
 
 const PREFIX = "[loadout]";
 const COMMAND = "loadout";
 const SUBCOMMANDS = ["status", "on", "off", "explain"] as const;
 const DECISION_ENTRY = "loadout.decision";
 const HINT_MESSAGE = "loadout.skills";
-/** Extra time past the backend's own budget before the outer guard gives up. */
-const GUARD_MS = 250;
 
 /** The parts of the prompt event this extension reads; `systemPromptOptions` is pi-only. */
 interface PromptEvent {
@@ -59,7 +49,8 @@ interface SessionState {
   baseline: string[] | null;
   /** What this extension last activated, to notice changes made by anyone else. */
   lastApplied: string[] | null;
-  lastDecision: (LoadoutDecision & { latencyMs: number }) | null;
+  /** Outcome of the latest turn, including a failed one. */
+  lastRecord: TurnRecord | null;
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
   lastFailure: string | null;
 }
@@ -75,10 +66,6 @@ const classifiers = new Map<string, SharedClassifier>();
 
 function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function sessionKey(ctx: ExtensionContext): string {
@@ -174,7 +161,7 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     holdsClassifier: keepClassifier,
     baseline: existing?.baseline ?? null,
     lastApplied: existing?.lastApplied ?? null,
-    lastDecision: existing?.lastDecision ?? null,
+    lastRecord: existing?.lastRecord ?? null,
     lastFailure: null,
   };
   sessions.set(key, state);
@@ -218,38 +205,28 @@ async function restoreBaseline(pi: ExtensionAPI, state: SessionState): Promise<v
   if (state.baseline !== null && state.lastApplied !== null) await activateTools(pi, state, state.baseline);
 }
 
-async function classify(state: SessionState, prompt: string, questions: ReturnType<typeof buildQuestions>) {
-  const config = state.config;
-  const budget = (config.backend === "laya" ? config.laya.timeoutMs : config.jev.timeoutMs) + GUARD_MS;
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const guard = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      reject(new ClassifierError(config.backend, "timeout", `no answer within ${budget}ms`));
-    }, budget);
-  });
-  try {
-    const call = classifierFor(state).classify(clipPrompt(prompt, config.maxPromptChars), questions, {
-      signal: controller.signal,
-    });
-    return await Promise.race([call, guard]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function summarize(decision: LoadoutDecision, baselineSize: number): string {
-  const { tools, skills } = decision;
+function summarize(record: TurnRecord, baselineSize: number): string {
+  const { tools, skills } = record;
+  if (tools === null || skills === null) return `failed (${record.failure}): ${record.message}`;
   const toolPart =
     tools.active === null
       ? `tools: all (${tools.reason})`
-      : `tools: ${tools.profile} ${tools.confidence.toFixed(2)} -> ${tools.active.length}/${baselineSize}`;
+      : `tools: ${tools.profile} -> ${tools.active.length}/${baselineSize}`;
   const skillPart =
     skills.selected === null
       ? `skills: all (${skills.reason})`
       : `skills: ${skills.selected.length > 0 ? skills.selected.join(", ") : "none"}`;
   return `${toolPart} | ${skillPart}`;
+}
+
+/** The user-facing reason a turn fell back to the baseline. */
+function failureNotice(record: TurnRecord): { text: string; level: "warning" | "error" } {
+  if (record.failure === "warming") return { text: record.message ?? "classifier is still loading", level: "warning" };
+  if (record.failure === "error") {
+    return { text: `selection error: ${record.message}; using the full loadout until it recovers`, level: "error" };
+  }
+  const text = `classification failed (${record.failure}): ${record.message}; using the full loadout until it recovers`;
+  return { text, level: "warning" };
 }
 
 function skillHint(selected: string[]): string {
@@ -271,23 +248,34 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     }
 
     const baseline = refreshBaseline(pi, state);
-    const allSkills = listSkills(pi, event);
-    const candidates = skillCandidates(allSkills, config.skills);
+    const candidates = skillCandidates(listSkills(pi, event), config.skills);
     const questions = buildQuestions(config, candidates);
     if (Object.keys(questions).length === 0) return;
 
-    const startedAt = Date.now();
-    const result = await classify(state, event.prompt, questions);
-    const decision: LoadoutDecision = {
-      tools: decideTools(config.tools, baseline, result.answers[TOOLS_QUESTION_ID]),
-      skills: decideSkills(config.skills, candidates, result.answers),
-    };
-    const latencyMs = Date.now() - startedAt;
-    state.lastDecision = { ...decision, latencyMs };
-    state.lastFailure = null;
+    const { record, decision } = await runTurn({
+      config,
+      classifier: classifierFor(state),
+      prompt: event.prompt,
+      questions,
+      baseline,
+      candidates,
+    });
+    if (decision) record.applied = decision.tools.profile;
+    state.lastRecord = record;
+    pi.appendEntry(DECISION_ENTRY, record);
 
-    pi.appendEntry(DECISION_ENTRY, { ...decision, backend: config.backend, dryRun: config.dryRun, latencyMs });
-    notify(ctx, config, `${config.dryRun ? "(dry run) " : ""}${summarize(decision, baseline.length)}`, "info");
+    if (decision === null) {
+      const notice = failureNotice(record);
+      if (notice.text !== state.lastFailure) {
+        state.lastFailure = notice.text;
+        notify(ctx, config, notice.text, notice.level);
+      }
+      await restoreBaseline(pi, state);
+      return;
+    }
+
+    state.lastFailure = null;
+    notify(ctx, config, `${config.dryRun ? "(dry run) " : ""}${summarize(record, baseline.length)}`, "info");
     if (config.dryRun) return;
 
     await activateTools(pi, state, decision.tools.active ?? baseline);
@@ -306,18 +294,10 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
   } catch (error) {
     if (!state) return;
-    const reason =
-      error instanceof ClassifierError
-        ? `classification failed (${error.code}): ${error.message}`
-        : `selection error: ${errorText(error)}`;
-    if (reason !== state.lastFailure) {
-      state.lastFailure = reason;
-      notify(
-        ctx,
-        state.config,
-        `${reason}; using the full loadout until it recovers`,
-        error instanceof ClassifierError ? "warning" : "error",
-      );
+    const text = `selection error: ${errorText(error)}; using the full loadout until it recovers`;
+    if (text !== state.lastFailure) {
+      state.lastFailure = text;
+      notify(ctx, state.config, text, "error");
     }
     try {
       await restoreBaseline(pi, state);
@@ -334,28 +314,38 @@ function commandStatus(ctx: ExtensionContext, state: SessionState): void {
     `config: ${state.source ?? "built-in defaults"}`,
     `tools: ${config.tools.enabled ? `profiles ${Object.keys(config.tools.profiles).join(", ")}` : "off"} | skills: ${config.skills.enabled ? config.skills.mode : "off"}`,
     `baseline tools: ${state.baseline?.join(", ") ?? "not captured yet"}`,
-    `last decision: ${state.lastDecision ? summarize(state.lastDecision, state.baseline?.length ?? 0) : "none"}`,
+    `last decision: ${state.lastRecord ? summarize(state.lastRecord, state.baseline?.length ?? 0) : "none"}`,
   ];
   for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
 }
 
 function commandExplain(ctx: ExtensionContext, state: SessionState): void {
-  const decision = state.lastDecision;
-  if (!decision) {
+  const record = state.lastRecord;
+  if (!record) {
     ctx.ui.notify(`${PREFIX} no decision yet`, "info");
     return;
   }
-  const { tools, skills } = decision;
+  const { tools, skills } = record;
+  if (tools === null || skills === null) {
+    ctx.ui.notify(`${PREFIX} failed (${record.failure}): ${record.message}`, "info");
+    ctx.ui.notify(`${PREFIX} latency: ${record.latencyMs}ms`, "info");
+    return;
+  }
   const scores = Object.entries(skills.scores)
     .sort(([, a], [, b]) => b - a)
     .map(([name, score]) => `${name}=${score.toFixed(2)}`)
     .join(", ");
+  const probabilities = Object.entries(tools.probabilities)
+    .sort(([, a], [, b]) => b - a)
+    .map(([name, p]) => `${name}=${p.toFixed(2)}`)
+    .join(", ");
   const lines = [
-    `tools: profile ${tools.profile ?? "-"} | confidence ${tools.confidence.toFixed(2)} | reason ${tools.reason}`,
+    `tools: profile ${tools.profile ?? "-"} | reason ${tools.reason}`,
+    `profile probabilities: ${probabilities || "none"}`,
     `active: ${tools.active?.join(", ") ?? "baseline"}`,
     `skills: reason ${skills.reason} | selected ${skills.selected?.join(", ") ?? "all"}`,
     `skill scores: ${scores || "none"}`,
-    `latency: ${decision.latencyMs}ms`,
+    `latency: ${record.latencyMs}ms`,
   ];
   for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
 }

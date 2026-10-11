@@ -101,7 +101,7 @@ test("bench refuses to reuse a non-empty results directory", () => {
   assert.match(result.stderr, /not empty/);
 });
 
-test("decisions reports profiles, confidence and skills across sessions", () => {
+test("decisions reports profiles, failures and skills across sessions", () => {
   const ctx = setup();
   runScript(
     "bench.ts",
@@ -118,7 +118,7 @@ test("decisions reports profiles, confidence and skills across sessions", () => 
   assert.equal(report.dryRun, 2);
   assert.deepEqual(report.toolProfiles, { answer: 4 });
   assert.deepEqual(report.skillsSelected, { pdf: 4 });
-  assert.equal(report.confidence.p50, 0.8);
+  assert.deepEqual(report.failures, {});
 
   const filtered = runScript("decisions.ts", ["--sessions-dir", ctx.sessions, "--folder", "wt-control", "--json"], {});
   assert.equal(JSON.parse(filtered.stdout).decisions, 2);

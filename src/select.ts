@@ -69,18 +69,24 @@ export function decideTools(
   baseline: string[],
   answer: Answer | undefined,
 ): ToolsDecision {
-  if (!config.enabled) return { active: null, profile: null, confidence: 0, reason: "disabled" };
-  if (answer?.type !== "choice") return { active: null, profile: null, confidence: 0, reason: "missing-answer" };
+  if (!config.enabled) return { active: null, profile: null, probabilities: {}, risk: null, reason: "disabled" };
+  if (answer?.type !== "choice") {
+    return { active: null, profile: null, probabilities: {}, risk: null, reason: "missing-answer" };
+  }
 
   const { choice: profile, confidence } = answer;
-  if (confidence < config.confidenceThreshold) return { active: null, profile, confidence, reason: "low-confidence" };
+  const probabilities = answer.probabilities ?? {};
+  if (confidence < config.confidenceThreshold) {
+    return { active: null, profile, probabilities, risk: null, reason: "low-confidence" };
+  }
 
   const tools = config.profiles[profile];
-  if (tools === undefined) return { active: null, profile, confidence, reason: "unknown-profile" };
-  if (tools === "*") return { active: [...baseline], profile, confidence, reason: "selected" };
+  if (tools === undefined) return { active: null, profile, probabilities, risk: null, reason: "unknown-profile" };
+  if (tools === "*") return { active: [...baseline], profile, probabilities, risk: null, reason: "selected" };
 
   const wanted = new Set([...tools, ...config.alwaysOn]);
-  return { active: baseline.filter((name) => wanted.has(name)), profile, confidence, reason: "selected" };
+  const active = baseline.filter((name) => wanted.has(name));
+  return { active, profile, probabilities, risk: null, reason: "selected" };
 }
 
 export function decideSkills(

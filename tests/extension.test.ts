@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import loadout from "../src/index.ts";
-import type { Answers } from "../src/types.ts";
+import type { Answers, TurnRecord } from "../src/types.ts";
 
 const TOKEN_VAR = "LOADOUT_TEST_TOKEN";
 const BASELINE = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -131,6 +131,8 @@ test("pi: narrows tools and filters skills out of the prompt", async () => {
   );
   assert.equal(result, undefined);
   assert.equal(host.entries[0]?.type, "loadout.decision");
+  const first = host.entries[0]?.data as TurnRecord;
+  assert.equal(first.v, 2);
   assert.deepEqual(Object.keys(requests[0]!.questions), ["tool_profile", "skill:pdf", "skill:deploy"]);
   host.shutdown();
 });
@@ -187,6 +189,8 @@ test("dry run records the decision but changes nothing", async () => {
   assert.deepEqual(host.active(), BASELINE);
   assert.equal(event.systemPromptOptions?.skills.length, SKILLS.length);
   assert.equal(host.entries.length, 1);
+  const dry = host.entries[0]?.data as TurnRecord;
+  assert.equal(dry.dryRun, true);
   host.shutdown();
 });
 
@@ -214,5 +218,16 @@ test("a failure that repeats is reported once, and again after a recovery", asyn
   reply = { status: 500, answers: {} };
   await host.prompt("four");
   assert.equal(failures(), 2);
+  host.shutdown();
+});
+
+test("a failed classification is recorded as a decision with its failure", async () => {
+  reply = { status: 500, answers: {} };
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  assert.equal(host.entries.length, 1);
+  const record = host.entries[0]?.data as TurnRecord;
+  assert.equal(record.failure, "unavailable");
+  assert.equal(record.tools, null);
   host.shutdown();
 });
