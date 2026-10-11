@@ -227,10 +227,26 @@ single-prompt session, so this understates the cache cost of changing tools
 mid-conversation; compare a few long interactive sessions too. Subagents that
 omp writes outside its sessions directory are not counted.
 
+### Benchmarking with a warm Laya server
+
+Each `omp -p` run is a fresh process, so the local sidecar reloads the model every
+time (about 40 s on CPU), which exceeds omp's 30 s extension-handler limit and
+yields no decisions. Serve the model once and use the HTTP transport:
+
+```bash
+python python/laya_http_server.py --repo convaiinnovations/laya --router --port 8765
+npm run bench -- --repo <repo> --tasks <tasks.json> --config bench/laya-http.example.json --runs 2
+```
+
+`bench/laya-http.example.json` only points the plugin at the server. The server binds to
+127.0.0.1 by default. To serve another host, pass `--host <addr> --allow-remote` and set
+`LAYA_SERVER_TOKEN`. A token in that variable is enforced on any host: every POST must then
+send `Authorization: Bearer <token>`. Request bodies over 1 MiB are refused with 413.
+
 ### Decision report: `npm run decisions`
 
-Summarizes every `loadout.decision` entry: profile distribution, confidence
-p10/p50/p90, low-confidence rate, selected skills and classifier latency.
+Summarizes every `loadout.decision` entry: profile distribution, risk p10/p50/p90, the share
+of turns that kept the baseline, failures by reason, selected skills and classifier latency.
 Useful on your normal day-to-day sessions, or on one benchmark arm:
 
 ```bash

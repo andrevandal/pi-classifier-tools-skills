@@ -1,0 +1,1 @@
+{"laya":{"transport":"http","endpoint":"http://127.0.0.1:8765/","apiKeyEnvVar":"","timeoutMs":20000},"skills":{"enabled":false}}
