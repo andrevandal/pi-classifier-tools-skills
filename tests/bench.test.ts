@@ -30,7 +30,7 @@ function setup() {
   fs.writeFileSync(
     tasks,
     JSON.stringify([
-      { id: "explain", prompt: "what is this repo?", check: "test -f done.txt" },
+      { id: "explain", prompt: "what is this repo?", check: 'test -f done.txt && grep -q "ANSWER: 42" "$BENCH_LOG"' },
       { id: "missing-check", prompt: "do something", check: "test -f never.txt" },
     ]),
   );

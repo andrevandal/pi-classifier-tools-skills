@@ -198,7 +198,9 @@ npm run bench -- --repo ~/code/my-project --tasks my-tasks.json --model <model> 
 
 A task is `{ "id", "prompt", "check"? }`. `check` runs in the worktree after the
 agent finishes, and exit 0 counts as a pass, e.g. `npm test`, or `git diff --quiet`
-for "should not have changed anything". Before every run the worktree is reset
+for "should not have changed anything". `$BENCH_LOG` holds the agent's output,
+so a question can be graded too, e.g. ask for a final `ANSWER: ...` line and
+`grep` for it. Before every run the worktree is reset
 to `--ref` (`git reset --hard` + `git clean -fd`; ignored files such as
 `node_modules` are kept). The arm that goes first alternates per task.
 

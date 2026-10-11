@@ -73,7 +73,10 @@ if (values.help || !values.repo || !values.tasks) {
 interface Task {
   id: string;
   prompt: string;
-  /** Shell command run in the worktree after the agent finishes; exit 0 = pass. */
+  /**
+   * Shell command run in the worktree after the agent finishes; exit 0 = pass.
+   * `$BENCH_LOG` is the agent's output, so a check can grade an answer too.
+   */
   check?: string;
 }
 
@@ -248,7 +251,12 @@ for (let run = 1; run <= runs; run++) {
 
       let pass: boolean | null = null;
       if (task.check) {
-        const check = spawnSync("sh", ["-c", task.check], { cwd, encoding: "utf8", timeout: timeoutMs });
+        const check = spawnSync("sh", ["-c", task.check], {
+          cwd,
+          encoding: "utf8",
+          timeout: timeoutMs,
+          env: { ...process.env, BENCH_LOG: logFile },
+        });
         fs.appendFileSync(logFile, `\n--- check: ${task.check}\n${check.stdout ?? ""}${check.stderr ?? ""}`);
         pass = check.status === 0;
       }

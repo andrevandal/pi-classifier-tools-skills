@@ -51,4 +51,4 @@ const entries = [
   },
 ];
 fs.writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`);
-console.log("fake omp done");
+console.log("fake omp done\nANSWER: 42");
