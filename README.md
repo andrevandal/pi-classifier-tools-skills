@@ -113,7 +113,7 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `tools.profiles` | see below | profile id -> tool names, or `"*"` for the whole baseline |
 | `tools.alwaysOn` | `[]` | tools added to every profile (still limited to the baseline) |
 | `tools.maxRisk` | `0.1` | most probability mass allowed on profiles broader than the chosen one; above it the baseline is kept. Profiles must be nested: each one's tools fit inside the next |
-| `skills.enabled` | `true` | select skills |
+| `skills.enabled` | `false` | select skills; skipped above `maxCandidates`. Unmeasured: the bench and `npm run decisions` do not judge skill choices yet |
 | `skills.mode` | `"auto"` | `"auto"`, `"filter"` (pi only), or `"hint"` |
 | `skills.threshold` | `0.5` | minimum yes-probability for a skill to be selected |
 | `skills.maxSkills` | `5` | most skills selected per turn |

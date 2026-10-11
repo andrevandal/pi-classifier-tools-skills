@@ -28,6 +28,7 @@
     "maxRisk": 0.1
   },
   "skills": {
+    "enabled": true,
     "mode": "hint",
     "threshold": 0.6,
     "maxSkills": 3,

@@ -75,7 +75,7 @@ export function defaultConfig(): LoadoutConfig {
       maxRisk: 0.1,
     },
     skills: {
-      enabled: true,
+      enabled: false,
       mode: "auto",
       threshold: 0.5,
       maxSkills: 5,

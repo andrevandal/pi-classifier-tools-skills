@@ -31,7 +31,11 @@ let sessionCounter = 0;
 function writeConfig(config: Record<string, unknown>): void {
   const endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/systemone`;
   const file = path.join(home, ".omp", "loadout.json");
-  fs.writeFileSync(file, JSON.stringify({ backend: "jev", ...config, jev: { endpoint, apiKeyEnvVar: TOKEN_VAR } }));
+  const skills = { enabled: true };
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ backend: "jev", skills, ...config, jev: { endpoint, apiKeyEnvVar: TOKEN_VAR } }),
+  );
 }
 
 before(async () => {
