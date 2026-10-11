@@ -111,4 +111,13 @@ test("an explicit path replaces the search, and a missing one is an error", () =
   const missing = loadConfig(project, { projectTrusted: true, home, explicitPath: path.join(project, "nope.json") });
   assert.equal(missing.source, null);
   assert.match(missing.errors.join("\n"), /LOADOUT_CONFIG/);
+  assert.equal(missing.config.enabled, false);
+});
+
+test("a file with errors disables the plugin instead of running on defaults", () => {
+  const { home, project } = tempDirs();
+  write(home, "loadout.json", { jev: { timeoutMs: 30000 } });
+  const result = loadConfig(project, { projectTrusted: true, home });
+  assert.equal(result.config.enabled, false);
+  assert.match(result.errors.join("\n"), /"jev\.timeoutMs" must be between 1 and 20000/);
 });

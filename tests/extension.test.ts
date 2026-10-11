@@ -231,3 +231,16 @@ test("a failed classification is recorded as a decision with its failure", async
   assert.equal(record.tools, null);
   host.shutdown();
 });
+
+test("an out-of-range timeout disables the plugin: it reports the error and classifies nothing", async () => {
+  fs.writeFileSync(
+    path.join(home, ".omp", "loadout.json"),
+    JSON.stringify({ backend: "jev", jev: { timeoutMs: 30000 } }),
+  );
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  assert.match(host.notes.join("\n"), /config error: .*jev\.timeoutMs/);
+  assert.equal(requests.length, 0);
+  assert.deepEqual(host.active(), BASELINE);
+  host.shutdown();
+});

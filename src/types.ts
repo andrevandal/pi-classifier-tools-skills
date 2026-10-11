@@ -90,6 +90,8 @@ export interface ClassifyOptions {
   signal?: AbortSignal;
 }
 
+export type Readiness = "ready" | "warming" | "failed";
+
 /**
  * A classifier turns state + typed questions into typed answers.
  *
@@ -106,6 +108,8 @@ export interface Classifier {
    */
   warmup?(options?: ClassifyOptions): Promise<void>;
   classify(state: ClassifierState, questions: Questions, options?: ClassifyOptions): Promise<ClassificationResult>;
+  /** `warming` while the backend loads, `failed` after it died, otherwise `ready`. Never blocks. */
+  readiness(): Readiness;
   /** Release resources (HTTP handles, sidecar processes). Idempotent. */
   dispose(): Promise<void>;
 }

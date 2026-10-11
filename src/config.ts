@@ -23,6 +23,8 @@ import type { LoadoutConfig, LoadoutConfigInput, ToolList } from "./types.ts";
 
 export const CONFIG_BASENAME = "loadout";
 const MIN_PROMPT_CHARS = 200;
+/** Longest classification budget a backend may ask for; a turn never waits longer. */
+export const MAX_BACKEND_TIMEOUT_MS = 20_000;
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "glob", "lsp", "web_search", "todo"];
 
 export function defaultConfig(): LoadoutConfig {
@@ -160,11 +162,13 @@ export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
     warnings.push(...parsed.warnings.map((w) => `${source.path}: ${w}`));
     if (parsed.errors.length > 0) {
       errors.push(...parsed.errors.map((e) => `${source.path}: ${e}`));
-      return { config: defaultConfig(), source: null, errors, warnings };
+      return { config: { ...defaultConfig(), enabled: false }, source: null, errors, warnings };
     }
     return { config: parsed.config, source: source.path, errors, warnings };
   }
-  return { config: defaultConfig(), source: null, errors, warnings };
+  // A file that was named but could not be used disables the plugin rather than running on guessed defaults.
+  const config = errors.length > 0 ? { ...defaultConfig(), enabled: false } : defaultConfig();
+  return { config, source: null, errors, warnings };
 }
 
 const SECTIONS = ["jev", "laya", "tools", "skills"] as const;
@@ -273,8 +277,8 @@ export function parseConfig(raw: unknown): { config: LoadoutConfig; errors: stri
   checkRange(errors, "skills.threshold", config.skills.threshold, 0, 1);
   checkRange(errors, "skills.maxSkills", config.skills.maxSkills, 1);
   checkRange(errors, "skills.maxCandidates", config.skills.maxCandidates, 1);
-  checkRange(errors, "jev.timeoutMs", config.jev.timeoutMs, 1);
-  checkRange(errors, "laya.timeoutMs", config.laya.timeoutMs, 1);
+  checkRange(errors, "jev.timeoutMs", config.jev.timeoutMs, 1, MAX_BACKEND_TIMEOUT_MS);
+  checkRange(errors, "laya.timeoutMs", config.laya.timeoutMs, 1, MAX_BACKEND_TIMEOUT_MS);
   if (config.maxPromptChars !== null) checkRange(errors, "maxPromptChars", config.maxPromptChars, MIN_PROMPT_CHARS);
   validateTools(config, errors);
 

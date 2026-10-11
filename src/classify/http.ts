@@ -21,6 +21,7 @@ import type {
   ClassifierState,
   ClassifyOptions,
   Questions,
+  Readiness,
 } from "../types.ts";
 import type { ClassifierDeps } from "./index.ts";
 
@@ -58,6 +59,11 @@ export function createHttpClassifier(options: HttpClassifierOptions, deps: Class
      * `classify` works without a prior warmup.
      */
     async warmup(): Promise<void> {},
+
+    /** HTTP has no load phase: every request is served on arrival. */
+    readiness(): Readiness {
+      return "ready";
+    },
 
     async classify(
       state: ClassifierState,
