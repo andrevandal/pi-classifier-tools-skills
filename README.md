@@ -206,10 +206,10 @@ to `--ref` (`git reset --hard` + `git clean -fd`; ignored files such as
 
 Output in `bench-results/<timestamp>/`:
 
-- `summary.md`: a `## Selection` section (below), then pass rate, cost, input tokens, cache
-  rate, requests, errors, tool calls and wall time per arm and per task, plus `loadout vs control`
-  deltas. If a run has no usable decision, or the two arms chose different profiles for the
-  same prompt, the summary starts with `**INVALID**` and the script exits 2.
+- `summary.md`: pass rate, cost, input tokens, cache rate, requests, errors, tool calls and wall
+  time per arm and per task, plus `loadout vs control` deltas, then a `## Selection` section (below).
+  If more than 5% of runs have no usable decision, or the two arms chose different profiles for
+  any prompt, the summary starts with `**INVALID**` and the script exits 2.
 - `results.jsonl`: one row per run, including the chosen profile, its risk, the classifier
   failure (if any), selected skills and classifier latency.
 - `logs/`: agent output and check output per run.
@@ -254,8 +254,9 @@ npm run eval -- --labels my-labels.jsonl --config my-config.json
 
 `bench/labels.jsonl` holds the 16 prompts from the bench task files, labeled. Sixteen
 labels are too few to recommend a `maxRisk`: even with no over-narrowing, the 95% upper bound
-stays above 5%, so the script says so rather than guessing. `--json` prints the same report
-as data.
+stays above 5%, so the script says so rather than guessing. Zero over-narrowing needs at least
+73 labels to meet that bound. The script exits 2 when every label fails, so a dead backend is
+not mistaken for a result. `--json` prints the same report as data.
 
 ### Benchmarking with a warm Laya server
 
@@ -271,7 +272,9 @@ npm run bench -- --repo <repo> --tasks <tasks.json> --config bench/laya-http.exa
 `bench/laya-http.example.json` only points the plugin at the server. The server binds to
 127.0.0.1 by default. To serve another host, pass `--host <addr> --allow-remote` and set
 `LAYA_SERVER_TOKEN`. A token in that variable is enforced on any host: every POST must then
-send `Authorization: Bearer <token>`. Request bodies over 1 MiB are refused with 413.
+send `Authorization: Bearer <token>`. The plugin sends it when `laya.apiKeyEnvVar` names an
+environment variable holding that token; the example config leaves it empty, so set it to
+`LAYA_SERVER_TOKEN` for a token-protected server. Request bodies over 1 MiB are refused with 413.
 
 ### Decision report: `npm run decisions`
 

@@ -17,6 +17,7 @@ are refused with 413 before they are read.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import sys
@@ -56,7 +57,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(413, {"error": "request too large"})
                 return
             body = self.rfile.read(length)
-            if TOKEN and self.headers.get("Authorization") != f"Bearer {TOKEN}":
+            presented = self.headers.get("Authorization", "")
+            if TOKEN and not hmac.compare_digest(presented.encode(), f"Bearer {TOKEN}".encode()):
                 self._send(401, {"error": "unauthorized"})
                 return
             request = json.loads(body)

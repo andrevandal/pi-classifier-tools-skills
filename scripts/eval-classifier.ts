@@ -57,6 +57,8 @@ if (values.help) {
 const RISK_LEVELS = [0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5];
 /** A level is recommended only if its 95% upper bound on over-narrowing is at most this. */
 const TARGET_OVER_NARROW = 0.05;
+/** Labels needed before a level with no over-narrowing meets the bound: with zero successes the Wilson upper bound is about z^2 / (n + z^2). */
+const LABELS_FOR_ZERO_OVER = Math.ceil(1.96 ** 2 * (1 / TARGET_OVER_NARROW - 1));
 /** How long to wait for a warming backend before giving up. */
 const WARMUP_LIMIT_MS = 600_000;
 /** Shorter first prompts are rarely about tool selection, so `--mine` drops them. */
@@ -264,7 +266,7 @@ function renderMarkdown(report: Report): string {
     ),
     ``,
     report.recommended === null
-      ? `recommended maxRisk: none. No level keeps the 95% upper bound on over-narrowing at or below ${pct(TARGET_OVER_NARROW)} with ${report.labels} labels; keep ${report.maxRisk}.`
+      ? `recommended maxRisk: none. No level keeps the 95% upper bound on over-narrowing at or below ${pct(TARGET_OVER_NARROW)} with ${report.labels} labels. Even zero over-narrowing needs ${LABELS_FOR_ZERO_OVER} labels to meet it; keep ${report.maxRisk}.`
       : `recommended maxRisk: ${report.recommended} (95% upper bound on over-narrowing <= ${pct(TARGET_OVER_NARROW)}).`,
   ];
   if (report.failures.length > 0) {
@@ -287,6 +289,10 @@ async function evaluate(): Promise<void> {
     const rows = await classifyAll(labels, classifier, config);
     const report = buildReport(config, order, rows);
     console.log(values.json ? JSON.stringify(report, null, 2) : renderMarkdown(report));
+    if (report.failures.length === report.labels) {
+      process.exitCode = 2;
+      console.error("every label failed: the backend is not answering");
+    }
   } finally {
     await classifier.dispose();
   }

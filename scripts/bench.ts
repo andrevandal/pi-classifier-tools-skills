@@ -452,7 +452,8 @@ const missing = pairs.flatMap((p) => {
 });
 const missingTotal = missing.reduce((s, m) => s + m.tools.length, 0);
 
-const ratios = pairs.flatMap((p) => (p.control.ptpr > 0 ? [p.loadout.ptpr / p.control.ptpr - 1] : []));
+const measured = pairs.filter((p) => p.loadout.ptpr > 0 && p.control.ptpr > 0);
+const ratios = measured.map((p) => p.loadout.ptpr / p.control.ptpr - 1);
 const meanRatio = ratios.reduce((s, r) => s + r, 0) / ratios.length;
 const interval = bootstrapMean(ratios);
 
@@ -488,6 +489,7 @@ const selection = [
     "prompt tokens/request, loadout vs control",
     `${signedPct(meanRatio)} (95% CI ${signedPct(interval.low)} to ${signedPct(interval.high)})`,
   ]),
+  mdRow(["pairs without model requests (left out of the ratio)", String(pairs.length - measured.length)]),
   ``,
   `**Verdict: ${verdict}**`,
   ``,

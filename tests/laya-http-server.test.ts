@@ -99,17 +99,17 @@ if (probe.error || probe.status !== 0) {
     const child = await start(port, baseEnv());
     t.after(() => child.kill());
 
-    const status = await new Promise<number>((resolve, reject) => {
-      const request = http.request(
-        { host: "127.0.0.1", port, method: "POST", headers: { "Content-Length": String(1_048_577) } },
-        (response) => {
-          response.resume();
-          resolve(response.statusCode ?? 0);
-        },
-      );
-      request.on("error", reject);
-      request.end();
-    });
+    const { promise, resolve, reject } = Promise.withResolvers<number>();
+    const request = http.request(
+      { host: "127.0.0.1", port, method: "POST", headers: { "Content-Length": String(1_048_577) } },
+      (response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      },
+    );
+    request.on("error", reject);
+    request.end();
+    const status = await promise;
     assert.equal(status, 413);
   });
 

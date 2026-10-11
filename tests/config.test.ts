@@ -131,3 +131,8 @@ test("tools.profiles must nest: each profile's tools fit inside the next", () =>
   });
   assert.match(errors.join("\n"), /"tools\.profiles" must be nested/);
 });
+
+test("the shipped example loadout parses without errors", () => {
+  const raw: unknown = JSON.parse(fs.readFileSync(new URL("../examples/loadout.json", import.meta.url), "utf8"));
+  assert.deepEqual(parseConfig(raw).errors, []);
+});

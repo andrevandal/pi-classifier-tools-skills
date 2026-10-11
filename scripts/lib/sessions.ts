@@ -88,7 +88,9 @@ export function emptyMetrics(): UsageMetrics {
 export function addFile(metrics: UsageMetrics, file: string): UsageMetrics {
   for (const entry of readEntries(file)) {
     if (entry.type === "custom" && entry.customType === DECISION_ENTRY) {
-      metrics.decisions.push({ ...(entry.data as Decision), timestamp: entry.timestamp as string, file });
+      // Only current-format records: older transcripts lack the fields the report reads.
+      const data = entry.data as Partial<Decision> | undefined;
+      if (data?.v === 2) metrics.decisions.push({ ...(data as Decision), timestamp: entry.timestamp as string, file });
       continue;
     }
     if (entry.type !== "message") continue;
