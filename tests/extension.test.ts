@@ -117,6 +117,7 @@ function fakeHost(kind: "pi" | "omp") {
     },
     command: (args: string) => commands.get("loadout")!.handler(args, ctx),
     shutdown: () => handlers.get("session_shutdown")!({}, ctx),
+    compact: () => handlers.get("session_compact")!({}, ctx),
   };
 }
 
@@ -242,5 +243,26 @@ test("an out-of-range timeout disables the plugin: it reports the error and clas
   assert.match(host.notes.join("\n"), /config error: .*jev\.timeoutMs/);
   assert.equal(requests.length, 0);
   assert.deepEqual(host.active(), BASELINE);
+  host.shutdown();
+});
+
+test("once narrowed, tools only widen until compaction", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  assert.deepEqual(host.active(), ["read", "grep", "find", "ls"]);
+
+  reply.answers.tool_profile = { type: "choice", choice: "full", probabilities: { full: 0.9 }, confidence: 0.9 };
+  await host.prompt("run the tests");
+  assert.deepEqual(host.active(), BASELINE);
+
+  reply.answers.tool_profile = { type: "choice", choice: "answer", probabilities: { answer: 0.9 }, confidence: 0.9 };
+  await host.prompt("explain that");
+  assert.deepEqual(host.active(), BASELINE);
+  const blocked = host.entries.at(-1)?.data as TurnRecord;
+  assert.equal(blocked.applied, "full");
+
+  await host.compact();
+  await host.prompt("explain once more");
+  assert.deepEqual(host.active(), ["read", "grep", "find", "ls"]);
   host.shutdown();
 });

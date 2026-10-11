@@ -21,7 +21,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
-import { buildQuestions, isSlashCommand, skillCandidates } from "./select.ts";
+import { buildQuestions, isSlashCommand, profileOrder, skillCandidates } from "./select.ts";
 import { errorText, runTurn } from "./turn.ts";
 import type { Classifier, LoadoutConfig, SkillCandidate, TurnRecord } from "./types.ts";
 
@@ -49,6 +49,10 @@ interface SessionState {
   baseline: string[] | null;
   /** What this extension last activated, to notice changes made by anyone else. */
   lastApplied: string[] | null;
+  /** Rank in `profileOrder` of the tools in force; the broadest is the baseline. Null before the first decision. */
+  appliedRank: number | null;
+  /** Whether the next decision may narrow: at the start, and again after compaction or `/loadout on|off`. */
+  allowNarrow: boolean;
   /** Outcome of the latest turn, including a failed one. */
   lastRecord: TurnRecord | null;
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
@@ -137,6 +141,12 @@ function dropClassifier(state: SessionState): void {
   releaseClassifier(state.classifierKey);
 }
 
+/** Start a fresh ratchet: the next decision may narrow again. */
+function resetRatchet(state: SessionState): void {
+  state.appliedRank = null;
+  state.allowNarrow = true;
+}
+
 /** Load (or reload, when cwd or project trust changed) this session's config. */
 function ensureSession(ctx: ExtensionContext): SessionState {
   const key = sessionKey(ctx);
@@ -162,6 +172,9 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     baseline: existing?.baseline ?? null,
     lastApplied: existing?.lastApplied ?? null,
     lastRecord: existing?.lastRecord ?? null,
+    // A config reload is not a new session: keep the ratchet, so a cwd change cannot reopen narrowing.
+    appliedRank: existing?.appliedRank ?? null,
+    allowNarrow: existing?.allowNarrow ?? true,
     lastFailure: null,
   };
   sessions.set(key, state);
@@ -260,7 +273,17 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
       baseline,
       candidates,
     });
-    if (decision) record.applied = decision.tools.profile;
+    const order = profileOrder(config.tools);
+    const broadest = order.length - 1;
+    // A failed turn and a "don't know" turn both want the baseline, which is the broadest rank.
+    const target = decision?.tools.active ? order.indexOf(decision.tools.profile ?? "") : broadest;
+    // Widen-only ratchet: once narrowed, a later turn may keep or widen the tools, never narrow them further.
+    const admitted = state.allowNarrow || state.appliedRank === null || target >= state.appliedRank;
+    if (admitted) {
+      state.appliedRank = target;
+      state.allowNarrow = false;
+    }
+    record.applied = config.tools.enabled && state.appliedRank !== null ? (order[state.appliedRank] ?? null) : null;
     state.lastRecord = record;
     pi.appendEntry(DECISION_ENTRY, record);
 
@@ -278,7 +301,7 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     notify(ctx, config, `${config.dryRun ? "(dry run) " : ""}${summarize(record, baseline.length)}`, "info");
     if (config.dryRun) return;
 
-    await activateTools(pi, state, decision.tools.active ?? baseline);
+    if (admitted) await activateTools(pi, state, decision.tools.active ?? baseline);
 
     const selected = decision.skills.selected;
     if (selected === null) return;
@@ -367,6 +390,12 @@ export default function loadout(pi: ExtensionAPI): void {
     dropClassifier(state);
   });
 
+  pi.on("session_compact", (_event, ctx) => {
+    // Compaction summarizes the history, so the next decision may narrow again.
+    const state = sessions.get(sessionKey(ctx));
+    if (state) state.allowNarrow = true;
+  });
+
   pi.on("before_agent_start", (event, ctx) => onBeforeAgentStart(pi, event as PromptEvent, ctx));
 
   pi.registerCommand(COMMAND, {
@@ -387,11 +416,13 @@ export default function loadout(pi: ExtensionAPI): void {
           return;
         case "on":
           state.config.enabled = true;
+          resetRatchet(state);
           classifierFor(state);
           ctx.ui.notify(`${PREFIX} selection enabled`, "info");
           return;
         case "off":
           state.config.enabled = false;
+          resetRatchet(state);
           await restoreBaseline(pi, state);
           ctx.ui.notify(`${PREFIX} selection disabled; full loadout restored`, "info");
           return;
