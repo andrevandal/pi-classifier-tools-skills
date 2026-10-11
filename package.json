@@ -34,7 +34,8 @@
     "lint": "biome check .",
     "format": "biome format --write .",
     "bench": "node scripts/bench.ts",
-    "decisions": "node scripts/decisions.ts"
+    "decisions": "node scripts/decisions.ts",
+    "eval": "node scripts/eval-classifier.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",

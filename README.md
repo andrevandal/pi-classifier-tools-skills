@@ -238,6 +238,25 @@ needed tool was missing, the loadout passed at least as many checks as control, 
 interval lies below zero. Otherwise it reads `NOT PROVEN` with the reasons. Over-narrowing
 is reported but does not decide the verdict.
 
+### Evaluating the classifier: `npm run eval`
+
+The bench measures a whole session, which is slow and noisy. `npm run eval` measures the
+classifier alone: it sends each labeled prompt through the same backend and questions the
+plugin uses, and reports the confusion matrix and how `tools.maxRisk` trades coverage
+against over-narrowing (a prompt given a narrower profile than it needs, so a tool goes
+missing).
+
+```bash
+npm run eval -- --mine --out my-labels.jsonl --since 30d   # first prompts from past sessions
+# add "expect": "answer" | "edit" | "full" to each line by hand, then:
+npm run eval -- --labels my-labels.jsonl --config my-config.json
+```
+
+`bench/labels.jsonl` holds the 16 prompts from the bench task files, labeled. Sixteen
+labels are too few to recommend a `maxRisk`: even with no over-narrowing, the 95% upper bound
+stays above 5%, so the script says so rather than guessing. `--json` prints the same report
+as data.
+
 ### Benchmarking with a warm Laya server
 
 Each `omp -p` run is a fresh process, so the local sidecar reloads the model every
