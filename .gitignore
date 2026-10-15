@@ -3,3 +3,7 @@ node_modules/
 .npmrc
 __pycache__/
 bench-results/
+
+# Local orchestration state and isolated issue worktrees
+/HANDOFF.md
+/.worktrees/
