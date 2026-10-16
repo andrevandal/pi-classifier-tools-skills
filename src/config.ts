@@ -11,8 +11,14 @@
  * so a cloned repository must not be able to supply one.
  *
  * The first file that parses and validates wins. A file that parses but holds a
- * bad value is rejected and the defaults apply, because silently mis-selecting
- * tools is worse than leaving the loadout alone.
+ * bad value is rejected: the plugin turns itself off and reports the error,
+ * because silently mis-selecting tools is worse than leaving the loadout alone.
+ *
+ * `telemetry: false` in `~/.omp/loadout.*` is a machine-wide ceiling. It is read
+ * outside the search above, so no project or `LOADOUT_CONFIG` file can lift it;
+ * those files can only turn telemetry off. An unreadable machine setting or any
+ * config error also means no persistence (fail closed). It is applied when a
+ * session loads its config, so a change needs a restart.
  */
 
 import * as fs from "node:fs";
@@ -20,7 +26,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { profileOrder } from "./select.ts";
-import type { LoadoutConfig, LoadoutConfigInput, ToolList } from "./types.ts";
+import type { LoadoutConfig, LoadoutConfigInput, TelemetryState, ToolList } from "./types.ts";
 
 export const CONFIG_BASENAME = "loadout";
 const MIN_PROMPT_CHARS = 200;
@@ -86,6 +92,7 @@ export function defaultConfig(): LoadoutConfig {
     maxPromptChars: 8000,
     dryRun: false,
     notify: true,
+    telemetry: true,
   };
 }
 
@@ -98,6 +105,10 @@ export interface LoadResult {
   config: LoadoutConfig;
   /** The file the config came from, or null when the defaults apply. */
   source: string | null;
+  /** Which kind of file `source` is; null when the defaults apply. */
+  scope: ConfigSource["scope"] | null;
+  /** Whether this session may persist trace records, and why not. */
+  telemetry: TelemetryState;
   errors: string[];
   warnings: string[];
 }
@@ -117,15 +128,20 @@ function bunYaml(): ((text: string) => unknown) | null {
   return typeof parse === "function" ? (text) => parse.call(bun?.YAML, text) : null;
 }
 
-export function configCandidates(cwd: string, home: string): ConfigSource[] {
-  const files = (dir: string, scope: ConfigSource["scope"]): ConfigSource[] =>
-    ["json", "yml", "yaml"].map((ext) => ({ path: path.join(dir, ".omp", `${CONFIG_BASENAME}.${ext}`), scope }));
-  return [...files(cwd, "project"), ...files(home, "global")];
+function configFiles(dir: string, scope: ConfigSource["scope"]): ConfigSource[] {
+  return ["json", "yml", "yaml"].map((ext) => ({ path: path.join(dir, ".omp", `${CONFIG_BASENAME}.${ext}`), scope }));
 }
 
-export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
-  const home = options.home ?? os.homedir();
-  const parseYaml = options.parseYaml === undefined ? bunYaml() : options.parseYaml;
+export function configCandidates(cwd: string, home: string): ConfigSource[] {
+  return [...configFiles(cwd, "project"), ...configFiles(home, "global")];
+}
+
+function searchConfig(
+  cwd: string,
+  options: LoadOptions,
+  home: string,
+  parseYaml: ((text: string) => unknown) | null,
+): Omit<LoadResult, "telemetry"> {
   const errors: string[] = [];
   const warnings: string[] = [];
   const projectIsHome = path.resolve(cwd) === path.resolve(home);
@@ -163,13 +179,63 @@ export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
     warnings.push(...parsed.warnings.map((w) => `${source.path}: ${w}`));
     if (parsed.errors.length > 0) {
       errors.push(...parsed.errors.map((e) => `${source.path}: ${e}`));
-      return { config: { ...defaultConfig(), enabled: false }, source: null, errors, warnings };
+      return { config: { ...defaultConfig(), enabled: false }, source: null, scope: null, errors, warnings };
     }
-    return { config: parsed.config, source: source.path, errors, warnings };
+    return { config: parsed.config, source: source.path, scope: source.scope, errors, warnings };
   }
   // A file that was named but could not be used disables the plugin rather than running on guessed defaults.
   const config = errors.length > 0 ? { ...defaultConfig(), enabled: false } : defaultConfig();
-  return { config, source: null, errors, warnings };
+  return { config, source: null, scope: null, errors, warnings };
+}
+
+/**
+ * The machine-level `telemetry` setting in the first existing `~/.omp/loadout.*`
+ * file. It is read outside the normal search so nothing a project or
+ * `LOADOUT_CONFIG` says can lift it. Anything unreadable is `"unreadable"`, which
+ * callers treat as off. `"on"` and `"absent"` behave alike: it is a ceiling, not a force.
+ */
+export type MachineTelemetry = "absent" | "on" | "off" | "unreadable";
+
+export function readMachineTelemetry(
+  home: string,
+  parseYaml: ((text: string) => unknown) | null = bunYaml(),
+): MachineTelemetry {
+  for (const source of configFiles(home, "global")) {
+    let text: string;
+    try {
+      text = fs.readFileSync(source.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return "unreadable";
+    }
+    let raw: unknown;
+    try {
+      if (source.path.endsWith(".json")) raw = JSON.parse(text);
+      else if (parseYaml) raw = parseYaml(text);
+      else return "unreadable";
+    } catch {
+      return "unreadable";
+    }
+    if (!isRecord(raw)) return "unreadable";
+    if (!Object.hasOwn(raw, "telemetry")) return "absent";
+    return raw.telemetry === false ? "off" : raw.telemetry === true ? "on" : "unreadable";
+  }
+  return "absent";
+}
+
+function resolveTelemetry(machine: MachineTelemetry, found: Omit<LoadResult, "telemetry">): TelemetryState {
+  if (machine === "off") return { persist: false, reason: "machine-off" };
+  if (machine === "unreadable") return { persist: false, reason: "machine-unreadable" };
+  if (found.errors.length > 0) return { persist: false, reason: "config-error" };
+  if (!found.config.telemetry) return { persist: false, reason: "config-off" };
+  return { persist: true, reason: "default" };
+}
+
+export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
+  const home = options.home ?? os.homedir();
+  const parseYaml = options.parseYaml === undefined ? bunYaml() : options.parseYaml;
+  const found = searchConfig(cwd, options, home, parseYaml);
+  return { ...found, telemetry: resolveTelemetry(readMachineTelemetry(home, parseYaml), found) };
 }
 
 const SECTIONS = ["jev", "laya", "tools", "skills"] as const;

@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { defaultConfig, loadConfig, parseConfig } from "../src/config.ts";
+import { defaultConfig, loadConfig, parseConfig, readMachineTelemetry } from "../src/config.ts";
 
 function tempDirs(): { home: string; project: string } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "loadout-config-"));
@@ -135,4 +135,150 @@ test("tools.profiles must nest: each profile's tools fit inside the next", () =>
 test("the shipped example loadout parses without errors", () => {
   const raw: unknown = JSON.parse(fs.readFileSync(new URL("../examples/loadout.json", import.meta.url), "utf8"));
   assert.deepEqual(parseConfig(raw).errors, []);
+});
+
+test("no file means telemetry on by default", () => {
+  const { home, project } = tempDirs();
+  const result = loadConfig(project, { projectTrusted: true, home });
+  assert.deepEqual(result.telemetry, { persist: true, reason: "default" });
+  assert.equal(result.config.telemetry, true);
+  assert.equal(result.scope, null);
+});
+
+test("the machine telemetry setting is a ceiling that nothing else lifts", () => {
+  const yml = (text: string) => text;
+  const cases: Array<{ name: string; setup: (d: { home: string; project: string }) => object; reason: string }> = [
+    {
+      name: "trusted project cannot lift it",
+      setup: ({ home, project }) => {
+        write(home, "loadout.json", { telemetry: false });
+        write(project, "loadout.json", { telemetry: true });
+        return { projectTrusted: true };
+      },
+      reason: "machine-off",
+    },
+    {
+      name: "explicit file cannot lift it",
+      setup: ({ home, project }) => {
+        write(home, "loadout.json", { telemetry: false });
+        write(project, "explicit.json", { telemetry: true });
+        return { projectTrusted: true, explicitPath: path.join(project, ".omp", "explicit.json") };
+      },
+      reason: "machine-off",
+    },
+    {
+      name: "project can turn it off",
+      setup: ({ home, project }) => {
+        write(home, "loadout.json", { telemetry: true });
+        write(project, "loadout.json", { telemetry: false });
+        return { projectTrusted: true };
+      },
+      reason: "config-off",
+    },
+    {
+      name: "explicit file can turn it off",
+      setup: ({ project }) => {
+        write(project, "explicit.json", { telemetry: false });
+        return { projectTrusted: true, explicitPath: path.join(project, ".omp", "explicit.json") };
+      },
+      reason: "config-off",
+    },
+    {
+      name: "machine off outranks a config error",
+      setup: ({ home, project }) => {
+        write(home, "loadout.json", { telemetry: false });
+        write(project, "loadout.json", { dryRun: "x" });
+        return { projectTrusted: true };
+      },
+      reason: "machine-off",
+    },
+    {
+      name: "a config error fails closed",
+      setup: ({ project }) => {
+        write(project, "loadout.json", { dryRun: "x" });
+        return { projectTrusted: true };
+      },
+      reason: "config-error",
+    },
+    {
+      name: "non-boolean machine value",
+      setup: ({ home }) => {
+        write(home, "loadout.json", { telemetry: "no" });
+        return { projectTrusted: true };
+      },
+      reason: "machine-unreadable",
+    },
+    {
+      name: "malformed machine file",
+      setup: ({ home }) => {
+        write(home, "loadout.json", "{ not json");
+        return { projectTrusted: true };
+      },
+      reason: "machine-unreadable",
+    },
+    {
+      name: "non-object machine file",
+      setup: ({ home }) => {
+        write(home, "loadout.json", "[]");
+        return { projectTrusted: true };
+      },
+      reason: "machine-unreadable",
+    },
+    {
+      name: "machine YAML without a parser",
+      setup: ({ home }) => {
+        write(home, "loadout.yml", yml("telemetry: false\n"));
+        return { projectTrusted: true, parseYaml: null };
+      },
+      reason: "machine-unreadable",
+    },
+    {
+      name: "machine YAML with a parser",
+      setup: ({ home }) => {
+        write(home, "loadout.yml", yml("telemetry: false\n"));
+        return { projectTrusted: true, parseYaml: () => ({ telemetry: false }) };
+      },
+      reason: "machine-off",
+    },
+  ];
+  for (const { name, setup, reason } of cases) {
+    const dirs = tempDirs();
+    const options = setup(dirs);
+    const result = loadConfig(dirs.project, { ...options, projectTrusted: true, home: dirs.home });
+    assert.deepEqual(result.telemetry, { persist: false, reason }, name);
+  }
+});
+
+test("readMachineTelemetry reads only the first existing machine file", () => {
+  const { home } = tempDirs();
+  assert.equal(readMachineTelemetry(home, null), "absent");
+  write(home, "loadout.json", { telemetry: true });
+  assert.equal(readMachineTelemetry(home, null), "on");
+  write(home, "loadout.json", { telemetry: false });
+  assert.equal(readMachineTelemetry(home, null), "off");
+  write(home, "loadout.json", { notify: false });
+  write(home, "loadout.yml", "telemetry: false\n");
+  assert.equal(
+    readMachineTelemetry(home, () => ({ telemetry: false })),
+    "absent",
+  );
+
+  const other = tempDirs();
+  fs.mkdirSync(path.join(other.home, ".omp", "loadout.json"));
+  assert.equal(readMachineTelemetry(other.home, null), "unreadable");
+});
+
+test("scope names the kind of file the config came from", () => {
+  const { home, project } = tempDirs();
+  assert.equal(loadConfig(project, { projectTrusted: true, home }).scope, null);
+  write(home, "loadout.json", { notify: false });
+  assert.equal(loadConfig(project, { projectTrusted: true, home }).scope, "global");
+  write(project, "loadout.json", { notify: false });
+  assert.equal(loadConfig(project, { projectTrusted: true, home }).scope, "project");
+  const explicitPath = path.join(project, ".omp", "loadout.json");
+  assert.equal(loadConfig(project, { projectTrusted: true, home, explicitPath }).scope, "explicit");
+});
+
+test("a non-boolean telemetry value rejects the file", () => {
+  assert.match(parseConfig({ telemetry: "no" }).errors.join("\n"), /telemetry/);
 });

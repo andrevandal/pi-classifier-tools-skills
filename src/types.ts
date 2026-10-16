@@ -254,6 +254,15 @@ export interface LoadoutConfig {
   /** Classify and record, but never change tools or skills. */
   dryRun: boolean;
   notify: boolean;
+  /** Persist plugin-owned trace records; a machine-level `false` outranks this key. */
+  telemetry: boolean;
+}
+
+/** Why records are or are not persisted, in precedence order. */
+export type TelemetryReason = "machine-off" | "machine-unreadable" | "config-error" | "config-off" | "default";
+export interface TelemetryState {
+  persist: boolean;
+  reason: TelemetryReason;
 }
 
 export interface LoadoutConfigInput {
@@ -266,6 +275,7 @@ export interface LoadoutConfigInput {
   maxPromptChars?: number | null;
   dryRun?: boolean;
   notify?: boolean;
+  telemetry?: boolean;
 }
 
 /** A skill as the classifier sees it. */
