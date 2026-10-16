@@ -8,12 +8,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { TurnRecord } from "../../src/types.ts";
-
-export const DECISION_ENTRY = "loadout.decision";
+import { DECISION_ENTRY, type DecisionView, normalizeDecision } from "../../src/telemetry.ts";
 
 /** One `loadout.decision` entry, read back from a session transcript. */
-export type Decision = TurnRecord & { timestamp?: string; file?: string };
+export type Decision = DecisionView & { timestamp?: string; file?: string };
 
 export interface UsageMetrics {
   requests: number;
@@ -26,6 +24,8 @@ export interface UsageMetrics {
   toolCalls: Record<string, number>;
   toolErrors: number;
   decisions: Decision[];
+  /** `loadout.decision` entries of an unknown version or shape; counted, never guessed at. */
+  unsupportedDecisions: number;
 }
 
 export function defaultSessionsDir(): string {
@@ -82,15 +82,16 @@ export function emptyMetrics(): UsageMetrics {
     toolCalls: {},
     toolErrors: 0,
     decisions: [],
+    unsupportedDecisions: 0,
   };
 }
 
 export function addFile(metrics: UsageMetrics, file: string): UsageMetrics {
   for (const entry of readEntries(file)) {
     if (entry.type === "custom" && entry.customType === DECISION_ENTRY) {
-      // Only current-format records: older transcripts lack the fields the report reads.
-      const data = entry.data as Partial<Decision> | undefined;
-      if (data?.v === 2) metrics.decisions.push({ ...(data as Decision), timestamp: entry.timestamp as string, file });
+      const view = normalizeDecision(entry.data);
+      if (view === null) metrics.unsupportedDecisions++;
+      else metrics.decisions.push({ ...view, timestamp: entry.timestamp as string, file });
       continue;
     }
     if (entry.type !== "message") continue;

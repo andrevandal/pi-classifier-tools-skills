@@ -50,9 +50,7 @@ const files = listSessionFiles(values["sessions-dir"]!).filter((file) => {
   if (!values.folder) return true;
   return (sessionCwd(file) ?? file).includes(values.folder);
 });
-const decisions = metricsFor(files).decisions.filter(
-  (decision) => since === null || Date.parse(decision.timestamp ?? "") >= since,
-);
+const metrics = metricsFor(files);
 
 function countBy<T>(items: T[], key: (item: T) => string | string[]): Record<string, number> {
   const counts: Record<string, number> = {};
@@ -62,15 +60,16 @@ function countBy<T>(items: T[], key: (item: T) => string | string[]): Record<str
   return Object.fromEntries(Object.entries(counts).sort(([, a], [, b]) => b - a));
 }
 
-function summarize(list: Decision[]) {
+function summarize(all: Decision[], unsupported: number) {
+  const list = all.filter((d) => d.outcome !== "skipped");
   const decided = list.flatMap((d) => (d.tools === null ? [] : [d.tools]));
   const risks = decided.flatMap((t) => (t.risk === null ? [] : [t.risk]));
   const narrowed = decided.flatMap((t) => (t.active === null ? [] : [t.active]));
-  const latencies = list.map((d) => d.latencyMs);
+  const latencies = list.flatMap((d) => (d.latencyMs === null ? [] : [d.latencyMs]));
   return {
     decisions: list.length,
     sessions: new Set(list.map((d) => d.file)).size,
-    dryRun: list.filter((d) => d.dryRun).length,
+    dryRun: list.filter((d) => d.dryRun === true).length,
     failures: countBy(
       list.flatMap((d) => (d.failure === null ? [] : [d.failure])),
       (reason) => reason,
@@ -91,10 +90,16 @@ function summarize(list: Decision[]) {
       (selected) => (selected.length > 0 ? selected : ["(none)"]),
     ),
     latencyMs: { p50: percentile(latencies, 50), p90: percentile(latencies, 90), max: Math.max(...latencies, 0) },
+    skipped: countBy(
+      all.filter((d) => d.outcome === "skipped"),
+      (d) => d.skip ?? "(unknown)",
+    ),
+    unsupported,
   };
 }
 
-const report = summarize(decisions);
+const inRange = metrics.decisions.filter((d) => since === null || Date.parse(d.timestamp ?? "") >= since);
+const report = summarize(inRange, metrics.unsupportedDecisions);
 
 if (values.json) {
   console.log(JSON.stringify(report, null, 2));
@@ -112,6 +117,13 @@ const table = (counts: Record<string, number>) =>
     .join("\n") || "  (none)";
 
 console.log(`loadout decisions: ${report.decisions} in ${report.sessions} sessions (${report.dryRun} dry run)`);
+const skippedText = Object.entries(report.skipped)
+  .map(([reason, n]) => `${reason} ${n}`)
+  .join(", ");
+if (skippedText) console.log(`skipped: ${skippedText}`);
+if (report.unsupported > 0) {
+  console.log(`unsupported records: ${report.unsupported} (unknown version or shape; not counted above)`);
+}
 if (report.decisions === 0) {
   console.log("no loadout.decision entries matched; check --sessions-dir, --folder and --since");
   process.exit(0);

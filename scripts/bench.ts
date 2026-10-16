@@ -9,7 +9,7 @@
  * Both arms pay the classifier's overhead, so differences come from the
  * selection itself. Each arm gets its config through LOADOUT_CONFIG, so the
  * worktrees stay clean, and runs in its own folder, so `omp stats` separates
- * the arms too.
+ * the arms too. The bench reads the plugin's loadout.decision records, so it needs telemetry on.
  *
  *   node scripts/bench.ts --repo <path> --tasks bench/tasks.json [--model <m>] [--runs 2]
  *
@@ -23,7 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
-import { parseConfig } from "../src/config.ts";
+import { parseConfig, readMachineTelemetry } from "../src/config.ts";
 import { profileOrder } from "../src/select.ts";
 import {
   cacheRate,
@@ -190,22 +190,38 @@ function runOmp(task: Task, cwd: string, configFile: string, logFile: string, ti
 }
 
 function summarizeRun(metrics: UsageMetrics, expectDryRun: boolean): Partial<RunResult> & { mismatch: boolean } {
-  const decision = metrics.decisions[0];
-  const mismatch = metrics.decisions.some((d) => d.dryRun !== expectDryRun);
+  const decision = metrics.decisions.find((d) => d.outcome !== "skipped");
+  const mismatch = metrics.decisions.some((d) => d.dryRun !== null && d.dryRun !== expectDryRun);
   const failure = decision?.failure ?? null;
-  const warning = failure === null ? null : `classifier failed (${failure}): ${decision?.message ?? ""}`;
+  // v2 keeps its meaning (the ratchet's profile); v3 reports one only when the plugin really settled on it.
+  const status = decision?.application?.status;
+  const applied =
+    decision === undefined || ["dry-run", "failed", "not-attempted"].includes(status ?? "")
+      ? null
+      : (decision.ratchet?.after ?? null);
+  // A v3 record knows the tools the host really had; a v2 record only the proposal.
+  const names =
+    decision === undefined
+      ? null
+      : decision.application
+        ? decision.application.actualTools
+        : (decision.tools?.active ?? null);
+  const noDecision =
+    metrics.decisions.length > 0
+      ? `only skipped decisions recorded (${metrics.decisions[0]?.skip})`
+      : "no loadout.decision recorded (plugin not loaded, or telemetry is off)";
   return {
     mismatch,
     decided: decision !== undefined,
     failure,
-    applied: decision?.applied ?? null,
+    applied,
     profile: decision?.tools?.profile ?? null,
     risk: decision?.tools?.risk ?? null,
-    activeTools: decision?.tools?.active?.length ?? null,
-    activeToolNames: decision?.tools?.active ?? null,
+    activeTools: names?.length ?? null,
+    activeToolNames: names,
     skills: decision?.skills?.selected ?? null,
     classifierMs: decision?.latencyMs ?? null,
-    warning: decision ? warning : "no loadout.decision recorded (plugin not loaded)",
+    warning: decision ? (failure === null ? null : `classifier failed (${failure})`) : noDecision,
   };
 }
 
@@ -213,6 +229,14 @@ const repo = path.resolve(values.repo);
 const base = loadBaseConfig(values.config);
 const parsed = parseConfig(base);
 if (parsed.errors.length > 0) fail(`base config: ${parsed.errors.join("; ")}`);
+const machine = readMachineTelemetry(os.homedir());
+if (machine === "off" || machine === "unreadable") {
+  fail(
+    machine === "off"
+      ? "telemetry is off for this machine (~/.omp/loadout.* sets telemetry: false); the bench reads loadout.decision records and cannot run"
+      : "the telemetry setting in ~/.omp/loadout.{json,yml,yaml} cannot be read here (malformed, not an object, not a boolean, or YAML without Bun); fix it first",
+  );
+}
 const order = profileOrder(parsed.config.tools);
 const tasks = loadTasks(path.resolve(values.tasks), order);
 const runs = Number.parseInt(values.runs!, 10);
@@ -232,7 +256,7 @@ const worktrees = {} as Record<Arm, string>;
 const configs = {} as Record<Arm, string>;
 for (const arm of ARMS) {
   configs[arm] = path.join(out, `loadout.${arm}.json`);
-  const armConfig = { ...base, enabled: true, dryRun: arm === "control", notify: false };
+  const armConfig = { ...base, enabled: true, dryRun: arm === "control", notify: false, telemetry: true };
   fs.writeFileSync(configs[arm], `${JSON.stringify(armConfig, null, 2)}\n`);
 
   worktrees[arm] = path.join(out, `wt-${arm}`);

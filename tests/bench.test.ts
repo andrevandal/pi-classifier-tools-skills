@@ -39,10 +39,13 @@ function setup() {
   return { dir, repo, tasks, config, sessions: path.join(dir, "sessions"), out: path.join(dir, "out") };
 }
 
+// An empty HOME, so a developer's real ~/.omp/loadout.* cannot change what the scripts do.
+const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "loadout-home-"));
+
 function runScript(script: string, args: string[], env: Record<string, string>) {
   return spawnSync(process.execPath, [path.join(ROOT, "scripts", script), ...args], {
     encoding: "utf8",
-    env: { ...process.env, ...env },
+    env: { ...process.env, HOME, ...env },
   });
 }
 
@@ -79,12 +82,21 @@ test("bench runs every task in both arms, resets worktrees, and summarizes", () 
     JSON.parse(fs.readFileSync(path.join(ctx.out, `loadout.${arm}.json`), "utf8")),
   );
   assert.deepEqual(
-    configs.map((c) => [c.backend, c.dryRun]),
+    configs.map((c) => [c.backend, c.dryRun, c.telemetry]),
     [
-      ["laya", false],
-      ["laya", true],
+      ["laya", false, true],
+      ["laya", true, true],
     ],
   );
+  assert.ok(rows.every((row) => row.profile === "answer"));
+  for (const row of rows.filter((r) => r.arm === "loadout")) {
+    assert.equal(row.applied, "answer");
+    assert.equal(row.activeToolNames.length, 4);
+  }
+  for (const row of rows.filter((r) => r.arm === "control")) {
+    assert.equal(row.applied, null);
+    assert.equal(row.activeToolNames.length, 7);
+  }
 
   const summary = fs.readFileSync(path.join(ctx.out, "summary.md"), "utf8");
   assert.match(summary, /\| loadout \| 2\/4 \|/);
@@ -121,6 +133,8 @@ test("decisions reports profiles, failures and skills across sessions", () => {
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
   assert.equal(report.decisions, 4);
+  assert.deepEqual(report.skipped, { command: 4 });
+  assert.equal(report.unsupported, 0);
   assert.equal(report.dryRun, 2);
   assert.deepEqual(report.toolProfiles, { answer: 4 });
   assert.deepEqual(report.skillsSelected, { pdf: 4 });
@@ -128,6 +142,36 @@ test("decisions reports profiles, failures and skills across sessions", () => {
 
   const filtered = runScript("decisions.ts", ["--sessions-dir", ctx.sessions, "--folder", "wt-control", "--json"], {});
   assert.equal(JSON.parse(filtered.stdout).decisions, 2);
+});
+
+test("bench refuses to run when the machine opts out of telemetry", () => {
+  const ctx = setup();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "loadout-home-off-"));
+  fs.mkdirSync(path.join(home, ".omp"));
+  fs.writeFileSync(path.join(home, ".omp", "loadout.json"), JSON.stringify({ telemetry: false }));
+  const result = runScript(
+    "bench.ts",
+    ["--repo", ctx.repo, "--tasks", ctx.tasks, "--config", ctx.config, "--model", "fake", "--out", ctx.out],
+    { HOME: home },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /telemetry/);
+  assert.equal(fs.existsSync(ctx.out), false);
+});
+
+test("bench refuses to run when the machine telemetry setting is unreadable", () => {
+  const ctx = setup();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "loadout-home-bad-"));
+  fs.mkdirSync(path.join(home, ".omp"));
+  fs.writeFileSync(path.join(home, ".omp", "loadout.json"), "{");
+  const result = runScript(
+    "bench.ts",
+    ["--repo", ctx.repo, "--tasks", ctx.tasks, "--config", ctx.config, "--model", "fake", "--out", ctx.out],
+    { HOME: home },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /telemetry/);
+  assert.equal(fs.existsSync(ctx.out), false);
 });
 
 test("session metrics sum usage, tool calls and cache rate", () => {
