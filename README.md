@@ -39,7 +39,7 @@ flowchart LR
   another extension change tools mid-session, that becomes the new baseline.
 - **"Don't know" keeps everything.** When no profile's risk is within `tools.maxRisk`,
   the answer is missing, or too many skills are candidates, all tools or all skills stay.
-- **Every turn is recorded** as a `loadout.decision` session entry, failures included.
+- **Every prompt it sees is recorded unless you opt out.** With telemetry on (the default) each prompt the host hands the plugin becomes one content-free `loadout.decision` session entry — skips and failures included — written after tools were applied. See [Telemetry](#telemetry).
 
 ## Quick start
 
@@ -97,7 +97,7 @@ Searched in order; the first file that parses and validates wins:
 1. `<project>/.omp/loadout.json` / `.yml` / `.yaml`, read **only when the project is trusted**
 2. `~/.omp/loadout.json` / `.yml` / `.yaml`
 
-A file with a bad value is rejected and the defaults apply. Unknown keys are
+A file with a bad value is rejected: the plugin turns itself off, reports the error, and writes no telemetry until the file is fixed. Unknown keys are
 warnings. Sections merge one level deep over the defaults; `tools.question` and
 `tools.profiles` are replaced as a whole and must cover the same options.
 
@@ -107,6 +107,7 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `backend` | `"laya"` | `"laya"` (local sidecar by default, or a shared host via `laya.transport: "http"`) or `"jev"` |
 | `dryRun` | `false` | classify and record, never change anything |
 | `notify` | `true` | show a one-line decision per turn; errors always show |
+| `telemetry` | `true` | write `loadout.decision` entries; `false` writes none. A machine-wide `false` in `~/.omp/loadout.*` cannot be overridden (see [Telemetry](#telemetry)) |
 | `maxPromptChars` | `8000` | longest prompt sent to the classifier (min 200; `null` = no limit) |
 | `tools.enabled` | `true` | select tools |
 | `tools.question` | `answer` / `edit` / `full` choice | the `choice` question; its options are the profile ids |
@@ -123,6 +124,7 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 
 Set `LOADOUT_CONFIG=/path/to/file.json` to use exactly that file and skip the
 search, e.g. to pin one session's config from outside the project.
+The machine telemetry setting is still read from `~/.omp/loadout.*`.
 
 The `jev` and `laya` sections are the same as in pi-classifier-router (endpoint,
 token variable, timeouts, local sidecar or HTTP transport).
@@ -146,9 +148,22 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
 
 `/loadout [status|explain|on|off]`
 
-- `status`: config source, baseline tools, last decision.
-- `explain`: last decision in full, including every skill's score.
+- `status`: config source, baseline tools, last decision, telemetry state.
+- `explain`: last decision in full: per-profile risks, the proposal versus the tools actually active, skill counts and scores.
 - `on` / `off`: toggle for this session; `off` restores the baseline.
+
+## Telemetry
+
+With telemetry on (the default) each prompt the host hands the plugin becomes one `loadout.decision` session entry, written after the tools were applied or restored.
+
+- **What a record holds:** the outcome (`classified`, `failed` or `skipped`, with the reason), a safe settings snapshot, classifier evidence (model id, token counts, elapsed and budget milliseconds, prompt length), the proposed tools with the risk of every narrower profile, skill counts, the widen-only ratchet state, and what happened when the plugin applied the tools: the status, a restore result, and the tools the host actually had afterwards.
+- **What it never holds:** prompt text, skill descriptions, rubrics, endpoints, environment variable names, file paths, or backend response and error text. Tool and skill names are stored only when they look like identifiers.
+- **How to turn it off:** put `{"telemetry": false}` in `~/.omp/loadout.json`. Only the first existing `~/.omp/loadout.*` file is read. A project file or `LOADOUT_CONFIG` file can also turn it off, but neither can turn it back on.
+- **Fail closed:** an unreadable or non-boolean machine setting, or any config error, writes nothing. The setting is read when a session loads its config, so restart after changing it.
+- **Opting out** writes nothing and deletes nothing. `/loadout explain` and `/loadout status` keep working from memory, and the `loadout.skills` hint message is unchanged.
+- **Handed to the host is not durable.** pi may throw on a disk error but keep the entry in memory, OMP swallows disk errors, and both defer writes until the first assistant message. A failed hand-off never aborts the turn; `/loadout status` counts them.
+
+Full schemas, the `loadout.usage` and `loadout.http` contracts and the v2 mapping are in [`docs/telemetry.md`](docs/telemetry.md). It lives in the repository and is not part of the npm package.
 
 ## Trade-offs
 
@@ -171,7 +186,7 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
   Use Jev, or a Laya checkpoint fine-tuned on your question set.
 - **Privacy.** The default Laya sidecar keeps everything local. With Jev, prompt
   text (clipped to `maxPromptChars`) and skill names and descriptions are sent
-  to TypeSafe.
+  to TypeSafe. The `loadout.decision` entries hold no prompt text, descriptions or backend responses; see [Telemetry](#telemetry).
 
 ## Benchmarking
 
@@ -190,6 +205,8 @@ Runs the same tasks headless (`omp -p`) in two git worktrees of your project:
 Both arms pay the classifier's overhead, so differences come from the selection
 itself. Each arm gets its config through `LOADOUT_CONFIG` (so the worktrees stay
 clean). It also runs in its own folder, so `omp stats` shows the arms separately.
+
+The bench needs telemetry on: it stops before creating anything when `~/.omp/loadout.*` turns telemetry off or cannot be read, and sets `telemetry: true` in each arm's config.
 
 ```bash
 cp bench/tasks.example.json my-tasks.json    # then write tasks from your real work
@@ -233,7 +250,7 @@ omp writes outside its sessions directory are not counted.
 profile a prompt needs (`answer`, `edit` or `full`); label it by hand from what the prompt
 requires. Accuracy scores the control arm's classifier choice against `expect`. Over-narrowed
 counts runs where the loadout applied a narrower profile than `expect`. Needed tool missing
-counts tools the control run used that the loadout's active set lacked. Prompt tokens per
+counts tools the control run used that the loadout's active set lacked. The loadout's active set is what the host reported after the plugin acted, not the plugin's proposal. Prompt tokens per
 request compares the arms with a 95% bootstrap interval. The verdict is `PASS` only when no
 needed tool was missing, the loadout passed at least as many checks as control, and that
 interval lies below zero. Otherwise it reads `NOT PROVEN` with the reasons. Over-narrowing
@@ -281,6 +298,8 @@ environment variable holding that token; the example config leaves it empty, so 
 
 Summarizes every `loadout.decision` entry: profile distribution, risk p10/p50/p90, the share
 of turns that kept the baseline, failures by reason, selected skills and classifier latency.
+Reads record versions 2 and 3; unknown versions are counted as unsupported. Skipped turns
+(`disabled`, `empty-prompt`, `command`, `no-questions`) are counted separately and are not in the percentages.
 Useful on your normal day-to-day sessions, or on one benchmark arm:
 
 ```bash
@@ -325,6 +344,7 @@ npm run lint
 | `src/index.ts` | host wiring: events, per-session state, shared classifiers, `/loadout` |
 | `src/select.ts` | pure logic: questions, tool/skill decisions, prompt clipping |
 | `src/config.ts` | discovery, trust gate, validation, defaults |
+| `src/telemetry.ts` | trace record schemas, privacy allowlists, safe persistence, v2/v3 readers |
 | `src/classify/*`, `python/` | Jev/Laya clients and the Laya worker (from pi-classifier-router) |
 | `scripts/bench.ts`, `scripts/decisions.ts` | A/B benchmark and decision report over session transcripts |
 
