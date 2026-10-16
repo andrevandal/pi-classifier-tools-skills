@@ -82,6 +82,22 @@ export function profileOrder(tools: ToolsSelectorConfig): string[] {
 }
 
 /**
+ * The risk of every profile narrower than the broadest: the probability mass on
+ * the profiles broader than it. Null when the answer reports no probability for
+ * any profile: that would read as zero risk everywhere and pick the narrowest.
+ */
+export function profileRisks(
+  order: string[],
+  probabilities: Record<string, number>,
+): Array<{ profile: string; risk: number }> | null {
+  if (!order.some((id) => id in probabilities)) return null;
+  return order.slice(0, -1).map((profile, i) => ({
+    profile,
+    risk: order.slice(i + 1).reduce((sum, id) => sum + (probabilities[id] ?? 0), 0),
+  }));
+}
+
+/**
  * The narrowest profile whose risk is within `maxRisk`, where a profile's risk is
  * the probability mass on the profiles broader than it. The broadest profile is
  * never picked: it stands for the baseline. Null when no profile qualifies.
@@ -91,13 +107,7 @@ export function pickProfile(
   probabilities: Record<string, number>,
   maxRisk: number,
 ): { profile: string; risk: number } | null {
-  // No probability for any profile would read as zero risk everywhere and pick the narrowest.
-  if (!order.some((id) => id in probabilities)) return null;
-  for (let i = 0; i < order.length - 1; i++) {
-    const risk = order.slice(i + 1).reduce((sum, id) => sum + (probabilities[id] ?? 0), 0);
-    if (risk <= maxRisk) return { profile: order[i]!, risk };
-  }
-  return null;
+  return profileRisks(order, probabilities)?.find((entry) => entry.risk <= maxRisk) ?? null;
 }
 
 /**

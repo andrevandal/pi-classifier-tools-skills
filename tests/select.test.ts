@@ -8,7 +8,9 @@ import {
   decideSkills,
   decideTools,
   isSlashCommand,
+  pickProfile,
   profileOrder,
+  profileRisks,
   skillCandidates,
   skillQuestionId,
   TOOLS_QUESTION_ID,
@@ -139,4 +141,49 @@ test("slash commands are recognized, paths are not", () => {
   assert.ok(isSlashCommand("  /review"));
   assert.ok(!isSlashCommand("/home/me/app.ts is failing"));
   assert.ok(!isSlashCommand("fix the build"));
+});
+
+const near = (a: number | undefined, b: number) => assert.ok(a !== undefined && Math.abs(a - b) < 1e-9, `${a} != ${b}`);
+
+test("profileRisks reports the mass on broader profiles for every narrower profile", () => {
+  const order = ["answer", "edit", "full"];
+  const risks = profileRisks(order, { answer: 0.42, edit: 0.31, full: 0.27 })!;
+  assert.deepEqual(
+    risks.map((r) => r.profile),
+    ["answer", "edit"],
+  );
+  near(risks[0]?.risk, 0.58);
+  near(risks[1]?.risk, 0.27);
+  assert.deepEqual(profileRisks(order, {}), null);
+  assert.deepEqual(profileRisks(order, { unrelated: 1 }), null);
+  assert.deepEqual(profileRisks(order, { full: 0.9 }), [
+    { profile: "answer", risk: 0.9 },
+    { profile: "edit", risk: 0.9 },
+  ]);
+  assert.deepEqual(profileRisks(["full"], { full: 1 }), []);
+  assert.equal(pickProfile(["full"], { full: 1 }, 0.1), null);
+});
+
+test("pickProfile picks the narrowest profile within maxRisk", () => {
+  const order = ["answer", "edit", "full"];
+  const table: Array<[Record<string, number>, { profile: string; risk: number } | null]> = [
+    [
+      { answer: 0.95, edit: 0.03, full: 0.02 },
+      { profile: "answer", risk: 0.05 },
+    ],
+    [
+      { answer: 0.5, edit: 0.45, full: 0.05 },
+      { profile: "edit", risk: 0.05 },
+    ],
+    [{ answer: 0.42, edit: 0.31, full: 0.27 }, null],
+    [
+      { edit: 0.95, full: 0.05 },
+      { profile: "edit", risk: 0.05 },
+    ],
+  ];
+  for (const [probabilities, expected] of table) {
+    const picked = pickProfile(order, probabilities, 0.1);
+    assert.equal(picked?.profile ?? null, expected?.profile ?? null);
+    if (expected) near(picked?.risk, expected.risk);
+  }
 });
