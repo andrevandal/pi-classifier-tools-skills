@@ -21,14 +21,44 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
-import { buildQuestions, isSlashCommand, profileOrder, skillCandidates } from "./select.ts";
-import { errorText, runTurn } from "./turn.ts";
-import type { Classifier, LoadoutConfig, SkillCandidate, TurnRecord } from "./types.ts";
+import {
+  buildQuestions,
+  decideSkills,
+  isSlashCommand,
+  profileOrder,
+  skillCandidates,
+  skillsAskable,
+} from "./select.ts";
+import {
+  type ApplicationStatus,
+  buildDecisionRecord,
+  DECISION_ENTRY,
+  type DecisionRecordV3,
+  newId,
+  type PersistResult,
+  persistRecord,
+  type RatchetRecord,
+  type Restoration,
+  safeErrorCode,
+  type SkillDelivery,
+  type SkipReason,
+  settingsSnapshot,
+  type ToolsRecord,
+} from "./telemetry.ts";
+import { errorText, runTurn, type TurnOutcome } from "./turn.ts";
+import type {
+  Classifier,
+  FailureReason,
+  LoadoutConfig,
+  SkillCandidate,
+  SkillsDecision,
+  SkillsReason,
+  TelemetryState,
+} from "./types.ts";
 
 const PREFIX = "[loadout]";
 const COMMAND = "loadout";
 const SUBCOMMANDS = ["status", "on", "off", "explain"] as const;
-const DECISION_ENTRY = "loadout.decision";
 const HINT_MESSAGE = "loadout.skills";
 
 /** The parts of the prompt event this extension reads; `systemPromptOptions` is pi-only. */
@@ -42,6 +72,8 @@ interface SessionState {
   projectTrusted: boolean;
   config: LoadoutConfig;
   source: string | null;
+  scope: "project" | "global" | "explicit" | null;
+  telemetry: TelemetryState;
   classifierKey: string;
   /** Whether this session counts as a user of the shared classifier for `classifierKey`. */
   holdsClassifier: boolean;
@@ -53,8 +85,13 @@ interface SessionState {
   appliedRank: number | null;
   /** Whether the next decision may narrow: at the start, and again after compaction or `/loadout on|off`. */
   allowNarrow: boolean;
-  /** Outcome of the latest turn, including a failed one. */
-  lastRecord: TurnRecord | null;
+  /** Latest non-skipped record; a skip never replaces it. */
+  lastRecord: DecisionRecordV3 | null;
+  /** Failure text of `lastRecord`; memory only, never persisted. */
+  lastMessage: string | null;
+  /** The latest record built, skips included; null when building it threw. */
+  lastDecisionId: string | null;
+  collection: { handedOff: number; suppressed: number; failed: number; lastFailure: string | null };
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
   lastFailure: string | null;
 }
@@ -72,11 +109,26 @@ function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function sessionKey(ctx: ExtensionContext): string {
+/** The host's session id, or null when it has none; records never carry a made-up one. */
+function hostSessionId(ctx: ExtensionContext): string | null {
   try {
-    return ctx.sessionManager.getSessionId();
+    const id = ctx.sessionManager.getSessionId();
+    return typeof id === "string" && id !== "" ? id : null;
   } catch {
-    return "unknown";
+    return null;
+  }
+}
+
+/** Map key only; records use `hostSessionId`. */
+function sessionKey(ctx: ExtensionContext): string {
+  return hostSessionId(ctx) ?? "unknown";
+}
+
+function readTools(pi: ExtensionAPI): string[] | null {
+  try {
+    return [...pi.getActiveTools()];
+  } catch {
+    return null;
   }
 }
 
@@ -167,11 +219,16 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     projectTrusted,
     config: result.config,
     source: result.source,
+    scope: result.scope,
+    telemetry: result.telemetry,
     classifierKey,
     holdsClassifier: keepClassifier,
     baseline: existing?.baseline ?? null,
     lastApplied: existing?.lastApplied ?? null,
     lastRecord: existing?.lastRecord ?? null,
+    lastMessage: existing?.lastMessage ?? null,
+    lastDecisionId: existing?.lastDecisionId ?? null,
+    collection: existing?.collection ?? { handedOff: 0, suppressed: 0, failed: 0, lastFailure: null },
     // A config reload is not a new session: keep the ratchet, so a cwd change cannot reopen narrowing.
     appliedRank: existing?.appliedRank ?? null,
     allowNarrow: existing?.allowNarrow ?? true,
@@ -197,9 +254,12 @@ function listSkills(pi: ExtensionAPI, event: PromptEvent): SkillCandidate[] {
   }
 }
 
-async function activateTools(pi: ExtensionAPI, state: SessionState, tools: string[]): Promise<void> {
-  if (!sameSet(pi.getActiveTools(), tools)) await pi.setActiveTools(tools);
+/** True when the host's setter ran. */
+async function activateTools(pi: ExtensionAPI, state: SessionState, tools: string[]): Promise<boolean> {
+  const changed = !sameSet(pi.getActiveTools(), tools);
+  if (changed) await pi.setActiveTools(tools);
   state.lastApplied = [...tools];
+  return changed;
 }
 
 /**
@@ -214,13 +274,16 @@ function refreshBaseline(pi: ExtensionAPI, state: SessionState): string[] {
   return state.baseline;
 }
 
-async function restoreBaseline(pi: ExtensionAPI, state: SessionState): Promise<void> {
-  if (state.baseline !== null && state.lastApplied !== null) await activateTools(pi, state, state.baseline);
+async function restoreBaseline(pi: ExtensionAPI, state: SessionState): Promise<"restored" | "unchanged" | null> {
+  if (state.baseline === null || state.lastApplied === null) return null;
+  return (await activateTools(pi, state, state.baseline)) ? "restored" : "unchanged";
 }
 
-function summarize(record: TurnRecord, baselineSize: number): string {
-  const { tools, skills } = record;
-  if (tools === null || skills === null) return `failed (${record.failure}): ${record.message}`;
+function summarize(
+  tools: Pick<ToolsRecord, "active" | "profile" | "risk" | "reason">,
+  skills: { selected: string[] | null; reason: SkillsReason | null },
+  baselineSize: number,
+): string {
   const toolPart =
     tools.active === null
       ? `tools: all (${tools.reason})`
@@ -232,13 +295,20 @@ function summarize(record: TurnRecord, baselineSize: number): string {
   return `${toolPart} | ${skillPart}`;
 }
 
-/** The user-facing reason a turn fell back to the baseline. */
-function failureNotice(record: TurnRecord): { text: string; level: "warning" | "error" } {
-  if (record.failure === "warming") return { text: record.message ?? "classifier is still loading", level: "warning" };
-  if (record.failure === "error") {
-    return { text: `selection error: ${record.message}; using the full loadout until it recovers`, level: "error" };
+function describe(record: DecisionRecordV3, message: string | null, baselineSize: number): string {
+  if (record.tools === null || record.skills === null) {
+    return `failed (${record.failure ?? "error"}): ${message ?? "no details kept"}`;
   }
-  const text = `classification failed (${record.failure}): ${record.message}; using the full loadout until it recovers`;
+  return summarize(record.tools, record.skills, baselineSize);
+}
+
+/** The user-facing reason a turn fell back to the baseline. */
+function failureNotice(failure: FailureReason, message: string | null): { text: string; level: "warning" | "error" } {
+  if (failure === "warming") return { text: message ?? "classifier is still loading", level: "warning" };
+  if (failure === "error") {
+    return { text: `selection error: ${message}; using the full loadout until it recovers`, level: "error" };
+  }
+  const text = `classification failed (${failure}): ${message}; using the full loadout until it recovers`;
   return { text, level: "warning" };
 }
 
@@ -250,96 +320,272 @@ function skillHint(selected: string[]): string {
   ].join("\n");
 }
 
+/** Everything one hook call learns, so a record can be built after apply/restore whatever happened. */
+interface HookTrace {
+  decisionId: string;
+  gate: SkipReason | null;
+  turn: TurnOutcome | null;
+  listed: boolean;
+  discovered: number;
+  eligible: number;
+  asked: number;
+  skillsDecision: SkillsDecision | null;
+  delivery: SkillDelivery;
+  filteredOut: number | null;
+  ratchet: RatchetRecord | null;
+  status: ApplicationStatus;
+  restoration: Restoration | null;
+  error: string | null;
+  /** Failure text; kept in memory for /loadout explain, never in a record. */
+  message: string | null;
+}
+
+type HookResult = { message: { customType: string; content: string; display: boolean } } | undefined;
+
+async function runHook(
+  pi: ExtensionAPI,
+  event: PromptEvent,
+  ctx: ExtensionContext,
+  state: SessionState,
+  trace: HookTrace,
+): Promise<HookResult> {
+  const { config } = state;
+  const gate: SkipReason | null = !config.enabled
+    ? "disabled"
+    : event.prompt.trim() === ""
+      ? "empty-prompt"
+      : isSlashCommand(event.prompt)
+        ? "command"
+        : null;
+  if (gate !== null) {
+    trace.gate = gate;
+    trace.restoration = await restoreBaseline(pi, state);
+    trace.status = trace.restoration ?? "not-attempted";
+    return;
+  }
+
+  const baseline = refreshBaseline(pi, state);
+  const discovered = listSkills(pi, event);
+  const candidates = skillCandidates(discovered, config.skills);
+  trace.listed = true;
+  trace.discovered = discovered.length;
+  trace.eligible = candidates.length;
+  const questions = buildQuestions(config, candidates);
+  if (Object.keys(questions).length === 0) {
+    trace.gate = "no-questions";
+    trace.skillsDecision = decideSkills(config.skills, candidates, {});
+    return;
+  }
+  trace.asked = skillsAskable(config.skills, candidates) ? candidates.length : 0;
+
+  const turn = await runTurn({
+    config,
+    classifier: classifierFor(state),
+    prompt: event.prompt,
+    questions,
+    baseline,
+    candidates,
+    persist: state.telemetry.persist,
+  });
+  trace.turn = turn;
+  trace.message = turn.message;
+  const { decision } = turn;
+  trace.skillsDecision = decision?.skills ?? null;
+
+  const order = profileOrder(config.tools);
+  const broadest = order.length - 1;
+  // A failed turn and a "don't know" turn both want the baseline, which is the broadest rank.
+  const target = decision?.tools.active ? order.indexOf(decision.tools.profile ?? "") : broadest;
+  const rankName = (rank: number | null): string | null =>
+    config.tools.enabled && rank !== null ? (order[rank] ?? null) : null;
+  const narrowAllowed = state.allowNarrow;
+  const before = rankName(state.appliedRank);
+  // Widen-only ratchet: once narrowed, a later turn may keep or widen the tools, never narrow them further.
+  const admitted = state.allowNarrow || state.appliedRank === null || target >= state.appliedRank;
+  if (admitted) {
+    state.appliedRank = target;
+    state.allowNarrow = false;
+  }
+  trace.ratchet = { narrowAllowed, before, after: rankName(state.appliedRank), admitted };
+
+  if (decision === null) {
+    const notice = failureNotice(turn.failure ?? "error", turn.message);
+    if (notice.text !== state.lastFailure) {
+      state.lastFailure = notice.text;
+      notify(ctx, config, notice.text, notice.level);
+    }
+    trace.restoration = await restoreBaseline(pi, state);
+    trace.status = trace.restoration ?? "not-attempted";
+    return;
+  }
+
+  state.lastFailure = null;
+  notify(
+    ctx,
+    config,
+    `${config.dryRun ? "(dry run) " : ""}${summarize(decision.tools, decision.skills, baseline.length)}`,
+    "info",
+  );
+  const selected = decision.skills.selected;
+  if (config.dryRun) {
+    trace.status = "dry-run";
+    trace.delivery = selected === null ? "none" : "dry-run";
+    return;
+  }
+
+  if (admitted) {
+    trace.status = (await activateTools(pi, state, decision.tools.active ?? baseline)) ? "applied" : "unchanged";
+  } else {
+    trace.status = "not-admitted";
+  }
+
+  if (selected === null) return;
+  const promptSkills = event.systemPromptOptions?.skills;
+  const filter = config.skills.mode === "filter" || (config.skills.mode === "auto" && Array.isArray(promptSkills));
+  if (filter && event.systemPromptOptions && Array.isArray(promptSkills)) {
+    const keep = new Set([...selected, ...config.skills.exclude]);
+    const kept = promptSkills.filter((skill) => keep.has(skill.name));
+    // Reassign rather than splice: the array may be shared with the host's base prompt options.
+    event.systemPromptOptions.skills = kept;
+    trace.delivery = "filter";
+    trace.filteredOut = promptSkills.length - kept.length;
+    return;
+  }
+  if (selected.length === 0) return;
+  trace.delivery = "hint";
+  return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
+}
+
+function countRecord(ctx: ExtensionContext, state: SessionState, result: PersistResult): void {
+  const { collection } = state;
+  if (result.outcome === "handed-off") collection.handedOff++;
+  else if (result.outcome === "suppressed") collection.suppressed++;
+  else {
+    collection.failed++;
+    collection.lastFailure = result.code;
+    if (collection.failed === 1) {
+      const text = `telemetry record not stored (${result.code}); later failures are counted in /loadout status`;
+      notify(ctx, state.config, text, "warning");
+    }
+  }
+}
+
+/** Build the record after apply/restore and hand it to the host once. Never throws. */
+function recordDecision(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionState | undefined, trace: HookTrace) {
+  if (!state) return;
+  try {
+    const { turn } = trace;
+    const { config } = state;
+    const record = buildDecisionRecord({
+      eventId: newId(),
+      decisionId: trace.decisionId,
+      sessionId: hostSessionId(ctx),
+      settings: settingsSnapshot(config, state.scope),
+      gate: trace.gate,
+      failure: turn?.failure ?? null,
+      classifier: turn?.classifier ?? null,
+      decision: turn?.decision ?? null,
+      order: profileOrder(config.tools),
+      maxRisk: config.tools.maxRisk,
+      skills: trace.listed
+        ? {
+            discovered: trace.discovered,
+            eligible: trace.eligible,
+            maxCandidates: config.skills.maxCandidates,
+            asked: trace.asked,
+            filteredOut: trace.filteredOut,
+            delivery: trace.delivery,
+            decision: trace.skillsDecision,
+          }
+        : null,
+      ratchet: trace.ratchet,
+      application: {
+        status: trace.status,
+        restoration: trace.restoration,
+        actualTools: readTools(pi),
+        error: trace.error,
+      },
+    });
+    state.lastDecisionId = record.decisionId;
+    if (record.outcome !== "skipped") {
+      state.lastRecord = record;
+      state.lastMessage = trace.message;
+    }
+    countRecord(
+      ctx,
+      state,
+      persistRecord((type, data) => pi.appendEntry(type, data), state.telemetry, DECISION_ENTRY, record),
+    );
+  } catch {
+    state.lastDecisionId = null;
+    countRecord(ctx, state, { outcome: "failed", code: "error" });
+  }
+}
+
 async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: ExtensionContext) {
+  const trace: HookTrace = {
+    decisionId: newId(),
+    gate: null,
+    turn: null,
+    listed: false,
+    discovered: 0,
+    eligible: 0,
+    asked: 0,
+    skillsDecision: null,
+    delivery: "none",
+    filteredOut: null,
+    ratchet: null,
+    status: "not-attempted",
+    restoration: null,
+    error: null,
+    message: null,
+  };
   let state: SessionState | undefined;
+  let result: HookResult;
   try {
     state = ensureSession(ctx);
-    const { config } = state;
-    if (!config.enabled || event.prompt.trim() === "" || isSlashCommand(event.prompt)) {
-      await restoreBaseline(pi, state);
-      return;
-    }
-
-    const baseline = refreshBaseline(pi, state);
-    const candidates = skillCandidates(listSkills(pi, event), config.skills);
-    const questions = buildQuestions(config, candidates);
-    if (Object.keys(questions).length === 0) return;
-
-    const { record, decision } = await runTurn({
-      config,
-      classifier: classifierFor(state),
-      prompt: event.prompt,
-      questions,
-      baseline,
-      candidates,
-    });
-    const order = profileOrder(config.tools);
-    const broadest = order.length - 1;
-    // A failed turn and a "don't know" turn both want the baseline, which is the broadest rank.
-    const target = decision?.tools.active ? order.indexOf(decision.tools.profile ?? "") : broadest;
-    // Widen-only ratchet: once narrowed, a later turn may keep or widen the tools, never narrow them further.
-    const admitted = state.allowNarrow || state.appliedRank === null || target >= state.appliedRank;
-    if (admitted) {
-      state.appliedRank = target;
-      state.allowNarrow = false;
-    }
-    record.applied = config.tools.enabled && state.appliedRank !== null ? (order[state.appliedRank] ?? null) : null;
-    state.lastRecord = record;
-    pi.appendEntry(DECISION_ENTRY, record);
-
-    if (decision === null) {
-      const notice = failureNotice(record);
-      if (notice.text !== state.lastFailure) {
-        state.lastFailure = notice.text;
-        notify(ctx, config, notice.text, notice.level);
-      }
-      await restoreBaseline(pi, state);
-      return;
-    }
-
-    state.lastFailure = null;
-    notify(ctx, config, `${config.dryRun ? "(dry run) " : ""}${summarize(record, baseline.length)}`, "info");
-    if (config.dryRun) return;
-
-    if (admitted) await activateTools(pi, state, decision.tools.active ?? baseline);
-
-    const selected = decision.skills.selected;
-    if (selected === null) return;
-    const promptSkills = event.systemPromptOptions?.skills;
-    const filter = config.skills.mode === "filter" || (config.skills.mode === "auto" && Array.isArray(promptSkills));
-    if (filter && event.systemPromptOptions && Array.isArray(promptSkills)) {
-      const keep = new Set([...selected, ...config.skills.exclude]);
-      // Reassign rather than splice: the array may be shared with the host's base prompt options.
-      event.systemPromptOptions.skills = promptSkills.filter((skill) => keep.has(skill.name));
-      return;
-    }
-    if (selected.length === 0) return;
-    return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
+    result = await runHook(pi, event, ctx, state, trace);
   } catch (error) {
-    if (!state) return;
+    if (!state) return; // fail closed: no record without a session
+    trace.message = errorText(error);
+    trace.status = "failed";
+    trace.error = safeErrorCode(error);
     const text = `selection error: ${errorText(error)}; using the full loadout until it recovers`;
     if (text !== state.lastFailure) {
       state.lastFailure = text;
       notify(ctx, state.config, text, "error");
     }
     try {
-      await restoreBaseline(pi, state);
+      trace.restoration = await restoreBaseline(pi, state);
     } catch {
-      // Restoring is best-effort; the turn must still run.
+      trace.restoration = "failed";
     }
   }
+  recordDecision(pi, ctx, state, trace);
+  return result;
 }
 
 function commandStatus(ctx: ExtensionContext, state: SessionState): void {
-  const { config } = state;
+  const { config, collection } = state;
+  const telemetry = state.telemetry.persist
+    ? `on | handed to host ${collection.handedOff} | failed ${collection.failed}${collection.lastFailure ? ` (${collection.lastFailure})` : ""}`
+    : `off (${state.telemetry.reason}) | suppressed ${collection.suppressed}`;
   const lines = [
     `${config.enabled ? "enabled" : "disabled"}${config.dryRun ? " (dry run)" : ""} | backend ${config.backend}`,
     `config: ${state.source ?? "built-in defaults"}`,
     `tools: ${config.tools.enabled ? `profiles ${Object.keys(config.tools.profiles).join(", ")}` : "off"} | skills: ${config.skills.enabled ? config.skills.mode : "off"}`,
     `baseline tools: ${state.baseline?.join(", ") ?? "not captured yet"}`,
-    `last decision: ${state.lastRecord ? summarize(state.lastRecord, state.baseline?.length ?? 0) : "none"}`,
+    `last decision: ${state.lastRecord ? describe(state.lastRecord, state.lastMessage, state.baseline?.length ?? 0) : "none"}`,
+    `telemetry: ${telemetry}`,
   ];
   for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
+}
+
+function applicationLine(record: DecisionRecordV3): string {
+  const { application } = record;
+  const restore = application.restoration ? ` (restore: ${application.restoration})` : "";
+  const error = application.error ? ` [${application.error}]` : "";
+  return `application: ${application.status}${restore}${error} | actual tools: ${application.actualTools?.join(", ") ?? "unknown"}`;
 }
 
 function commandExplain(ctx: ExtensionContext, state: SessionState): void {
@@ -349,9 +595,12 @@ function commandExplain(ctx: ExtensionContext, state: SessionState): void {
     return;
   }
   const { tools, skills } = record;
+  const latency = `latency: ${record.classifier?.elapsedMs ?? "-"}ms`;
   if (tools === null || skills === null) {
-    ctx.ui.notify(`${PREFIX} failed (${record.failure}): ${record.message}`, "info");
-    ctx.ui.notify(`${PREFIX} latency: ${record.latencyMs}ms`, "info");
+    const baselineSize = state.baseline?.length ?? 0;
+    for (const line of [describe(record, state.lastMessage, baselineSize), latency, applicationLine(record)]) {
+      ctx.ui.notify(`${PREFIX} ${line}`, "info");
+    }
     return;
   }
   const scores = Object.entries(skills.scores)
@@ -362,13 +611,20 @@ function commandExplain(ctx: ExtensionContext, state: SessionState): void {
     .sort(([, a], [, b]) => b - a)
     .map(([name, p]) => `${name}=${p.toFixed(2)}`)
     .join(", ");
+  const risks = tools.risks?.map(({ profile, risk }) => `${profile}=${risk?.toFixed(2) ?? "-"}`).join(" ");
+  const { ratchet } = record;
   const lines = [
     `tools: profile ${tools.profile ?? "-"} | risk ${tools.risk?.toFixed(2) ?? "-"} | reason ${tools.reason}`,
     `profile probabilities: ${probabilities || "none"}`,
-    `active: ${tools.active?.join(", ") ?? "baseline"}`,
-    `skills: reason ${skills.reason} | selected ${skills.selected?.join(", ") ?? "all"}`,
+    risks ? `risks: ${risks} (max ${tools.maxRisk.toFixed(2)})` : "risks: none",
+    `proposed: ${tools.active?.join(", ") ?? "baseline"}`,
+    ratchet
+      ? `ratchet: ${ratchet.before ?? "-"} -> ${ratchet.after ?? "-"} (${ratchet.admitted ? "admitted" : "blocked"}, narrowing ${ratchet.narrowAllowed ? "open" : "locked"})`
+      : "ratchet: none",
+    applicationLine(record),
+    `skills: reason ${skills.reason ?? "-"} | selected ${skills.selected?.join(", ") ?? "all"} | discovered ${skills.discovered} eligible ${skills.eligible} cap ${skills.maxCandidates} asked ${skills.asked}`,
     `skill scores: ${scores || "none"}`,
-    `latency: ${record.latencyMs}ms`,
+    latency,
   ];
   for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
 }

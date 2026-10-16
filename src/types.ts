@@ -339,17 +339,3 @@ export interface LoadoutDecision {
 
 /** Why a turn produced no decision. `warming`: the classifier had not loaded yet. */
 export type FailureReason = "warming" | ClassifierErrorCode | "error";
-
-/** One `loadout.decision` session entry per turn, including turns that failed. */
-export interface TurnRecord {
-  v: 2;
-  failure: FailureReason | null;
-  message: string | null;
-  tools: ToolsDecision | null;
-  skills: SkillsDecision | null;
-  /** Profile applied this turn, or the one that would be in dry run; null when none. */
-  applied: string | null;
-  backend: "jev" | "laya";
-  dryRun: boolean;
-  latencyMs: number;
-}
