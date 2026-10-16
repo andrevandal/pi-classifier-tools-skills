@@ -77,6 +77,13 @@ export interface ClassificationResult {
   model?: string;
   answers: Answers;
   usage?: { input_tokens?: number; output_tokens?: number };
+  timing?: ServerTiming;
+}
+
+/** Server-measured phases of one classification, in ms. Absent = unknown; 0 = measured zero. */
+export interface ServerTiming {
+  queueMs?: number;
+  inferenceMs?: number;
 }
 
 /** The state handed to a classifier: prompt text, or a structured document. */
@@ -88,6 +95,13 @@ export type ClassifierState = string | Record<string, unknown> | unknown[];
 
 export interface ClassifyOptions {
   signal?: AbortSignal;
+  /**
+   * UUIDv4 offered to the transport; set only when the caller persists telemetry. A record carries it even when the
+   * transport failed before sending (e.g. Jev token unset). Only the Laya HTTP transport may forward it.
+   */
+  requestId?: string;
+  /** The caller opted out of telemetry: a transport that records requests must not record this one. */
+  telemetryOff?: boolean;
 }
 
 export type Readiness = "ready" | "warming" | "failed";
@@ -120,11 +134,23 @@ export class ClassifierError extends Error {
   readonly code: ClassifierErrorCode;
   readonly backend: string;
 
-  constructor(backend: string, code: ClassifierErrorCode, message: string, options?: { cause?: unknown }) {
+  /** HTTP status of the failed call, when the transport saw one. */
+  readonly status?: number;
+  /** Server-measured phases, when the failed call still reported them. */
+  readonly timing?: ServerTiming;
+
+  constructor(
+    backend: string,
+    code: ClassifierErrorCode,
+    message: string,
+    options?: { cause?: unknown; status?: number; timing?: ServerTiming },
+  ) {
     super(message, options);
     this.name = "ClassifierError";
     this.backend = backend;
     this.code = code;
+    this.status = options?.status;
+    this.timing = options?.timing;
   }
 }
 
