@@ -3,30 +3,41 @@
  *
  * Search order is project before global, JSON before YAML:
  *   <cwd>/.omp/loadout.{json,yml,yaml}, then ~/.omp/loadout.{json,yml,yaml}
+ * `LOADOUT_CONFIG=<file>` replaces the search with that one file, which lets
+ * a benchmark or CI run pin each session's config from outside the project.
  *
  * Project files are read only when the host trusts the project: a config picks
  * the executable the Laya sidecar runs and the endpoint that receives prompts,
  * so a cloned repository must not be able to supply one.
  *
  * The first file that parses and validates wins. A file that parses but holds a
- * bad value is rejected and the defaults apply, because silently mis-selecting
- * tools is worse than leaving the loadout alone.
+ * bad value is rejected: the plugin turns itself off and reports the error,
+ * because silently mis-selecting tools is worse than leaving the loadout alone.
+ *
+ * `telemetry: false` in `~/.omp/loadout.*` is a machine-wide ceiling. It is read
+ * outside the search above, so no project or `LOADOUT_CONFIG` file can lift it;
+ * those files can only turn telemetry off. An unreadable machine setting or any
+ * config error also means no persistence (fail closed). It is applied when a
+ * session loads its config, so a change needs a restart.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { LoadoutConfig, LoadoutConfigInput, ToolList } from "./types.ts";
+import { profileOrder } from "./select.ts";
+import type { LoadoutConfig, LoadoutConfigInput, TelemetryState, ToolList } from "./types.ts";
 
 export const CONFIG_BASENAME = "loadout";
 const MIN_PROMPT_CHARS = 200;
+/** Longest classification budget a backend may ask for; a turn never waits longer. */
+export const MAX_BACKEND_TIMEOUT_MS = 20_000;
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "glob", "lsp", "web_search", "todo"];
 
 export function defaultConfig(): LoadoutConfig {
   return {
     enabled: true,
-    backend: "jev",
+    backend: "laya",
     jev: {
       endpoint: "https://api.typesafe.ai/v1/systemone",
       model: "jev-latest",
@@ -55,7 +66,7 @@ export function defaultConfig(): LoadoutConfig {
         type: "choice",
         instructions: "Which tools does an AI coding agent need to handle this request?",
         criteria: {
-          answer: "explain, review, or answer a question about code; nothing is changed or executed",
+          answer: "explain or answer a question by reading code; needs no shell, git, or file changes",
           edit: "change files directly; no commands, tests, or builds need to run",
           full: "run commands, tests, builds, git, or anything not covered above",
         },
@@ -67,10 +78,10 @@ export function defaultConfig(): LoadoutConfig {
         full: "*",
       },
       alwaysOn: [],
-      confidenceThreshold: 0.6,
+      maxRisk: 0.1,
     },
     skills: {
-      enabled: true,
+      enabled: false,
       mode: "auto",
       threshold: 0.5,
       maxSkills: 5,
@@ -81,18 +92,23 @@ export function defaultConfig(): LoadoutConfig {
     maxPromptChars: 8000,
     dryRun: false,
     notify: true,
+    telemetry: true,
   };
 }
 
 export interface ConfigSource {
   path: string;
-  scope: "project" | "global";
+  scope: "project" | "global" | "explicit";
 }
 
 export interface LoadResult {
   config: LoadoutConfig;
   /** The file the config came from, or null when the defaults apply. */
   source: string | null;
+  /** Which kind of file `source` is; null when the defaults apply. */
+  scope: ConfigSource["scope"] | null;
+  /** Whether this session may persist trace records, and why not. */
+  telemetry: TelemetryState;
   errors: string[];
   warnings: string[];
 }
@@ -102,6 +118,8 @@ export interface LoadOptions {
   home?: string;
   /** YAML parser; defaults to `Bun.YAML.parse` when running on Bun. */
   parseYaml?: ((text: string) => unknown) | null;
+  /** Load exactly this file instead of searching (from `LOADOUT_CONFIG`). */
+  explicitPath?: string;
 }
 
 function bunYaml(): ((text: string) => unknown) | null {
@@ -110,21 +128,32 @@ function bunYaml(): ((text: string) => unknown) | null {
   return typeof parse === "function" ? (text) => parse.call(bun?.YAML, text) : null;
 }
 
-export function configCandidates(cwd: string, home: string): ConfigSource[] {
-  const files = (dir: string, scope: ConfigSource["scope"]): ConfigSource[] =>
-    ["json", "yml", "yaml"].map((ext) => ({ path: path.join(dir, ".omp", `${CONFIG_BASENAME}.${ext}`), scope }));
-  return [...files(cwd, "project"), ...files(home, "global")];
+function configFiles(dir: string, scope: ConfigSource["scope"]): ConfigSource[] {
+  return ["json", "yml", "yaml"].map((ext) => ({ path: path.join(dir, ".omp", `${CONFIG_BASENAME}.${ext}`), scope }));
 }
 
-export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
-  const home = options.home ?? os.homedir();
-  const parseYaml = options.parseYaml === undefined ? bunYaml() : options.parseYaml;
+export function configCandidates(cwd: string, home: string): ConfigSource[] {
+  return [...configFiles(cwd, "project"), ...configFiles(home, "global")];
+}
+
+function searchConfig(
+  cwd: string,
+  options: LoadOptions,
+  home: string,
+  parseYaml: ((text: string) => unknown) | null,
+): Omit<LoadResult, "telemetry"> {
   const errors: string[] = [];
   const warnings: string[] = [];
   const projectIsHome = path.resolve(cwd) === path.resolve(home);
 
-  for (const source of configCandidates(cwd, home)) {
-    if (!fs.existsSync(source.path)) continue;
+  const candidates: ConfigSource[] = options.explicitPath
+    ? [{ path: path.resolve(options.explicitPath), scope: "explicit" }]
+    : configCandidates(cwd, home);
+  for (const source of candidates) {
+    if (!fs.existsSync(source.path)) {
+      if (source.scope === "explicit") errors.push(`${source.path}: LOADOUT_CONFIG names a file that does not exist`);
+      continue;
+    }
     if (source.scope === "project" && (projectIsHome || !options.projectTrusted)) {
       if (!projectIsHome) warnings.push(`${source.path}: ignored because this project is not trusted`);
       continue;
@@ -150,11 +179,63 @@ export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
     warnings.push(...parsed.warnings.map((w) => `${source.path}: ${w}`));
     if (parsed.errors.length > 0) {
       errors.push(...parsed.errors.map((e) => `${source.path}: ${e}`));
-      return { config: defaultConfig(), source: null, errors, warnings };
+      return { config: { ...defaultConfig(), enabled: false }, source: null, scope: null, errors, warnings };
     }
-    return { config: parsed.config, source: source.path, errors, warnings };
+    return { config: parsed.config, source: source.path, scope: source.scope, errors, warnings };
   }
-  return { config: defaultConfig(), source: null, errors, warnings };
+  // A file that was named but could not be used disables the plugin rather than running on guessed defaults.
+  const config = errors.length > 0 ? { ...defaultConfig(), enabled: false } : defaultConfig();
+  return { config, source: null, scope: null, errors, warnings };
+}
+
+/**
+ * The machine-level `telemetry` setting in the first existing `~/.omp/loadout.*`
+ * file. It is read outside the normal search so nothing a project or
+ * `LOADOUT_CONFIG` says can lift it. Anything unreadable is `"unreadable"`, which
+ * callers treat as off. `"on"` and `"absent"` behave alike: it is a ceiling, not a force.
+ */
+export type MachineTelemetry = "absent" | "on" | "off" | "unreadable";
+
+export function readMachineTelemetry(
+  home: string,
+  parseYaml: ((text: string) => unknown) | null = bunYaml(),
+): MachineTelemetry {
+  for (const source of configFiles(home, "global")) {
+    let text: string;
+    try {
+      text = fs.readFileSync(source.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return "unreadable";
+    }
+    let raw: unknown;
+    try {
+      if (source.path.endsWith(".json")) raw = JSON.parse(text);
+      else if (parseYaml) raw = parseYaml(text);
+      else return "unreadable";
+    } catch {
+      return "unreadable";
+    }
+    if (!isRecord(raw)) return "unreadable";
+    if (!Object.hasOwn(raw, "telemetry")) return "absent";
+    return raw.telemetry === false ? "off" : raw.telemetry === true ? "on" : "unreadable";
+  }
+  return "absent";
+}
+
+function resolveTelemetry(machine: MachineTelemetry, found: Omit<LoadResult, "telemetry">): TelemetryState {
+  if (machine === "off") return { persist: false, reason: "machine-off" };
+  if (machine === "unreadable") return { persist: false, reason: "machine-unreadable" };
+  if (found.errors.length > 0) return { persist: false, reason: "config-error" };
+  if (!found.config.telemetry) return { persist: false, reason: "config-off" };
+  return { persist: true, reason: "default" };
+}
+
+export function loadConfig(cwd: string, options: LoadOptions): LoadResult {
+  const home = options.home ?? os.homedir();
+  const parseYaml = options.parseYaml === undefined ? bunYaml() : options.parseYaml;
+  const found = searchConfig(cwd, options, home, parseYaml);
+  return { ...found, telemetry: resolveTelemetry(readMachineTelemetry(home, parseYaml), found) };
 }
 
 const SECTIONS = ["jev", "laya", "tools", "skills"] as const;
@@ -259,14 +340,21 @@ export function parseConfig(raw: unknown): { config: LoadoutConfig; errors: stri
   if (!["auto", "filter", "hint"].includes(config.skills.mode)) {
     errors.push(`"skills.mode" must be "auto", "filter" or "hint"`);
   }
-  checkRange(errors, "tools.confidenceThreshold", config.tools.confidenceThreshold, 0, 1);
+  checkRange(errors, "tools.maxRisk", config.tools.maxRisk, 0, 1);
   checkRange(errors, "skills.threshold", config.skills.threshold, 0, 1);
   checkRange(errors, "skills.maxSkills", config.skills.maxSkills, 1);
   checkRange(errors, "skills.maxCandidates", config.skills.maxCandidates, 1);
-  checkRange(errors, "jev.timeoutMs", config.jev.timeoutMs, 1);
-  checkRange(errors, "laya.timeoutMs", config.laya.timeoutMs, 1);
+  checkRange(errors, "jev.timeoutMs", config.jev.timeoutMs, 1, MAX_BACKEND_TIMEOUT_MS);
+  checkRange(errors, "laya.timeoutMs", config.laya.timeoutMs, 1, MAX_BACKEND_TIMEOUT_MS);
   if (config.maxPromptChars !== null) checkRange(errors, "maxPromptChars", config.maxPromptChars, MIN_PROMPT_CHARS);
   validateTools(config, errors);
+  if (errors.length === 0) {
+    try {
+      profileOrder(config.tools);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   return errors.length > 0 ? { config: defaults, errors, warnings } : { config, errors, warnings };
 }

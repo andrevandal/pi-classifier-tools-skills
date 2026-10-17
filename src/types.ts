@@ -77,6 +77,13 @@ export interface ClassificationResult {
   model?: string;
   answers: Answers;
   usage?: { input_tokens?: number; output_tokens?: number };
+  timing?: ServerTiming;
+}
+
+/** Server-measured phases of one classification, in ms. Absent = unknown; 0 = measured zero. */
+export interface ServerTiming {
+  queueMs?: number;
+  inferenceMs?: number;
 }
 
 /** The state handed to a classifier: prompt text, or a structured document. */
@@ -88,7 +95,16 @@ export type ClassifierState = string | Record<string, unknown> | unknown[];
 
 export interface ClassifyOptions {
   signal?: AbortSignal;
+  /**
+   * UUIDv4 offered to the transport; set only when the caller persists telemetry. A record carries it even when the
+   * transport failed before sending (e.g. Jev token unset). Only the Laya HTTP transport may forward it.
+   */
+  requestId?: string;
+  /** The caller opted out of telemetry: a transport that records requests must not record this one. */
+  telemetryOff?: boolean;
 }
+
+export type Readiness = "ready" | "warming" | "failed";
 
 /**
  * A classifier turns state + typed questions into typed answers.
@@ -106,6 +122,8 @@ export interface Classifier {
    */
   warmup?(options?: ClassifyOptions): Promise<void>;
   classify(state: ClassifierState, questions: Questions, options?: ClassifyOptions): Promise<ClassificationResult>;
+  /** `warming` while the backend loads, `failed` after it died, otherwise `ready`. Never blocks. */
+  readiness(): Readiness;
   /** Release resources (HTTP handles, sidecar processes). Idempotent. */
   dispose(): Promise<void>;
 }
@@ -116,11 +134,23 @@ export class ClassifierError extends Error {
   readonly code: ClassifierErrorCode;
   readonly backend: string;
 
-  constructor(backend: string, code: ClassifierErrorCode, message: string, options?: { cause?: unknown }) {
+  /** HTTP status of the failed call, when the transport saw one. */
+  readonly status?: number;
+  /** Server-measured phases, when the failed call still reported them. */
+  readonly timing?: ServerTiming;
+
+  constructor(
+    backend: string,
+    code: ClassifierErrorCode,
+    message: string,
+    options?: { cause?: unknown; status?: number; timing?: ServerTiming },
+  ) {
     super(message, options);
     this.name = "ClassifierError";
     this.backend = backend;
     this.code = code;
+    this.status = options?.status;
+    this.timing = options?.timing;
   }
 }
 
@@ -211,8 +241,8 @@ export interface ToolsSelectorConfig {
   profiles: Record<string, ToolList>;
   /** Tools kept active under every profile (still intersected with the baseline). */
   alwaysOn: string[];
-  /** Below this confidence the baseline is kept. */
-  confidenceThreshold: number;
+  /** Most probability mass allowed on profiles broader than the chosen one; above it the baseline is kept. */
+  maxRisk: number;
 }
 
 /**
@@ -250,6 +280,15 @@ export interface LoadoutConfig {
   /** Classify and record, but never change tools or skills. */
   dryRun: boolean;
   notify: boolean;
+  /** Persist plugin-owned trace records; a machine-level `false` outranks this key. */
+  telemetry: boolean;
+}
+
+/** Why records are or are not persisted, in precedence order. */
+export type TelemetryReason = "machine-off" | "machine-unreadable" | "config-error" | "config-off" | "default";
+export interface TelemetryState {
+  persist: boolean;
+  reason: TelemetryReason;
 }
 
 export interface LoadoutConfigInput {
@@ -262,6 +301,7 @@ export interface LoadoutConfigInput {
   maxPromptChars?: number | null;
   dryRun?: boolean;
   notify?: boolean;
+  telemetry?: boolean;
 }
 
 /** A skill as the classifier sees it. */
@@ -270,14 +310,17 @@ export interface SkillCandidate {
   description: string;
 }
 
-export type ToolsReason = "selected" | "disabled" | "missing-answer" | "low-confidence" | "unknown-profile";
+export type ToolsReason = "selected" | "disabled" | "missing-answer" | "low-confidence";
 export type SkillsReason = "selected" | "disabled" | "no-candidates" | "too-many-candidates" | "missing-answer";
 
 export interface ToolsDecision {
   /** Tools to activate, or null to keep the baseline. */
   active: string[] | null;
   profile: string | null;
-  confidence: number;
+  /** Probability per profile id, as the classifier reported it. */
+  probabilities: Record<string, number>;
+  /** Probability mass on profiles broader than `profile`; null when nothing was chosen. */
+  risk: number | null;
   reason: ToolsReason;
 }
 
@@ -293,3 +336,6 @@ export interface LoadoutDecision {
   tools: ToolsDecision;
   skills: SkillsDecision;
 }
+
+/** Why a turn produced no decision. `warming`: the classifier had not loaded yet. */
+export type FailureReason = "warming" | ClassifierErrorCode | "error";

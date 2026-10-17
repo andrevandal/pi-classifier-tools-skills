@@ -35,6 +35,7 @@ import type {
   ClassifyOptions,
   LayaBackendConfig,
   Questions,
+  Readiness,
 } from "../types.ts";
 import type { ClassifierDeps } from "./index.ts";
 
@@ -87,6 +88,7 @@ export function createLayaClassifier(config: LayaBackendConfig, deps: Classifier
   let child: ChildProcessLike | null = null;
   let nextId = 1;
   let ready: ReadyInfo | null = null;
+  let lastError: string | null = null;
   let warnedStdout = false;
   const pending = new Map<number, PendingCall>();
   let readyWaiters: ReadyWaiter[] = [];
@@ -113,6 +115,7 @@ export function createLayaClassifier(config: LayaBackendConfig, deps: Classifier
     if (child !== proc) return;
     child = null;
     ready = null;
+    lastError = message;
     warnedStdout = false;
     const error = new ClassifierError(BACKEND, "unavailable", message);
     for (const call of [...pending.values()]) call.reject(error);
@@ -144,6 +147,7 @@ export function createLayaClassifier(config: LayaBackendConfig, deps: Classifier
     if (typeof record["event"] === "string") {
       const event = record["event"];
       if (event === "ready") {
+        lastError = null;
         ready = {
           version: typeof record["version"] === "string" ? record["version"] : "unknown",
           loaded: Array.isArray(record["loaded"])
@@ -313,6 +317,11 @@ export function createLayaClassifier(config: LayaBackendConfig, deps: Classifier
 
   return {
     name: BACKEND,
+
+    readiness(): Readiness {
+      if (ready !== null) return "ready";
+      return lastError !== null ? "failed" : "warming";
+    },
 
     async warmup(options?: ClassifyOptions): Promise<void> {
       ensureChild();

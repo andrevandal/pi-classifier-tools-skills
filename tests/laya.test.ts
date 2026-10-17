@@ -108,6 +108,37 @@ if (probe.error || probe.status !== 0) {
     assert.equal(echoOf(result).state, "after warmup");
   });
 
+  test("readiness is warming until the worker reports ready", async (t) => {
+    const laya = createLayaClassifier(config(), { env: { STUB_LAYA_READY_DELAY_MS: "120" } });
+    t.after?.(() => laya.dispose());
+
+    const warming = laya.warmup?.();
+    assert.equal(laya.readiness(), "warming");
+    await warming;
+    assert.equal(laya.readiness(), "ready");
+  });
+
+  test("readiness is failed once the worker exits before it becomes ready", async (t) => {
+    let onExit: ((code: unknown) => void) | undefined;
+    const laya = createLayaClassifier(config(), {
+      spawnImpl: () => ({
+        stdout: null,
+        stderr: null,
+        stdin: { write: () => true },
+        kill: () => true,
+        on: (event, listener) => {
+          if (event === "exit") onExit = listener;
+        },
+      }),
+    });
+    t.after?.(() => laya.dispose());
+
+    const call = rejection(laya.classify("hi", QUESTIONS), "unavailable");
+    onExit?.(2);
+    await call;
+    assert.equal(laya.readiness(), "failed");
+  });
+
   test("warmup fails with timeout when the worker never becomes ready", async (t) => {
     const laya = createLayaClassifier(config({ warmupTimeoutMs: 150 }), {
       env: { STUB_LAYA_READY_DELAY_MS: "3000" },
