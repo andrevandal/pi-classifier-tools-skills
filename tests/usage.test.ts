@@ -401,11 +401,20 @@ test("usage: a replayed turn_end counts once and only assistant messages are obs
 });
 
 test("usage: tool counts and errors come from this message and this turn's results only", () => {
-  const calls = ["read", "read", "bash", "bash; CANARY", "__proto__", { type: "toolCall", id: "call_9", name: 42 }];
+  const calls = [
+    "read",
+    "read",
+    "bash",
+    "bash; CANARY",
+    "__proto__",
+    ...INVENTED_TOOL_NAMES,
+    { type: "toolCall", id: "call_9", name: 42 },
+  ];
   const results = [toolResult("read", true), toolResult("read", false), { isError: "yes" }, null];
   const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results }), REGISTERED);
   assert.ok(observation);
   assert.deepEqual(observation.toolCalls, { read: 2, bash: 1 });
+  assert.doesNotMatch(JSON.stringify(observation), /CANARY|secret|example\.com|sk-live/);
   assert.equal(observation.toolErrors, 1);
   // A tool result's own usage is not this turn's usage.
   assert.deepEqual(observation.tokens, DEFAULT_TOKENS);
