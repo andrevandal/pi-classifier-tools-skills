@@ -51,7 +51,9 @@ import {
 const piAiJson = findPackageJSON("@earendil-works/pi-ai", import.meta.resolve("@earendil-works/pi-coding-agent"));
 if (piAiJson === undefined) throw new Error("@earendil-works/pi-ai not found next to @earendil-works/pi-coding-agent");
 const piAiEntry = path.join(path.dirname(piAiJson), JSON.parse(fs.readFileSync(piAiJson, "utf8")).exports["."].import);
-const { fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(piAiEntry).href);
+const { fauxAssistantMessage, fauxProvider, fauxToolCall, InMemoryCredentialStore, InMemoryModelsStore } = await import(
+  pathToFileURL(piAiEntry).href
+);
 
 const SESSION = "session-usage-1";
 const KEYS = [
@@ -571,9 +573,11 @@ async function piSession(loadoutConfig: Record<string, unknown>) {
   fs.mkdirSync(agentDir);
   fs.writeFileSync(path.join(cwd, "notes.txt"), "synthetic notes\n");
   const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  // In-memory stores: pi's file-backed ones write auth.json and models-store.json after the session is disposed.
   const modelRuntime = await ModelRuntime.create({
-    authPath: path.join(agentDir, "auth.json"),
-    modelsPath: path.join(agentDir, "models.json"),
+    credentials: new InMemoryCredentialStore(),
+    modelsStore: new InMemoryModelsStore(),
+    modelsPath: null,
   });
   modelRuntime.registerNativeProvider(faux.provider);
   const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [loadout] });
