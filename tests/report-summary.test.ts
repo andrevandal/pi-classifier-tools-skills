@@ -20,6 +20,7 @@ import {
 } from "../src/report/summary.ts";
 import { DECISION_ENTRY, USAGE_ENTRY } from "../src/telemetry.ts";
 import {
+  application,
   assistantMessage,
   chain,
   classifier,
@@ -27,11 +28,13 @@ import {
   decisionV3,
   header,
   httpRecord,
+  INVENTED_TOOL_NAMES,
   R1,
   reportInput,
   serviceLog,
   settings,
   tmp,
+  toolCallTurn,
   usageV1,
   uuid,
   writeBranches,
@@ -307,6 +310,51 @@ test("summary: usage records and transcript turns are separate sources", () => {
   assert.equal(both.transcript.turns, 4, "host messages have no identity to deduplicate on");
   assert.equal(both.transcript.deduplicated, false);
   assert.equal(both.transcript.tokens.input.sum, 32);
+});
+
+test("summary: a transcript tool name is printed only when the plugin's own records vouch for it", () => {
+  const dir = tmp();
+  const file = writeSession(path.join(dir, "v.jsonl"), [
+    header({ id: "sess-V", cwd: "/p/one" }),
+    ...chain([
+      toolCallTurn("read", "bash", ...INVENTED_TOOL_NAMES),
+      toolCallTurn("read", "edit", "CANARY_TOOL_N7"),
+      toolCallTurn("write", "CANARY tool name"),
+      custom(USAGE_ENTRY, usageV1({ eventId: uuid(601), toolCalls: { read: 2, edit: 1 } })),
+      custom(
+        DECISION_ENTRY,
+        decisionV3({
+          eventId: uuid(61),
+          decisionId: uuid(261),
+          application: application({ actualTools: ["read", "bash"] }),
+        }),
+      ),
+    ]),
+  ]);
+  const bare = writeSession(path.join(dir, "bare.jsonl"), [header({ id: "sess-B" }), ...chain([toolCallTurn("read")])]);
+
+  // `read` and `edit` are vouched by a usage record, `bash` by a decision's actual tools. Every other name,
+  // whatever it looks like, is the model's own text: it counts, under one label, and is never printed.
+  const summary = summarize(reportInput([file]));
+  assert.deepEqual(summary.transcript.toolCalls, {
+    total: 11,
+    byTool: { read: 2, bash: 1, edit: 1, "(redacted)": 7 },
+  });
+  assert.deepEqual(summary.usage.toolCalls, { total: 3, byTool: { read: 2, edit: 1 } });
+  for (const name of [...INVENTED_TOOL_NAMES, "CANARY tool name"]) {
+    assert.equal(JSON.stringify(summary).includes(name), false, name);
+  }
+
+  // A session with no plugin record vouches for nothing: the counts stay, the names go.
+  assert.deepEqual(summarize(reportInput([bare])).transcript.toolCalls, { total: 1, byTool: { "(redacted)": 1 } });
+
+  // A caller that passes no set (the benchmark) gets the reader's names.
+  const read = readSessions([file]);
+  assert.equal(transcriptTotals(read.turns, read.toolResults).toolCalls.byTool.CANARY_TOOL_N7, 2);
+  assert.deepEqual(transcriptTotals(read.turns, read.toolResults, false, new Set(["read"])).toolCalls.byTool, {
+    read: 2,
+    "(redacted)": 9,
+  });
 });
 
 test("summary: abandoned branches count by default and filter on demand", () => {

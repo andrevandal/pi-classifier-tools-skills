@@ -8,15 +8,16 @@
  */
 
 import type { DecisionView, HttpServerRecordV1 } from "../telemetry.ts";
-import type {
-  Branch,
-  DecisionEvent,
-  Provenance,
-  ServiceRead,
-  ToolResultEvent,
-  TurnEvent,
-  TurnOutcome,
-  UsageEvent,
+import {
+  type Branch,
+  type DecisionEvent,
+  type Provenance,
+  REDACTED,
+  type ServiceRead,
+  type ToolResultEvent,
+  type TurnEvent,
+  type TurnOutcome,
+  type UsageEvent,
 } from "./read.ts";
 import type { FilterSpec, Filtered, ScopeSpec, Selection } from "./scope.ts";
 
@@ -305,12 +306,17 @@ function threeWay(values: Iterable<boolean | null>): { yes: number; no: number; 
   return out;
 }
 
-function toolCalls(perTurn: Iterable<Record<string, number>>): { total: number; byTool: Count } {
+/** Calls per tool. A name outside `vouched`, when given, counts under one redacted label; the total is unchanged. */
+function toolCalls(
+  perTurn: Iterable<Record<string, number>>,
+  vouched: ReadonlySet<string> | null = null,
+): { total: number; byTool: Count } {
   const byTool = new Map<string, number>();
   let total = 0;
   for (const calls of perTurn) {
     for (const [name, n] of Object.entries(calls)) {
-      byTool.set(name, (byTool.get(name) ?? 0) + n);
+      const label = vouched === null || vouched.has(name) ? name : REDACTED;
+      byTool.set(label, (byTool.get(label) ?? 0) + n);
       total += n;
     }
   }
@@ -321,11 +327,16 @@ function toolCalls(perTurn: Iterable<Record<string, number>>): { total: number; 
 // Transcript and usage
 // ---------------------------------------------------------------------------
 
-/** Totals over host-transcript turns. Not deduplicated; `toolResults` and `toolErrors` are null when `usageFiltered`. */
+/**
+ * Totals over host-transcript turns. Not deduplicated; `toolResults` and `toolErrors` are null when `usageFiltered`.
+ * A transcript's tool names are the model's own text, so a report passes `vouched` (see `vouchedToolNames`) and a name
+ * outside it counts under `(redacted)`. The benchmark passes none and keeps the reader's names.
+ */
 export function transcriptTotals(
   turns: readonly TurnEvent[],
   toolResults: readonly ToolResultEvent[],
   usageFiltered = false,
+  vouched: ReadonlySet<string> | null = null,
 ): TranscriptSummary {
   return {
     turns: turns.length,
@@ -338,11 +349,29 @@ export function transcriptTotals(
       cacheWrite: sumOf(turns.map((turn) => turn.tokens.cacheWrite)),
     },
     cost: sumOf(turns.map((turn) => turn.cost)),
-    toolCalls: toolCalls(turns.map((turn) => turn.tools)),
+    toolCalls: toolCalls(
+      turns.map((turn) => turn.tools),
+      vouched,
+    ),
     toolResults: usageFiltered ? null : toolResults.length,
     toolErrors: usageFiltered ? null : toolResults.filter((result) => result.isError).length,
     deduplicated: false,
   };
+}
+
+/**
+ * The tool names the plugin's own records vouch for: the keys of a `loadout.usage` record's `toolCalls` (the producer
+ * counts only names in the host's tool registry) and the tools a decision read back from the host after applying.
+ */
+function vouchedToolNames(usage: readonly UsageEvent[], decisions: readonly DecisionEvent[]): Set<string> {
+  const names = new Set<string>();
+  for (const event of usage) {
+    for (const name of Object.keys(event.record.toolCalls)) names.add(name);
+  }
+  for (const event of decisions) {
+    for (const name of event.view.application?.actualTools ?? []) names.add(name);
+  }
+  return names;
 }
 
 type PromptTokens = Pick<TranscriptSummary["tokens"], "input" | "cacheRead" | "cacheWrite">;
@@ -736,7 +765,12 @@ export function summarize(input: ReportInput): Summary {
     decisions: summarizeDecisions(filtered.decisions, attempts, blockers),
     classifier: summarizeClassifier(attempts),
     usage: summarizeUsage(filtered.usage),
-    transcript: transcriptTotals(filtered.turns, filtered.toolResults, filtered.usageFiltered),
+    transcript: transcriptTotals(
+      filtered.turns,
+      filtered.toolResults,
+      filtered.usageFiltered,
+      vouchedToolNames(filtered.usage, filtered.decisions),
+    ),
     http: join === null ? null : join.http,
     leads: candidates.filter((lead) => lead.count > 0).sort((a, b) => b.count - a.count || byText(a.id, b.id)),
     disclosures: DISCLOSURES,

@@ -429,7 +429,7 @@ The last column says when each counter is computed: before parsing, at file leve
 | `transcript.cost` | `Sum` of each turn's `usage.cost.total` |
 | `transcript.toolCalls` | object with `total` and `byTool` (below) |
 | `transcript.toolCalls.total` | tool calls in the kept turns |
-| `transcript.toolCalls.byTool` | tool calls by name; a name that is not an identifier counts as `(redacted)` |
+| `transcript.toolCalls.byTool` | tool calls by name. A transcript's tool names are the model's own text, so a name is printed only when a `loadout.usage` record's `toolCalls` or a decision's `application.actualTools`, in the same scope and filters, names that tool. Every other name, identifier-shaped or not, counts as `(redacted)`, and `total` does not change. A session with no plugin record prints only `(redacted)` |
 | `transcript.toolResults` | kept tool-result messages; `null` under a model-turn filter |
 | `transcript.toolErrors` | kept tool results with `isError`; `null` under a model-turn filter |
 | `transcript.deduplicated` | always `false` |

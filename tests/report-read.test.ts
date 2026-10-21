@@ -526,7 +526,7 @@ test("reader: timestamps accept strict ISO only", () => {
   assert.deepEqual(ats, [Date.parse(T0), null, null], "a malformed or missing timestamp is unplaced, never now");
 });
 
-test("reader: tool-name sanitizer agrees with normalizeUsage", () => {
+test("reader: a transcript tool name is a candidate only when it is identifier-shaped, by normalizeUsage's rule", () => {
   const names = [
     "read",
     "mcp__srv__tool",
@@ -546,6 +546,8 @@ test("reader: tool-name sanitizer agrees with normalizeUsage", () => {
       ),
     ),
   ]);
+  // The reader's gate is the shape alone: a model can write an identifier-shaped name that no host registered, so a
+  // report prints a candidate only when a plugin record vouches for it (see the summary test).
   const turns = readSessions([file]).turns;
   assert.equal(turns.length, names.length);
   for (const [i, name] of names.entries()) {

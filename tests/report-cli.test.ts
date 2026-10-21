@@ -9,14 +9,17 @@ import type { ExportDoc } from "../src/report/export.ts";
 import { buildExport, buildSummary } from "../src/report/report.ts";
 import { NO_FILTERS } from "../src/report/scope.ts";
 import type { Summary } from "../src/report/summary.ts";
-import { DECISION_ENTRY } from "../src/telemetry.ts";
+import { DECISION_ENTRY, USAGE_ENTRY } from "../src/telemetry.ts";
 import {
   chain,
   custom,
   decisionV3,
   header,
+  INVENTED_TOOL_NAMES,
   serviceLog,
   tmp,
+  toolCallTurn,
+  usageV1,
   uuid,
   writeBranches,
   writeMixed,
@@ -415,4 +418,28 @@ console.log(JSON.stringify({
   );
   assert.equal(probe.status, 0, probe.stderr || "killed: a reader blocked on the pipe");
   assert.deepEqual(JSON.parse(probe.stdout), { header: null, sessionUnreadable: true, logUnreadable: 1 });
+});
+
+test("cli: a tool name the model wrote never reaches summary or export stdout", () => {
+  const file = writeSession(path.join(tmp(), "t.jsonl"), [
+    header({ id: "sess-T", cwd: "/p/one" }),
+    ...chain([
+      toolCallTurn("read", ...INVENTED_TOOL_NAMES),
+      custom(USAGE_ENTRY, usageV1({ eventId: uuid(701), toolCalls: { read: 1 } })),
+    ]),
+  ]);
+  assert.match(fs.readFileSync(file, "utf8"), /CANARY_TOOL_N7/, "the invented names are in the transcript");
+
+  for (const command of ["summary", "export"]) {
+    const result = run([command, "--session", file]);
+    assert.equal(result.status, 0, result.stderr);
+    for (const name of INVENTED_TOOL_NAMES) {
+      assert.equal(result.stdout.includes(name), false, `${command} prints ${name}`);
+    }
+  }
+  // `read` is vouched by the usage record; the four invented names count under one label.
+  assert.deepEqual(summaryOf(run(["summary", "--session", file])).transcript.toolCalls, {
+    total: 5,
+    byTool: { read: 1, "(redacted)": 4 },
+  });
 });

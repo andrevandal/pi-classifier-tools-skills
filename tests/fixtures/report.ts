@@ -242,6 +242,16 @@ export const toolResultMessage = (isError = false): Record<string, unknown> => (
   },
 });
 
+/** An assistant turn that calls each named tool once. */
+export const toolCallTurn = (...names: string[]): Record<string, unknown> =>
+  assistantMessage({
+    content: names.map((name, i) => ({ type: "toolCall", id: `call-${i}`, name, arguments: {} })),
+    stopReason: "toolUse",
+  });
+
+/** Names a model can write that look like identifiers and are not tools the host registered. */
+export const INVENTED_TOOL_NAMES = ["CANARY_TOOL_N7", "src/secret.ts", "user@example.com", "sk-live-0123456789abcdef"];
+
 /** Link entries into one linear branch: id `e<i>`, the previous id as parent, a timestamp one step after the last. */
 export function chain(
   entries: Record<string, unknown>[],

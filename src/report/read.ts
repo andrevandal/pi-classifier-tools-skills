@@ -114,7 +114,8 @@ export interface ServiceRead {
 /** The identifier pattern of `telemetry.ts` (its private `SAFE_NAME`); a test pins the two together. */
 export const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:@/+-]{0,99}$/;
 
-const REDACTED = "(redacted)";
+/** What stands in for a value a report must not print. */
+export const REDACTED = "(redacted)";
 /** The host writes the header on line 1 or 2, after an optional title slot. */
 const HEADER_WINDOW = 4;
 const PEEK_BYTES = 64 * 1024;
