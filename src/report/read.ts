@@ -120,7 +120,7 @@ const HEADER_WINDOW = 4;
 const PEEK_BYTES = 64 * 1024;
 const TURN_OUTCOMES: readonly string[] = ["stop", "length", "toolUse", "error", "aborted"];
 
-const isObject = (value: unknown): value is Record<string, unknown> =>
+export const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 // ---------------------------------------------------------------------------
