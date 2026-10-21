@@ -1410,7 +1410,11 @@ async function explainOf(host: Host): Promise<string> {
 function assertCompact(text: string): void {
   assert.ok(text.length <= 160, text);
   assert.doesNotMatch(text, /\n/);
-  assert.doesNotMatch(text, /\b(?:read|bash|edit|write|grep|find|ls|task), /);
+  // A tool list is two tool names in a row; a profile name that is also a tool name ("would keep edit, not answer") is not.
+  assert.doesNotMatch(
+    text,
+    /\b(?:read|bash|edit|write|grep|find|ls|task), (?:read|bash|edit|write|grep|find|ls|task)\b/,
+  );
   assert.doesNotMatch(text, /\bp \d\.\d\d\b|\b(?:answer|edit|full): \d/);
 }
 
@@ -1769,6 +1773,64 @@ test("extension: per-turn notice: one compact line after application, honors not
   host.shutdown();
 });
 
+test("extension: a dry run reports what the widen-only ratchet would keep, never a narrowing it would refuse", async () => {
+  // Answer, then a widening to edit, then answer again: the third proposal would narrow below the tools in force.
+  writeConfig({ dryRun: true, skills: { enabled: false } });
+  let host = fakeHost("pi");
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  assert.equal(
+    onlyNotice(await promptInfo(host, "explain this")).message,
+    "[loadout] dry run: would use answer (tools 4), nothing changed",
+  );
+  WIDEN_TO_EDIT();
+  assert.equal(
+    onlyNotice(await promptInfo(host, "run the tests")).message,
+    "[loadout] dry run: would use edit (tools 6), nothing changed",
+  );
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  const refused = onlyNotice(await promptInfo(host, "explain that")).message;
+  assert.equal(refused, "[loadout] dry run: widen-only would keep edit, not answer; nothing changed");
+  assertCompact(refused);
+  const refusedExplain = await explainOf(host);
+  assert.match(refusedExplain, /^ {2}ratchet: edit -> edit \(blocked, narrowing locked\)$/m);
+  assert.match(refusedExplain, /^ {2}blocked: dry run, widen-only ratchet \(would keep edit\)$/m);
+  assert.doesNotMatch(refusedExplain, /\bapplied\b/i);
+  assert.deepEqual(host.active(), BASELINE, "a dry run changes no tool");
+  assert.ok(!host.calls.includes("set"));
+  host.shutdown();
+
+  // One low-confidence turn locks narrowing at the broadest profile, so a later confident answer is refused as well.
+  reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
+  host = fakeHost("pi");
+  assert.equal(
+    onlyNotice(await promptInfo(host, "explain this")).message,
+    "[loadout] dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10))",
+  );
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  const locked = onlyNotice(await promptInfo(host, "explain that")).message;
+  assert.equal(locked, "[loadout] dry run: widen-only would keep full, not answer; nothing changed");
+  const lockedExplain = await explainOf(host);
+  assert.match(lockedExplain, /^ {2}ratchet: full -> full \(blocked, narrowing locked\)$/m);
+  assert.match(lockedExplain, /^ {2}blocked: dry run, widen-only ratchet \(would keep full\)$/m);
+  assert.match(
+    onlyNotice(await runCommand(host, "status")).message,
+    /^ {2}last decision: dry run: widen-only would keep full/m,
+  );
+  host.shutdown();
+
+  // The same two turns without a dry run: the ratchet refuses the narrowing and says so, so both modes agree on the fact.
+  writeConfig({ skills: { enabled: false } });
+  reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
+  host = fakeHost("pi");
+  await host.prompt("explain this");
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  assert.equal(
+    onlyNotice(await promptInfo(host, "explain that")).message,
+    "[loadout] kept full: widen-only blocked narrowing to answer",
+  );
+  host.shutdown();
+});
+
 test("extension: commands add nothing to the model context or the session", async () => {
   const host = fakeHost("omp", { sessionFile: path.join(sessionDir(), "session.jsonl") });
   await host.prompt("explain this");
@@ -1887,6 +1949,11 @@ test("extension: stats before the first session file explains itself", async () 
   const absent = onlyNotice(await runCommand(none, "stats"));
   assert.equal(absent.level, "info");
   assert.match(absent.message, /^\[loadout\] stats: no session file yet\. /);
+  // A bad argument is a warning even before the session file exists, never the explanation of the missing file.
+  const bad = onlyNotice(await runCommand(none, "stats --sumary"));
+  assert.equal(bad.level, "warning");
+  assert.match(bad.message, /^\[loadout\] stats: /);
+  assert.doesNotMatch(bad.message, /no session file yet/);
   none.shutdown();
 
   const file = path.join(sessionDir(), "session.jsonl");

@@ -28,8 +28,8 @@ import {
 } from "./fixtures/report.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const NO_SESSION_TEXT =
-  "[loadout] stats: no session file yet. The host writes it with the first assistant message; ask again after the first reply, or name a scope (see /loadout stats --help)";
+/** The explanation of a missing session file; only its first sentence is the contract, the advice after it may change. */
+const NO_SESSION_FILE = /^\[loadout\] stats: no session file yet\. /;
 const HELP_LINE = "[loadout] stats [summary|export] [--json] [scope] [filters]";
 const UNTIL = "2026-10-11T00:00:00.000Z";
 
@@ -86,7 +86,9 @@ test("stats: the current session's file is the default scope, and a missing file
 
   // No file, or a directory where the file should be: explained, with no summary.
   for (const sessionFile of [undefined, tmp(), path.join(tmp(), "not-yet.jsonl")]) {
-    assert.deepEqual(runStats([], sessionFile), { kind: "refused", level: "info", text: NO_SESSION_TEXT });
+    const explained = refusalOf(runStats([], sessionFile));
+    assert.equal(explained.level, "info");
+    assert.match(explained.text, NO_SESSION_FILE);
   }
 });
 
@@ -208,6 +210,49 @@ test("stats: help, version and unknown views", () => {
     level: "warning",
     text: "[loadout] stats: unknown view bogus (use summary or export)",
   });
+});
+
+test("stats: a bad argument is refused the same way before the first session file exists as after it", () => {
+  const { file } = writeMixed(tmp());
+  const unsaved = [undefined, path.join(tmp(), "not-yet.jsonl")];
+  const bad = [
+    ["--sumary"],
+    ["--branch", "nope"],
+    ["--branch"],
+    ["--outcome", "typo"],
+    ["--service-log", path.join(tmp(), "none.log")],
+    ["--json=1"],
+    ["summary", "export"],
+    ["export", "--sumary"],
+  ];
+  for (const tokens of bad) {
+    const label = tokens.join(" ");
+    // The CLI's own message for the same arguments with a real scope; a leading `summary` or `export` is the view.
+    const [first, ...others] = tokens;
+    const named = first === "summary" || first === "export";
+    const cli = parseArgv(named ? [first, "--session", file, ...others] : ["summary", "--session", file, ...tokens]);
+    assert.ok(!cli.ok, `the CLI must refuse ${label}`);
+    const refusal: StatsResult = { kind: "refused", level: "warning", text: `[loadout] stats: ${cli.message}` };
+    for (const sessionFile of [file, ...unsaved]) assert.deepEqual(runStats(tokens, sessionFile), refusal, label);
+  }
+
+  // Valid arguments before the first reply still get the explanation, and nothing is read.
+  const log = serviceLog(path.join(tmp(), "server.log"));
+  const valid = [
+    [],
+    ["summary"],
+    ["export"],
+    ["--branch", "active"],
+    ["--outcome", "failed"],
+    ["export", "--service-log", log],
+  ];
+  for (const tokens of valid) {
+    for (const sessionFile of unsaved) {
+      const explained = refusalOf(runStats(tokens, sessionFile));
+      assert.equal(explained.level, "info", tokens.join(" "));
+      assert.match(explained.text, NO_SESSION_FILE);
+    }
+  }
 });
 
 test("the packed file set loads the extension entry", () => {

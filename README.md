@@ -197,8 +197,8 @@ Before the first prompt, `explain` says `[loadout] explain: nothing observed yet
 
 `/loadout stats [summary|export] [--json] [scope] [filters]`. `summary` (the default) prints the figures, and `export` prints the events behind them.
 
-- **Default scope:** the host's current session file. The host writes it with the first assistant message, so before the first reply, or in a session that keeps no file, `stats` sends one info line that says there is no session file yet.
-- **Scope:** `--session <file>` names a file. A history is `--since <ISO> --until <ISO>` (events with since <= time < until) with `--project <path>` (the working directory must match exactly) or `--all-projects`. `--sessions-dir <dir>` replaces the root. The root defaults to OMP's, `~/.omp/agent/sessions`, whatever the host, so on pi pass `--sessions-dir ~/.pi/agent/sessions`. Dates follow the same rules as `loadout-report`.
+- **Default scope:** the host's current session file. The host writes it with the first assistant message, so before the first reply `stats` sends one info line that says there is no session file yet. A session that is never saved never writes one, so the line stays; name a scope instead. The arguments are checked first: a bad flag is a warning with the CLI's message even before the file exists.
+- **Scope:** `--session <file>` names a file. A history is `--since <ISO> --until <ISO>` (events with since <= time < until) with `--project <path>` (the working directory must match exactly) or `--all-projects`. `--sessions-dir <dir>` replaces the root. The root defaults to OMP's, `~/.omp/agent/sessions`, whatever the host, so on pi pass the absolute path of pi's sessions directory. The host does not expand `~` in a path, so give `--session`, `--sessions-dir`, `--project` and `--service-log` absolute paths. Dates follow the same rules as `loadout-report`.
 - **Filters:** `--branch <all|active|abandoned>`, `--outcome <value>` (repeatable), and `--service-log <file>` (a Laya server log for the request-id join; see [Telemetry](#telemetry)).
 - **`--json`** prints the summary document and `export` prints the export document, as JSON with no prefix. They are the documents `loadout-report` prints. `--json` may appear anywhere on the line.
 - **Cost:** a history scan reads the session files synchronously inside the host and blocks it until the scan finishes. Prefer `--project` and a short window.
@@ -248,11 +248,14 @@ After each classified turn, once the tools are applied, one info line says what 
 [loadout] already matching edit (tools 9 of 14)
 [loadout] applied answer (tools 6 of 14)
 [loadout] dry run: would use answer (tools 6), nothing changed
+[loadout] dry run: widen-only would keep edit, not answer; nothing changed
 [loadout] all tools kept: low confidence (closest narrower risk 0.15 > max 0.10)
 [loadout] dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked
 ```
 
-Skipped turns (selection off, empty prompt, slash command, nothing to ask) get no notice. A failed classification keeps its own warning, and a failed application its own error. Both show even with `notify: false`:
+A dry run changes nothing, but the widen-only ratchet still advances, so a proposal it would refuse reads `widen-only would keep <tools>, not <profile>`.
+
+Skipped turns (selection off, empty prompt, slash command, nothing to ask) get no notice. A failed classification keeps its own notice: a warning, or an error (`selection error: ...`) when the failure reason is `error`. An error in the hook, a failed apply included, keeps its own error. They show even with `notify: false`:
 
 ```text
 [loadout] classification failed (timeout): laya request exceeded 400ms; using the full loadout until it recovers

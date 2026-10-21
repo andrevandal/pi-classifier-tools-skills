@@ -115,8 +115,10 @@ function classifiedHeadline(record: DecisionRecordV3, baselineSize: number | und
       if (!active) return `all tools kept: ${keep}`;
       break;
     case "dry-run":
-      return tools.active === null
-        ? `dry run: would keep all tools (${keep})`
+      if (tools.active === null) return `dry run: would keep all tools (${keep})`;
+      // The ratchet is evaluated in a dry run too, so a proposal it would refuse is not offered as the proposal.
+      return record.ratchet?.admitted === false
+        ? `dry run: widen-only would keep ${record.ratchet.before ?? "the current tools"}, not ${profile}; nothing changed`
         : `dry run: would use ${profile} (tools ${tools.active.length}), nothing changed`;
     case "not-admitted":
       return `kept ${record.ratchet?.before ?? "the current tools"}: widen-only blocked narrowing to ${profile}`;
@@ -315,8 +317,8 @@ function blockers(record: DecisionRecordV3, tools: ToolsRecord): string[] {
   const { application, skills } = record;
   const found = [
     application.status === "dry-run" ? "dry run" : null,
-    application.status === "not-admitted"
-      ? `widen-only ratchet (kept ${record.ratchet?.before ?? "the current tools"})`
+    record.ratchet?.admitted === false
+      ? `widen-only ratchet (${application.status === "dry-run" ? "would keep" : "kept"} ${record.ratchet.before ?? "the current tools"})`
       : null,
     tools.reason === "low-confidence" ? "low confidence" : null,
     tools.reason === "missing-answer" ? "no tool answer" : null,

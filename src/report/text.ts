@@ -176,7 +176,7 @@ export function renderSummary(summary: Summary): string {
   lines.push(
     http === null
       ? "service log: not read (--service-log <file> joins server records by request id)"
-      : `service log: ${http.records} records in ${http.files} files | joined ${http.joined} of ${classifier.attempts} attempts | attempts without a record ${http.unmatched.clientWithoutRecord}, records not in scope ${http.unmatched.recordsNotInScope}, no request id ${http.unmatched.recordsWithoutRequestId}, ambiguous ${http.unmatched.ambiguous} | client timeouts ${http.timeouts.clientTimeouts} (joined ${http.timeouts.joined})`,
+      : `service log: ${http.records} records in ${http.files} files | joined ${http.joined} of ${classifier.attempts} attempts | attempts without a record ${http.unmatched.clientWithoutRecord}, not joinable (not HTTP) ${http.unmatched.notJoinable}, records not in scope ${http.unmatched.recordsNotInScope}, no request id ${http.unmatched.recordsWithoutRequestId}, ambiguous ${http.unmatched.ambiguous} | client timeouts ${http.timeouts.clientTimeouts} (joined ${http.timeouts.joined})`,
   );
 
   const removed = Object.values(coverage.removedByFilters);

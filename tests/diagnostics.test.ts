@@ -135,6 +135,14 @@ function rows(): Map<string, DecisionRecordV3> {
       }),
     ],
     [
+      "dry-run-widen-only",
+      live({
+        settings: settings({ dryRun: true }),
+        ratchet: ratchet({ narrowAllowed: false, before: "edit", after: "edit", admitted: false }),
+        application: application({ status: "dry-run", actualTools: BASE7 }),
+      }),
+    ],
+    [
       "apply-failed",
       live({
         application: application({ status: "failed", restoration: "restored", actualTools: BASE7, error: "EIO" }),
@@ -267,6 +275,15 @@ test("headline: low confidence, skill overflow, dry run, ratchet rejection, appl
       text("skip-nothing-to-ask-over-limit").includes("limit 40"),
   );
   assert.ok(text("dry-run").includes("dry run") && text("dry-run").includes("nothing changed"));
+  assert.ok(
+    text("dry-run").includes(`would use answer (tools ${ANSWER.length})`),
+    "an admitted proposal is the proposal",
+  );
+  const dryBlocked = text("dry-run-widen-only");
+  for (const fact of ["dry run", "widen-only would keep edit", "not answer", "nothing changed"]) {
+    assert.ok(dryBlocked.includes(fact), `dry-run-widen-only: ${fact}`);
+  }
+  assert.ok(!dryBlocked.includes("would use"), "a narrowing the ratchet refuses is not offered as the proposal");
   assert.ok(
     text("widen-only").includes("widen-only") && text("widen-only").includes("edit"),
     "names the profile it kept",
@@ -417,6 +434,13 @@ test("explain: proposal versus actual application and the blockers", () => {
   assert.ok(dry.includes(`proposal: answer: read, grep, find, ls (${ANSWER.length})`), dry);
   assert.ok(dry.includes(`application: dry-run | actual tools: ${BASE7.join(", ")} (${BASE7.length})`), dry);
   assert.ok(!/\bapplied\b/i.test(dry), "a dry run is never called applied");
+  assert.equal(lineOf(dry, "blocked:"), "  blocked: dry run", "an admitted dry run names no ratchet");
+
+  const dryBlocked = explain(observation(row("dry-run-widen-only")));
+  assert.equal(lineOf(dryBlocked, "blocked:"), "  blocked: dry run, widen-only ratchet (would keep edit)");
+  assert.ok(dryBlocked.includes("ratchet: edit -> edit (blocked, narrowing locked)"), dryBlocked);
+  assert.ok(dryBlocked.includes("application: dry-run"), dryBlocked);
+  assert.ok(!/\bapplied\b/i.test(dryBlocked), "a dry run is never called applied");
 
   const combined = explain(
     observation(

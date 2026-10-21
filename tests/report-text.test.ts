@@ -16,11 +16,13 @@ import { renderDecisions, renderSummary } from "../src/report/text.ts";
 import { DECISION_ENTRY, USAGE_ENTRY } from "../src/telemetry.ts";
 import {
   chain,
+  classifier,
   custom,
   decisionV2,
   decisionV3,
   header,
   serviceLog,
+  settings,
   tmp,
   usageV1,
   uuid,
@@ -367,11 +369,36 @@ test("renderSummary says when a scope matches nothing", () => {
 test("renderSummary shows the service join only when a log was given", () => {
   const dir = tmp();
   const { file } = writeMixed(dir);
-  const joined = sessionSummary([file], [serviceLog(path.join(dir, "service.log"))]);
+  const log = serviceLog(path.join(dir, "service.log"));
+  const joined = sessionSummary([file], [log]);
   assert.ok(joined.http !== null && joined.http.joined > 0, "the fixture joins a request id");
   const line = lineStarting(renderSummary(joined), "service log:");
   assert.ok(line.includes(`joined ${joined.http.joined} of ${joined.classifier.attempts} attempts`), line);
   assert.ok(line.includes(`${joined.http.records} records in ${joined.http.files} files`), line);
+  assert.ok(line.includes("not joinable (not HTTP) 0"), "a log was read and no attempt was off the HTTP transport");
+
+  // An attempt that carries a request id but went to a transport the server never sees is counted apart, so the
+  // joined and unjoined attempts can be added up.
+  const jev = writeSession(path.join(dir, "jev.jsonl"), [
+    header({ id: "sess-jev", cwd: "/p/one" }),
+    ...chain([
+      custom(
+        DECISION_ENTRY,
+        decisionV3({
+          eventId: uuid(11),
+          sessionId: "sess-jev",
+          decisionId: uuid(211),
+          settings: settings({ backend: "jev", transport: null }),
+          classifier: classifier({ requestId: uuid(300) }),
+        }),
+      ),
+    ]),
+  ]);
+  const withJev = sessionSummary([file, jev], [log]);
+  const notJoinable = withJev.http?.unmatched.notJoinable;
+  assert.equal(notJoinable, 1, "the fixture has one attempt that cannot join");
+  const jevLine = lineStarting(renderSummary(withJev), "service log:");
+  assert.ok(jevLine.includes(`not joinable (not HTTP) ${notJoinable}`), jevLine);
 
   assert.equal(
     lineStarting(renderSummary(sessionSummary([file])), "service log:"),

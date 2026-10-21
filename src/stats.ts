@@ -22,7 +22,11 @@ const STATS_USAGE = `[loadout] stats [summary|export] [--json] [scope] [filters]
   --json prints the loadout-report summary document and export prints the export document, exactly as the CLI does
   a history scan reads session files inside the host and blocks it until it finishes: prefer --project and a short window`;
 
-const NO_SESSION_FILE = `${PREFIX}no session file yet. The host writes it with the first assistant message; ask again after the first reply, or name a scope (see /loadout stats --help)`;
+const NO_SESSION_FILE = `${PREFIX}no session file yet. The host writes it with the first assistant message (an unsaved session never writes one); ask again after the first reply, or name a scope (see /loadout stats --help)`;
+
+// A history scope that names nothing on disk. Parsing it reads nothing, so it lets every other argument be validated
+// before the session file exists.
+const PROBE_SCOPE = ["--since", "1970-01-01", "--until", "1970-01-02", "--all-projects"];
 
 // A scope or filter flag, bare or as `--flag=value`.
 const SCOPE_FLAG = /^--(session|since|until|project|all-projects|sessions-dir)(=|$)/;
@@ -87,6 +91,10 @@ export function runStats(tokens: string[], sessionFile: string | undefined): Sta
   let compare = false;
   // Without a scope flag the scope is this session's file. Help and version parse without one, so they win here.
   if (!result.ok && !rest.some((token) => SCOPE_FLAG.test(token))) {
+    // The other arguments are checked first, so a bad flag is refused the same way before the session file exists as
+    // after it, and only a valid command is answered with the missing file.
+    const probe = parseArgv([view, ...PROBE_SCOPE, ...rest]);
+    if (!probe.ok) return { kind: "refused", level: "warning", text: `${PREFIX}${probe.message}` };
     if (sessionFile === undefined || !isRegularFile(sessionFile)) {
       return { kind: "refused", level: "info", text: NO_SESSION_FILE };
     }

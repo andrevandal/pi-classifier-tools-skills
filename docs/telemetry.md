@@ -579,7 +579,8 @@ The headlines of `status`, `explain` and the per-turn notice all come from `head
 | `already matching <profile> (tools <m> of <b>)` | `application.status` is `unchanged` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile`, `application.actualTools` |
 | `all tools kept: <keep>` | `application.status` is `unchanged`, `restored` or `not-attempted`, and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
 | `dry run: would keep all tools (<keep>)` | `application.status` is `dry-run` and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
-| `dry run: would use <profile> (tools <n>), nothing changed` | `application.status` is `dry-run` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile` |
+| `dry run: would use <profile> (tools <n>), nothing changed` | `application.status` is `dry-run`, `tools.active` is set and the ratchet admits the proposal (`ratchet.admitted` is not false) | `application.status`, `tools.active`, `tools.profile`, `ratchet.admitted` |
+| `dry run: widen-only would keep <before>, not <profile>; nothing changed` | `application.status` is `dry-run`, `tools.active` is set and `ratchet.admitted` is false: the ratchet runs in a dry run too, so this is a proposal it would refuse; `<before>` is `ratchet.before`, or `the current tools` when that is null | `application.status`, `tools.active`, `ratchet.admitted`, `ratchet.before`, `tools.profile` |
 | `kept <before>: widen-only blocked narrowing to <profile>` | `application.status` is `not-admitted`; `<before>` is `ratchet.before`, or `the current tools` when that is null | `application.status`, `ratchet.before`, `tools.profile` |
 | `could not apply <profile>: <error>[, baseline restored]` | `application.status` is `failed`; `<error>` is `application.error` or `error`; the suffix is `, baseline restored` or `, baseline restore failed` from `application.restoration` | `application.status`, `application.error`, `application.restoration`, `tools.active`, `tools.profile` |
 | `proposed <profile> (application <status>)` | any other combination, such as `restored` or `not-attempted` with `tools.active` set; `<profile>` is `nothing` when `tools.profile` is null | `application.status`, `tools.profile` |
@@ -629,7 +630,7 @@ It prints no endpoint, environment variable name, python path or question text. 
 - `proposal:` what the classifier asked for (section 4), or `keep all tools (baseline)`.
 - `ratchet:` before and after, admitted or blocked, and narrowing open or locked.
 - `application:` the status, the restoration, the error, and the tools the host reports after applying (`actual tools`).
-- `blocked:` what kept the proposal from changing the tools, in this order: dry run, widen-only ratchet, low confidence, no tool answer, skills over the candidate limit; `none` when there is none.
+- `blocked:` what kept the proposal from changing the tools, in this order: dry run, widen-only ratchet, low confidence, no tool answer, skills over the candidate limit; `none` when there is none. The ratchet entry reads `widen-only ratchet (kept <before>)` for a turn the ratchet refused and `widen-only ratchet (would keep <before>)` for a dry-run proposal it would refuse (`<before>` is `ratchet.before`, or `the current tools` when that is null).
 - `skills:` the skill reason with its counts and, when skills were selected, the best scores.
 - `classifier:` questions asked, prompt and sent characters (`clipped` or `not clipped`), the model, and the tokens or `tokens not reported`.
 - `timing:` elapsed time, budget, timeout, whether the guard fired, and the HTTP status when there is one.
@@ -643,10 +644,11 @@ It prints no endpoint, environment variable name, python path or question text. 
 `/loadout stats` reads session files through the report library that `loadout-report` uses. The text view is the title, the telemetry line, the `file:` line when it applies (below), then `renderSummary` in [`src/report/text.ts`](../src/report/text.ts): the scope line, the `npm run decisions` text (`renderDecisions`), and the blockers, classifier, model-turn, host-transcript, service-log and coverage sections.
 
 - `summary` (the default) or `export`. `--json` prints the summary document; `export` prints the export document. Both are the CLI's JSON, byte for byte, without the CLI's trailing newline.
-- Scope: without a scope flag, the host's current session file. `--session <file>` (repeatable) names files. A history needs `--since <ISO>` and `--until <ISO>` with `--project <path>` (an exact match) or `--all-projects`; `--sessions-dir <dir>` (repeatable) sets the roots. The default root is OMP's `~/.omp/agent/sessions` for either host, so a pi history needs `--sessions-dir`.
+- Scope: without a scope flag, the host's current session file. `--session <file>` (repeatable) names files. A history needs `--since <ISO>` and `--until <ISO>` with `--project <path>` (an exact match) or `--all-projects`; `--sessions-dir <dir>` (repeatable) sets the roots. The default root is OMP's `~/.omp/agent/sessions` for either host, so a pi history needs `--sessions-dir` with the absolute path of pi's sessions directory.
 - Filters pass through to the library: `--branch all|active|abandoned`, `--outcome <value>` (repeatable; section 11a) and `--service-log <file>` (repeatable; the request-id join).
 - Quotes: `"..."` and `'...'` group a value with spaces. There are no escapes, an unterminated quote is refused, and `--flag=value` works.
-- Refused at `warning`: a partial history, with the CLI's own message (see the examples), `--version`, and an unknown view word (`unknown view <word> (use summary or export)`). `--help` prints the usage text at `info`.
+- Paths: the host does not expand `~` or `$VARIABLE` in a path, so give `--session`, `--sessions-dir`, `--project` and `--service-log` absolute paths. With a `~` path, `--session`, `--sessions-dir` and `--service-log` are refused (not a file or not a directory), and `--project ~/x` matches no file.
+- Refused at `warning`: a partial history, with the CLI's own message (see the examples), `--version`, and an unknown view word (`unknown view <word> (use summary or export)`). Any other argument the CLI refuses (an unknown flag, a bad `--branch` or `--outcome` value, a `--service-log` that is not a file) gets the CLI's message too, before the session file exists as after it. `--help` prints the usage text at `info`.
 - The `file:` line appears only for the default scope with no filter flag, and only with telemetry on. It compares what the file holds with what this process handed to the host. The two can differ: earlier history, or records the host has not written yet.
 - With telemetry off, the telemetry line says so and that nothing from this process was stored (`N suppressed`). The figures still cover the records in the files read, because reading is not collection.
 - The `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records.
@@ -674,7 +676,7 @@ In print mode (`omp -p`, `pi -p`) the host has no UI: `hasUI` is false and nothi
 
 `stats` takes the host's current session file from `ctx.sessionManager.getSessionFile()`, guarded: a throw or an empty string counts as no file.
 
-Before the first assistant reply the host may report a path, but the file is written with that reply. Until then `stats` prints `[loadout] stats: no session file yet. The host writes it with the first assistant message; ask again after the first reply, or name a scope (see /loadout stats --help)` at `info`, and reads nothing else. The same text is printed when the host reports no file. After a reply, a `stats` run reads every record handed to the host before it (probed on OMP 18.12.5 and pi 0.87.1).
+Before the first assistant reply the host may report a path, but the file is written with that reply. Until then `stats` prints `[loadout] stats: no session file yet. The host writes it with the first assistant message (an unsaved session never writes one); ask again after the first reply, or name a scope (see /loadout stats --help)` at `info`, and reads nothing else. The same text is printed when the host reports no file, which is what a session that is never saved does. The arguments are checked first, so a bad flag is a `warning` with the CLI's message even before the file exists. After a reply, a `stats` run reads every record handed to the host before it (probed on OMP 18.12.5 and pi 0.87.1).
 
 ### Examples
 
@@ -752,6 +754,7 @@ One-line notices, one `info` line per classified turn:
 | already matching | `[loadout] already matching edit (tools 9 of 14)` |
 | applied after `/loadout on` | `[loadout] applied answer (tools 6 of 14)` |
 | dry run | `[loadout] dry run: would use answer (tools 6), nothing changed` |
+| dry run, widen-only ratchet would refuse a narrowing | `[loadout] dry run: widen-only would keep edit, not answer; nothing changed` |
 | low confidence | `[loadout] all tools kept: low confidence (closest narrower risk 0.15 > max 0.10)` |
 | dry run, low confidence and skill overflow | `[loadout] dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked` |
 
@@ -796,3 +799,5 @@ Failed (abridged): `"outcome":"failed","failure":"unavailable","tools":null`, a 
 - After a restart or a resume, `status` and `explain` have observed nothing yet and the counters start at zero. The earlier records are in the session file, which only `stats` reads.
 - `/loadout stats export` puts the whole export in one notification, so use `loadout-report` for large scopes (section 11b).
 - The text view's `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records (section 11b).
+- A config reload (a cwd or project-trust change) can change the telemetry setting in the middle of a session, while the latest observation and the counters carry over. Afterwards `explain` names the reason in force now for a record built earlier (it can read `record not stored: telemetry off (default)` for a record that was suppressed before the reload), and `stats` can say that nothing from this process was stored although the process handed records to the host before the reload.
+- The blockers section of the `stats` text counts `ratchet-refused` by application status, so a dry run whose proposal the ratchet would have refused is not counted there. The JSON `decisions.ratchet.blocked` counts every record whose ratchet did not admit the proposal, dry runs included.
