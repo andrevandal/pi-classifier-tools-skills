@@ -99,17 +99,34 @@ The plugin counts per session `{handedOff, suppressed, failed, lastFailure}`, sh
 
 Defined here, with normalizers (`normalizeUsage`, `normalizeHttp`); nothing produces them yet. Completeness is per field: `null` means not observed or not reported by this host, `decisionId: null` means unassigned. There is no separate completeness flag. A producer builds a candidate and appends `normalizeUsage(candidate)`; a null result is not appended.
 
-`loadout.usage` v1, one per assistant message:
+`loadout.usage` v1, one per assistant model turn the host reports through `turn_end` (OMP and pi). This plugin produces it: one record per observed turn, appended with the session's other records through the same persistence path and opt-out as `loadout.decision`.
 
 | field | meaning |
 | --- | --- |
-| `v`, `eventId`, `sessionId`, `runId`, `decisionId`, `turnIndex` | identity; `eventId` and `runId` are UUIDv4 |
-| `host` | `omp` or `pi` |
-| `hostEntryId` | pi's entry id when given; null on OMP |
-| `stopReason` | `stop` `length` `toolUse` `error` `aborted` `other`, or null |
-| `tokens` | `input`, `output`, `cacheRead`, `cacheWrite`, `reasoning`, each a number or null. A synthetic failure's zero usage is unknown, so null |
-| `costTotal`, `toolCalls` (name to count), `toolErrors`, `errorStatus` | totals for the message |
-| `retryAttempt` | informational only |
+| `v`, `eventId`, `sessionId`, `runId`, `decisionId`, `turnIndex` | identity; `eventId` and `runId` are UUIDv4. `eventId` is new for every observation and is the dedup key when a host copies entries into a fork or branch. `runId` groups the turns of one run. `turnIndex` is the host's counter: informational, it restarts at 0 with each run and is never a join key |
+| `host` | `omp` or `pi`, told apart by the shape of the event (pi's `turn_end` carries `messageEntryId`) |
+| `hostEntryId` | pi's id of the assistant message entry; null on OMP, whose `turn_end` has none |
+| `stopReason` | `stop` `length` `toolUse` `error` `aborted`; any other host value (pi also has `pending` and `deferred`) is `other`; null when the host gives none |
+| `tokens` | `input`, `output`, `cacheRead`, `cacheWrite`, `reasoning`: each the host's count or null. The buckets are the host's own (OMP's `input` excludes cache reads, and `reasoning` is part of `output`); nothing is summed or reconciled. `reasoning` is OMP's `reasoningTokens` or pi's `reasoning`, null when the provider does not report it. A host shows "no usage reported" as zero counters, and a model turn always consumes tokens, so when none of the four counters is above zero all five token fields and `costTotal` are null. This covers failed and interrupted attempts and providers that report nothing |
+| `costTotal` | the host's `usage.cost.total`, which the host computes from its configured prices. It is not a bill: `0` can mean free or unpriced. Null when unknown |
+| `toolCalls`, `toolErrors` | the tool calls in this message counted by name, and how many of this turn's tool results the host flagged as errors (null when the host sent no results). A name that is not a safe identifier is dropped, so the counts can sum to less than the calls. A tool result's own usage or details are never read |
+| `errorStatus` | OMP's HTTP status of a failed request; null on pi, which has none, and for failures that carry no status, such as a dropped stream |
+| `retryAttempt` | OMP: the attempt number from the host's `auto_retry_start`, on the first observation after it. pi: always null, because its extension API has no retry event. Informational only: null does not prove a first attempt |
+
+Attribution. A record links to a decision only through lifecycle events the plugin saw, never by time, content or transcript order:
+
+- A decision (a skip included) is pending once its `before_agent_start` hook finishes. The run that starts next takes it. Inside a run that is already open, a queued follow-up or steer runs the hook again and the decision applies from the next turn on; earlier turns keep the previous one.
+- `agent_start` opens a run with a new `runId`. A run that starts without a decision hook (a retry, a compaction continuation, a wake-up) is unassigned: `decisionId` is null. So is the retry of a failed attempt.
+- Compaction ends the run; the next turn is a new, unassigned run. A pending decision stays pending, because OMP may compact between the hook and the run. A tree move, branch or switch ends the run and drops a pending decision. `agent_end` drops a pending decision too.
+- A decision whose prompt the host cancelled before any run began stays pending until the next decision, `agent_end` or boundary, so an unrelated run that starts in between could be linked to it.
+
+Coverage. These records do not claim complete billing or complete coverage:
+
+- One record per assistant message that reaches `turn_end`, failed and interrupted ones included. Classifier calls are not model turns and are never in these records.
+- Not observed: model calls the host makes without telling extensions (session titles, memory consolidation, compaction summaries), transport retries the host performs inside one model call (no message exists, so nothing is reported), usage fields the schema has no slot for (OMP's orchestration, server-tool and credit counters), and anything before the plugin loaded or after it was disabled. A pi turn whose message entry id cannot be resolved is not delivered by pi, so it is not observed.
+- Subagent and child sessions are never added to the parent's records. Each session's plugin instance writes its own records, nothing here reads or sums other sessions' logs, and a reader that combines sessions deduplicates by `eventId`.
+- A replayed `turn_end` for the same message object (OMP can replay one when it resumes unpaired tool calls) counts once. The same usage arriving as a different object cannot be told apart and counts again.
+- With telemetry off nothing is written. The plugin still counts the turns in memory, and `/loadout status` shows them as suppressed.
 
 `loadout.http` v1, one per `POST` to the Laya HTTP server (`python/laya_http_server.py`), written as one JSON line on the server's stderr. That is the server's existing log (the journal under systemd), not a new file or datastore. `GET` health checks write no line.
 
