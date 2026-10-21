@@ -490,3 +490,98 @@ export function reportInput(
     service: opts.serviceLogs === undefined ? null : readServiceLogs(opts.serviceLogs),
   };
 }
+
+/**
+ * The synthetic history of the packaged-CLI smoke, all relative to `T0`. `one/a.jsonl` (header `s-a`, cwd
+ * `/smoke/one`): decision A1 (v3, applied) at +0m, usage record UA at +1m, A2 (v3, failed by timeout) at +2m, A3
+ * (v2) at +3m. `one/a-fork.jsonl` repeats it under header `s-a2`. `one/a/child.jsonl` (header `s-c`, same cwd) holds
+ * C1 (v3) at +4m. `two/b.jsonl` (header `s-b`, cwd `/smoke/two`): B1 (v3, skipped) at +1m, one malformed line and B2
+ * (v3, dry run) at +5m. `old/c.jsonl` (header `s-o`, cwd `/smoke/one`) holds O1 400 days before `T0` and an old
+ * modification time. Every other file is stamped `T0` + 10 minutes, so the tree does not depend on the clock.
+ */
+export function writeSmokeTree(root: string): {
+  t0: string;
+  since: string;
+  until: string;
+  narrowSince: string;
+  narrowUntil: string;
+} {
+  const minute = 60_000;
+  const t0 = Date.parse(T0);
+  const stamp = (offsetMs: number): string => new Date(t0 + offsetMs).toISOString();
+  const at = (offsetMs: number, n: number, entry: Record<string, unknown>): Record<string, unknown> => ({
+    ...entry,
+    id: `e${n}`,
+    parentId: n === 1 ? null : `e${n - 1}`,
+    timestamp: stamp(offsetMs),
+  });
+  const fresh = new Date(t0 + 10 * minute);
+  const decision = (n: number, sessionId: string, over: Partial<DecisionRecordV3> = {}): Record<string, unknown> =>
+    custom(DECISION_ENTRY, decisionV3({ eventId: uuid(n), sessionId, decisionId: uuid(200 + n), ...over }));
+  const a = (id: string): Array<Record<string, unknown>> => [
+    header({ id, cwd: "/smoke/one" }),
+    at(0, 1, decision(1, "s-a")),
+    at(minute, 2, custom(USAGE_ENTRY, usageV1({ eventId: uuid(501), sessionId: "s-a" }))),
+    at(
+      2 * minute,
+      3,
+      decision(2, "s-a", {
+        outcome: "failed",
+        failure: "timeout",
+        tools: null,
+        skills: null,
+        ratchet: null,
+        application: application({ status: "not-attempted" }),
+      }),
+    ),
+    at(3 * minute, 4, custom(DECISION_ENTRY, decisionV2())),
+  ];
+
+  writeSession(path.join(root, "one", "a.jsonl"), a("s-a"), fresh);
+  writeSession(path.join(root, "one", "a-fork.jsonl"), a("s-a2"), fresh);
+  writeSession(
+    path.join(root, "one", "a", "child.jsonl"),
+    [header({ id: "s-c", cwd: "/smoke/one" }), at(4 * minute, 1, decision(3, "s-c"))],
+    fresh,
+  );
+  writeSession(
+    path.join(root, "two", "b.jsonl"),
+    [
+      header({ id: "s-b", cwd: "/smoke/two" }),
+      at(
+        minute,
+        1,
+        decision(4, "s-b", {
+          outcome: "skipped",
+          skip: "command",
+          classifier: null,
+          tools: null,
+          skills: null,
+          ratchet: null,
+        }),
+      ),
+      '{ "truncated": ',
+      at(
+        5 * minute,
+        2,
+        decision(5, "s-b", {
+          settings: settings({ dryRun: true }),
+          application: application({ status: "dry-run" }),
+        }),
+      ),
+    ],
+    fresh,
+  );
+  writeSession(
+    path.join(root, "old", "c.jsonl"),
+    [header({ id: "s-o", cwd: "/smoke/one" }), at(-400 * 24 * 60 * minute, 1, decision(6, "s-o"))],
+    new Date("2020-01-01T00:00:00.000Z"),
+  );
+  return {
+    t0: stamp(0),
+    since: stamp(-60 * minute),
+    until: stamp(60 * minute),
+    narrowSince: stamp(minute),
+    narrowUntil: stamp(3 * minute),
+  };
+}
