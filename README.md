@@ -162,8 +162,41 @@ With telemetry on (the default) each prompt the host hands the plugin becomes on
 - **Fail closed:** an unreadable or non-boolean machine setting, or any config error, writes nothing. The setting is read when a session loads its config, so restart after changing it.
 - **Opting out** writes nothing and deletes nothing. `/loadout explain` and `/loadout status` keep working from memory, and the `loadout.skills` hint message is unchanged.
 - **Handed to the host is not durable.** pi may throw on a disk error but keep the entry in memory, OMP swallows disk errors, and both defer writes until the first assistant message. A failed hand-off never aborts the turn; `/loadout status` counts them.
+- **Reading it back:** `loadout-report` summarizes and exports these records without writing anything. See [Reporting: loadout-report](#reporting-loadout-report).
 
 Full schemas, the `loadout.usage` and `loadout.http` contracts and the v2 mapping are in [`docs/telemetry.md`](docs/telemetry.md). It lives in the repository and is not part of the npm package.
+
+## Reporting: loadout-report
+
+`loadout-report` summarizes and exports the `loadout.decision`, `loadout.usage` and `loadout.http` records from local session transcripts and, optionally, a service log. It is read-only: it writes nothing and keeps no transcript text. It prints one JSON document on stdout; diagnostics go to stderr.
+
+The installed binary is TypeScript with a Bun shebang, so `bun` must be on PATH. From a checkout, `npm run report -- <args>` runs the same CLI under Node.
+
+```bash
+# the current session: exactly this file, no time window
+loadout-report summary --session <file>
+
+# one project over a half-open window: since <= time < until
+loadout-report export --since 2026-10-01 --until 2026-11-01 --project <path>
+
+# pi: every project under pi's sessions directory
+loadout-report summary --since 2026-10-01 --until 2026-11-01 --all-projects --sessions-dir ~/.pi/agent/sessions
+```
+
+- **Scope:** use `--session`, or a window (`--since`, `--until`) with exactly one of `--project` (the session's working directory must match it exactly) or `--all-projects`. A date means UTC midnight; a date-time must carry `Z` or an offset such as `+02:00`. Relative values such as `7d` are rejected. Without a scope the command exits 2 and reads nothing. `--sessions-dir` replaces the default root, `~/.omp/agent/sessions`.
+- **Filters:** `--branch active` or `--branch abandoned` keeps one branch (default: all). `--outcome` (repeatable) filters by decision outcome or by model-turn outcome, for example `--outcome failed`.
+- **Service log (optional):** capture the Laya server's journal lines, then pass the file:
+  ```bash
+  journalctl --user -u laya-server -o cat > laya.log
+  loadout-report summary --session <file> --service-log laya.log
+  ```
+  A log with no `loadout.http` lines is harmless. A service record joins an attempt only by request id, and only for an attempt that used the HTTP transport. An export never contains a service record that no in-scope attempt names.
+- **Output:** `summary` gives counts and statistics for decisions, classifier evidence, model-turn usage, transcript turns and the service join, plus coverage (what was read, skipped or removed) and leads (counts, each with the population it is out of). `export` gives the content-free events behind them, with the same scope, filter and coverage header.
+- **Unknown is not zero:** a missing measurement is `null` or counted as unknown. A transcript turn whose usage block has no counter above zero is unknown. Statistics cover known values only.
+- **Privacy:** no prompt, message, title, tool argument or result, path or working directory is copied into the output, and the reporter never adds a session file's own header id (an exported record carries the `sessionId` the plugin recorded). Export fields come from declared allowlists, so a new field stays out until it is added on purpose. Identifiers (session, event, decision and request ids, tool and skill names) are local metadata, not anonymous.
+- **Cost:** a full scan reads every transcript in the window. On one heavy machine the sessions held about 2.3 GB in 2,490 files, and the largest file was about 25 MB. Prefer `--project` and a short window. Files last modified before `--since` are skipped without being opened, and `--project` reads only the first 64 KiB of each file to check its working directory.
+
+The field-by-field reference, the exit codes and the known shortcuts are in [`docs/telemetry.md`](docs/telemetry.md) section 11a. That file lives in the repository and is not part of the npm package.
 
 ## Trade-offs
 
@@ -296,15 +329,11 @@ environment variable holding that token; the example config leaves it empty, so 
 
 ### Decision report: `npm run decisions`
 
-Summarizes every `loadout.decision` entry: profile distribution, risk p10/p50/p90, the share
-of turns that kept the baseline, failures by reason, selected skills and classifier latency.
-Reads record versions 2 and 3; unknown versions are counted as unsupported. Skipped turns
-(`disabled`, `empty-prompt`, `command`, `no-questions`) are counted separately and are not in the percentages.
-Useful on your normal day-to-day sessions, or on one benchmark arm:
+The text view of the `loadout-report summary` report for `loadout.decision` records: profile distribution, risk p10/p50/p90, the share of turns that kept the baseline, failures by reason, selected skills and classifier latency. It takes the same flags as `loadout-report summary` (scope, filters and `--service-log`; see [Reporting](#reporting-loadout-report)) plus `--json`, which prints the same JSON document as the CLI. Reads record versions 2 and 3; unknown versions are counted as unsupported. Skipped turns (`disabled`, `empty-prompt`, `command`, `no-questions`) are counted separately and are not in the percentages.
 
 ```bash
-npm run decisions -- --since 7d
-npm run decisions -- --folder wt-control --json
+npm run decisions -- --since 2026-10-01 --until 2026-11-01 --project <path>
+npm run decisions -- --session <file> --json
 ```
 
 ### `omp stats`
@@ -337,6 +366,7 @@ npm install
 npm test           # node --test; Laya tests skip without python3
 npm run typecheck
 npm run lint
+npm run report -- --help   # loadout-report usage, from the checkout
 ```
 
 | file | role |
@@ -345,6 +375,7 @@ npm run lint
 | `src/select.ts` | pure logic: questions, tool/skill decisions, prompt clipping |
 | `src/config.ts` | discovery, trust gate, validation, defaults |
 | `src/telemetry.ts` | trace record schemas, privacy allowlists, safe persistence, v2/v3 readers |
+| `src/report/*` | session reader, aggregation, export and the `loadout-report` CLI |
 | `src/classify/*`, `python/` | Jev/Laya clients and the Laya worker (from pi-classifier-router) |
 | `scripts/bench.ts`, `scripts/decisions.ts` | A/B benchmark and decision report over session transcripts |
 
