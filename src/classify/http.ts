@@ -12,8 +12,8 @@
  * timer is always cleared.
  *
  * Our own Laya server is correlated with (`correlation`): the call carries `X-Request-Id`, or `X-Loadout-Telemetry: off`
- * when the caller opted out, and the server's `Server-Timing` queue/infer metrics are read back. Every failure that
- * follows a response keeps that response's HTTP status, and those timings, on the `ClassifierError`.
+ * when the caller opted out, and the server's `Server-Timing` queue/infer metrics are read back. Every failure raised
+ * after the body was read keeps that response's HTTP status, and those timings, on the `ClassifierError`.
  */
 
 import { ID_PATTERN } from "../telemetry.ts";
@@ -146,7 +146,7 @@ export function createHttpClassifier(options: HttpClassifierOptions, deps: Class
           signal: controller.signal,
         });
 
-        // What the call saw of the server, kept on every failure that follows a response: unknown stays unknown.
+        // What the call saw of the server, kept on every failure raised after the body was read: unknown stays unknown.
         const seen = {
           status: response.status,
           timing: options.correlation ? parseServerTiming(response.headers.get("server-timing")) : undefined,
