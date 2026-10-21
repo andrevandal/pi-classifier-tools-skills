@@ -55,6 +55,8 @@ export interface ScopeInfo {
   files: number;
   nestedChildFiles: number;
   childFilesNotRead: number;
+  /** Session scope: child directories that could not be listed or examined, so `childFilesNotRead` is a lower bound. */
+  childDirsUnreadable: number;
   /** ISO UTC; `since` is inclusive, `until` exclusive. */
   since: string | null;
   until: string | null;
@@ -230,11 +232,15 @@ export function tally(keys: Iterable<string>): Count {
   return ranked(counts);
 }
 
+/**
+ * The sum of the known values. A value that would push the total past what a number can hold (only a corrupt or
+ * hostile record has one) is counted unknown, never added as Infinity.
+ */
 export function sumOf(values: Array<number | null>): Sum {
   let sum = 0;
   let known = 0;
   for (const value of values) {
-    if (value === null) continue;
+    if (value === null || !Number.isFinite(sum + value)) continue;
     sum += value;
     known++;
   }
@@ -249,12 +255,18 @@ export function percentile(values: number[], p: number): number {
   return sorted[index] as number;
 }
 
+/** The mean. When the plain total would overflow, each value is scaled first: the mean of finite values is finite. */
+function meanOf(values: number[]): number {
+  const total = values.reduce((a, b) => a + b, 0);
+  return Number.isFinite(total) ? total / values.length : values.reduce((a, b) => a + b / values.length, 0);
+}
+
 /** Statistics over the known values only; every field is null when there are none. */
 export function statsOf(values: number[]): Stats {
   if (values.length === 0) return { n: 0, mean: null, p10: null, p50: null, p90: null, max: null };
   return {
     n: values.length,
-    mean: values.reduce((a, b) => a + b, 0) / values.length,
+    mean: meanOf(values),
     p10: percentile(values, 10),
     p50: percentile(values, 50),
     p90: percentile(values, 90),
@@ -673,6 +685,7 @@ export function buildHeader(input: ReportInput): { scope: ScopeInfo; filters: Fi
       files: selection.files.length,
       nestedChildFiles: files.filter((file) => file.nestedChild).length,
       childFilesNotRead: selection.childFilesNotRead,
+      childDirsUnreadable: selection.childDirsUnreadable,
       since: historical === null ? null : new Date(historical.since).toISOString(),
       until: historical === null ? null : new Date(historical.until).toISOString(),
       projects: historical === null ? null : historical.projects === null ? "all-projects" : "exact",

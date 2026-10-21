@@ -122,6 +122,59 @@ test("export: canaries in transcripts, records and logs never reach the output",
   assert.match(exported, /IDENT_tool/);
 });
 
+test("export: identifier-shaped values are exported from identifier fields and nowhere else", () => {
+  const dir = tmp();
+  const decision = {
+    ...decisionV3({ eventId: uuid(31), decisionId: uuid(331), sessionId: "IDENT_session" }),
+    extra: "IDENT_extra",
+    classifier: { ...classifier({ requestId: uuid(300) }), model: "IDENT_model" },
+    tools: {
+      ...tools({
+        profile: "IDENT_profile",
+        active: ["IDENT_active"],
+        risks: [{ profile: "IDENT_riskProfile", risk: 0.1 }],
+      }),
+      probabilities: { IDENT_probability: 0.5 },
+      extra: "IDENT_nested",
+    },
+    skills: skills({ reason: "selected", selected: ["IDENT_skill"], scores: { IDENT_score: 0.9 } }),
+    ratchet: ratchet({ before: "IDENT_before", after: "IDENT_after" }),
+    application: application({ actualTools: ["IDENT_actual"] }),
+  };
+  const file = writeSession(path.join(dir, "ident.jsonl"), [
+    header({ id: "sess-I" }),
+    ...chain([
+      custom(DECISION_ENTRY, decision),
+      custom(USAGE_ENTRY, {
+        ...usageV1({
+          eventId: uuid(531),
+          sessionId: "IDENT_usageSession",
+          hostEntryId: "IDENT_hostEntry",
+          toolCalls: { IDENT_call: 1 },
+        }),
+        extra: "IDENT_usageExtra",
+      }),
+    ]),
+  ]);
+  const log = path.join(dir, "ident.log");
+  fs.writeFileSync(
+    log,
+    `${JSON.stringify({ ...httpRecord({ requestId: uuid(300) }), errorClass: "IDENT_ErrClass", body: "IDENT_body" })}\n`,
+  );
+
+  const text = JSON.stringify(exportDocument(reportInput([file], { serviceLogs: [log] })));
+  const markers = [...new Set([...text.matchAll(/IDENT_\w+/g)].map((match) => match[0]))].sort();
+  assert.deepEqual(
+    markers,
+    [
+      ...["IDENT_ErrClass", "IDENT_active", "IDENT_actual", "IDENT_after", "IDENT_before", "IDENT_call"],
+      ...["IDENT_hostEntry", "IDENT_model", "IDENT_probability", "IDENT_profile", "IDENT_riskProfile"],
+      ...["IDENT_score", "IDENT_session", "IDENT_skill", "IDENT_usageSession"],
+    ].sort(),
+    "an unlisted field (extra, nested, usageExtra, body) never carries a value out",
+  );
+});
+
 test("export: events are built from a declared allowlist", () => {
   const complete = normalizeDecision(
     decisionV3({

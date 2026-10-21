@@ -201,6 +201,7 @@ test("summary: mixed v2 and v3 history keeps counts, unknowns and coverage", () 
     files: 1,
     nestedChildFiles: 0,
     childFilesNotRead: 0,
+    childDirsUnreadable: 0,
     since: null,
     until: null,
     projects: null,
@@ -557,4 +558,35 @@ test("summary: transcript totals reproduce the benchmark numbers", () => {
   const empty = transcriptTotals([], []);
   assert.equal(cacheRate(empty.tokens), 0);
   assert.equal(promptTokensPerRequest(empty), 0);
+});
+
+test("summary: astronomically large values never reach the output as Infinity", () => {
+  const huge = 1e308;
+  const decision = (n: number) =>
+    custom(
+      DECISION_ENTRY,
+      decisionV3({ eventId: uuid(n), classifier: classifier({ server: { queueMs: huge, inferenceMs: 1 } }) }),
+    );
+  const file = writeSession(path.join(tmp(), "huge.jsonl"), [
+    header({ id: "sess-M" }),
+    ...chain([
+      assistantMessage({ usage: { input: huge, output: 7, cacheRead: 0, cacheWrite: 0, cost: { total: huge } } }),
+      assistantMessage({ usage: { input: huge, output: 7, cacheRead: 0, cacheWrite: 0, cost: { total: huge } } }),
+      custom(USAGE_ENTRY, usageV1({ eventId: uuid(501), costTotal: huge })),
+      custom(USAGE_ENTRY, usageV1({ eventId: uuid(502), costTotal: huge })),
+      decision(1),
+      decision(2),
+    ]),
+  ]);
+
+  const s = summarize(reportInput([file]));
+  finiteEverywhere(s);
+  assert.deepEqual(s.transcript.tokens.input, { sum: 0, known: 0, unknown: 2 }, "not a safe integer: unknown");
+  assert.deepEqual(s.transcript.tokens.output, { sum: 14, known: 2, unknown: 0 });
+  assert.deepEqual(s.transcript.cost, { sum: huge, known: 1, unknown: 1 }, "the second cannot be added: it overflows");
+  assert.deepEqual(s.usage.cost, { sum: huge, known: 1, unknown: 1 });
+  assert.equal(s.classifier.server.queueMs.mean, huge, "the mean of two huge values does not overflow");
+
+  assert.deepEqual(sumOf([huge, huge]), { sum: huge, known: 1, unknown: 1 });
+  assert.deepEqual(statsOf([huge, huge]), { n: 2, mean: huge, p10: huge, p50: huge, p90: huge, max: huge });
 });

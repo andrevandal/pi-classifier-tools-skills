@@ -124,6 +124,27 @@ test("scope: an unreadable directory is counted and the rest is selected", { ski
   }
 });
 
+test("scope: entries that are not regular files are counted as unreadable, never thrown on or opened", () => {
+  const root = tmp();
+  put(root, "ok/valid.jsonl", "/p/one");
+  fs.symlinkSync("loop.jsonl", path.join(root, "loop.jsonl"));
+  fs.symlinkSync("missing.jsonl", path.join(root, "dangling.jsonl"));
+  fs.symlinkSync("b.jsonl", path.join(root, "a.jsonl"));
+  fs.symlinkSync("a.jsonl", path.join(root, "b.jsonl"));
+
+  const cases: Array<[string[] | null, string[]]> = [
+    [null, ["ok/valid.jsonl"]],
+    [["/p/one"], ["ok/valid.jsonl"]],
+    [["/p/other"], []],
+  ];
+  for (const [projects, expected] of cases) {
+    const selection = selectFiles(historical([root], projects));
+    assert.deepEqual(relative(root, selection), expected, `projects ${JSON.stringify(projects)}`);
+    assert.equal(selection.unreadable, 4, "the loop, the dangling link and the two-link loop, whatever the project");
+    assert.equal(selection.skippedByMtime, 0);
+  }
+});
+
 test("scope: session scope reads the named files and reports unread children", () => {
   const dir = tmp();
   const parent = put(dir, "A.jsonl", "/p/one");
@@ -133,9 +154,38 @@ test("scope: session scope reads the named files and reports unread children", (
   const selection = selectFiles({ kind: "session", files: [parent] });
   assert.deepEqual(selection.files, [parent]);
   assert.equal(selection.childFilesNotRead, 2);
+  assert.equal(selection.childDirsUnreadable, 0);
   assert.equal(selection.skippedByMtime, 0);
   assert.deepEqual(selectFiles({ kind: "session", files: [parent, parent] }).files, [parent]);
   assert.equal(selectFiles({ kind: "session", files: [path.join(dir, "A", "c1.jsonl")] }).childFilesNotRead, 0);
+});
+
+test("scope: a child directory that cannot be listed is counted apart from unreadable files", { skip: isRoot }, () => {
+  const dir = tmp();
+  const parent = put(dir, "A.jsonl", "/p/one");
+  put(dir, "A/c1.jsonl", "/p/one");
+  fs.chmodSync(path.join(dir, "A"), 0o000);
+  try {
+    const selection = selectFiles({ kind: "session", files: [parent] });
+    assert.deepEqual(selection.files, [parent]);
+    assert.equal(selection.unreadable, 0, "the named file was not affected");
+    assert.equal(selection.childDirsUnreadable, 1);
+    assert.equal(selection.childFilesNotRead, 0, "a lower bound: the directory could not be listed");
+  } finally {
+    fs.chmodSync(path.join(dir, "A"), 0o755);
+  }
+});
+
+test("scope: a loop where the child directory would be is counted, not thrown", () => {
+  const dir = tmp();
+  const parent = put(dir, "A.jsonl", "/p/one");
+  fs.symlinkSync("A", path.join(dir, "A"));
+
+  const selection = selectFiles({ kind: "session", files: [parent] });
+  assert.deepEqual(selection.files, [parent]);
+  assert.equal(selection.unreadable, 0);
+  assert.equal(selection.childDirsUnreadable, 1);
+  assert.equal(selection.childFilesNotRead, 0);
 });
 
 /** Four families at minutes 0 to 4, plus one of each with no timestamp. */

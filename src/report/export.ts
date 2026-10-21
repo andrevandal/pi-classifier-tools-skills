@@ -5,8 +5,10 @@
  * Every event is rebuilt from a declared allowlist, so a field nobody listed cannot leave the process, whatever a
  * record, a transcript or a service log contained. The normalizers in `telemetry.ts` already validated each value
  * at the source; the allowlist is the second, independent gate. It exports identifier-shaped values from
- * identifier fields (an event id, a request id, a tool or skill name) and nothing else: no path, no title, no
- * message, no tool argument or result, no header id and no host entry id of a transcript.
+ * identifier fields exactly as a record carries them: session, event, decision, run, request and host-entry ids,
+ * model ids, profile, tool and skill names, and an HTTP error class. Nothing else leaves: no path, title, message,
+ * tool argument or result, and no id of the transcript itself (the reporter never adds a session file's header id,
+ * or the entry and parent ids it reads for branch labels).
  */
 
 import { type Branch, isObject, IDENTIFIER, parseInstant, type Provenance } from "./read.ts";

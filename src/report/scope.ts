@@ -10,7 +10,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { DecisionOutcome } from "../telemetry.ts";
-import { canonical, listSessionFiles, readHeader, type SessionRead, type TurnOutcome, type Where } from "./read.ts";
+import {
+  canonical,
+  listSessionFiles,
+  readHeader,
+  type SessionRead,
+  statOrNull,
+  type TurnOutcome,
+  type Where,
+} from "./read.ts";
 
 export type ScopeSpec =
   | { kind: "session"; files: string[] }
@@ -18,10 +26,19 @@ export type ScopeSpec =
 
 export interface Selection {
   files: string[];
-  /** Unreadable directories met while listing. Unreadable files are found later, by the reader. */
+  /**
+   * Unreadable directories met while listing, and listed `.jsonl` entries that are not regular files (a symlink
+   * loop, a dangling link, a pipe, a device). A named session file that cannot be read is found later, by the reader.
+   */
   unreadable: number;
   skippedByMtime: number;
+  /** Session scope: `.jsonl` files found under the named files' child directories, none of them read. */
   childFilesNotRead: number;
+  /**
+   * Session scope: child directories that could not be listed or examined, so `childFilesNotRead` is a lower bound.
+   * Not part of `unreadable`: no in-scope file was lost.
+   */
+  childDirsUnreadable: number;
 }
 
 export const DECISION_OUTCOMES: readonly DecisionOutcome[] = ["classified", "failed", "skipped"];
@@ -67,30 +84,48 @@ function realOrNull(file: string): string | null {
   }
 }
 
-/** The nested child sessions of a named session file sit in `<file minus .jsonl>/`. */
-function childDirOf(file: string): string | null {
+/**
+ * The nested child sessions of a named session file sit in `<file minus .jsonl>/`. Null when there is no such
+ * directory; a location that cannot be examined (a symlink loop, no permission) is reported and is null too.
+ */
+function childDirOf(file: string, onUnreadable: () => void): string | null {
   if (!file.endsWith(".jsonl")) return null;
   const dir = file.slice(0, -".jsonl".length);
-  return fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory() === true ? dir : null;
+  try {
+    return fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory() === true ? dir : null;
+  } catch {
+    onUnreadable();
+    return null;
+  }
 }
 
 /**
  * Session scope reads exactly the named files. Historical scope lists every root, drops files last modified
  * before `since` (a restore or copy tool that resets modification times can hide old files; the count keeps that
  * visible) and, for `--project`, keeps a file only when its header cwd is exactly a project path: equal after
- * `path.resolve`, or equal after `realpath` when both exist. A file without a header matches no project.
+ * `path.resolve`, or equal after `realpath` when both exist. A file without a header matches no project. A listed
+ * entry that is not a regular file is counted as unreadable and never opened.
  */
 export function selectFiles(scope: ScopeSpec): Selection {
-  const selection: Selection = { files: [], unreadable: 0, skippedByMtime: 0, childFilesNotRead: 0 };
+  const selection: Selection = {
+    files: [],
+    unreadable: 0,
+    skippedByMtime: 0,
+    childFilesNotRead: 0,
+    childDirsUnreadable: 0,
+  };
   const onUnreadable = (): void => {
     selection.unreadable++;
+  };
+  const onChildUnreadable = (): void => {
+    selection.childDirsUnreadable++;
   };
 
   if (scope.kind === "session") {
     selection.files = [...new Set(scope.files.map(canonical))].sort();
     for (const file of selection.files) {
-      const dir = childDirOf(file);
-      if (dir !== null) selection.childFilesNotRead += listSessionFiles(dir, onUnreadable).length;
+      const dir = childDirOf(file, onChildUnreadable);
+      if (dir !== null) selection.childFilesNotRead += listSessionFiles(dir, onChildUnreadable).length;
     }
     return selection;
   }
@@ -110,8 +145,12 @@ export function selectFiles(scope: ScopeSpec): Selection {
       const file = canonical(listed);
       if (seen.has(file)) continue;
       seen.add(file);
-      const mtime = fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs;
-      if (mtime !== undefined && mtime < scope.since) {
+      const stat = statOrNull(file);
+      if (stat === null || !stat.isFile()) {
+        selection.unreadable++;
+        continue;
+      }
+      if (stat.mtimeMs < scope.since) {
         selection.skippedByMtime++;
         continue;
       }

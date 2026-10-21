@@ -7,7 +7,7 @@
  *   node scripts/decisions.ts --session <file>
  */
 
-import { buildSummary, parseArgv, USAGE } from "../src/report/report.ts";
+import { buildSummary, main as reportMain, parseArgv, USAGE } from "../src/report/report.ts";
 import type { Count, Stats, Summary } from "../src/report/summary.ts";
 
 const fixed = (n: number | null, digits = 2): string => (n === null ? "-" : n.toFixed(digits));
@@ -69,11 +69,13 @@ function main(argv: string[]): number {
     console.error(`decisions: ${result.message}`);
     return 2;
   }
-  if (result.parsed.kind !== "run") {
+  const { parsed } = result;
+  if (parsed.kind === "version") return reportMain(["--version"]);
+  if (parsed.kind === "help") {
     console.log(`usage: node scripts/decisions.ts <loadout-report summary flags> [--json]\n\n${USAGE}`);
     return 0;
   }
-  const summary = buildSummary(result.parsed.spec);
+  const summary = buildSummary(parsed.spec);
   if (summary.scope.files === 0) console.error("decisions: warning: no session files matched the scope");
   console.log(json ? JSON.stringify(summary, null, 2) : render(summary));
   return 0;

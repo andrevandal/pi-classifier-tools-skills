@@ -38,15 +38,27 @@ interface Run {
   stderr: string;
 }
 
+/** A spawned report that blocks is killed after this long, so a regression fails instead of hanging the suite. */
+const LIMIT_MS = 20_000;
+
+function cleanEnv(over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...over };
+  delete env.NODE_TEST_CONTEXT;
+  return env;
+}
+
 function run(
   args: string[],
   home = tmp("loadout-report-home-"),
   command = process.execPath,
   entry: string[] = [CLI],
 ): Run {
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
-  delete env.NODE_TEST_CONTEXT;
-  const result = spawnSync(command, [...entry, ...args], { encoding: "utf8", env });
+  const result = spawnSync(command, [...entry, ...args], {
+    encoding: "utf8",
+    env: cleanEnv({ HOME: home }),
+    timeout: LIMIT_MS,
+    killSignal: "SIGKILL",
+  });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
@@ -81,6 +93,8 @@ test("cli: scope errors exit 2 with nothing on stdout", () => {
       ["summary", ...win, "--project", "/p/one", "--all-projects"],
       ["--project", "--all-projects"],
     ],
+    ["empty project", ["summary", ...win, "--project", ""], ["--project"]],
+    ["empty project in the = form", ["summary", ...win, "--project="], ["--project"]],
     ["empty window", ["summary", "--since", A, "--until", A, "--all-projects"], ["--since", "--until"]],
     ["reversed window", ["summary", "--since", B, "--until", A, "--all-projects"], ["--since", "--until"]],
     ["relative instant", ["summary", "--since", "7d", "--until", B, "--all-projects"], ["--since"]],
@@ -310,4 +324,95 @@ test("cli: the synthetic smoke tree reports the derived figures", () => {
   assert.equal(narrow.decisions.total, 2);
   assert.equal(narrow.usage.turns, 1);
   assert.equal(narrow.coverage.removedByFilters.decisions.outsideRange, 5);
+});
+
+/** `mkfifo` is POSIX; where it is missing the pipe cases are skipped. */
+function mkfifo(file: string): boolean {
+  return spawnSync("mkfifo", [file]).status === 0;
+}
+
+const historical = (command: "summary" | "export", root: string, ...scope: string[]): string[] => [
+  ...[command, "--sessions-dir", root, "--since", A, "--until", B],
+  ...scope,
+];
+
+test("cli: a looping or dangling *.jsonl entry is counted as unreadable and the rest is reported", () => {
+  const root = tmp();
+  stamped(writeMixed(path.join(root, "p")).file);
+  fs.symlinkSync("loop.jsonl", path.join(root, "loop.jsonl"));
+  fs.symlinkSync("missing.jsonl", path.join(root, "dangling.jsonl"));
+  fs.symlinkSync("b.jsonl", path.join(root, "a.jsonl"));
+  fs.symlinkSync("a.jsonl", path.join(root, "b.jsonl"));
+
+  for (const scope of [["--project", "/p/one"], ["--all-projects"]]) {
+    const label = scope.join(" ");
+    const result = run(historical("summary", root, ...scope));
+    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    const summary = summaryOf(result);
+    assert.equal(summary.coverage.files.read, 1, label);
+    assert.equal(summary.decisions.total, 10, label);
+    assert.equal(summary.coverage.files.unreadable, 4, `${label}: the four entries that are not files`);
+
+    const exported = run(historical("export", root, ...scope));
+    assert.equal(exported.status, 0, `${label}: ${exported.stderr}`);
+    assert.equal(exportOf(exported).coverage.files.unreadable, 4, label);
+  }
+});
+
+test("cli: a session whose parent or child location is a loop is still read", () => {
+  const root = tmp();
+  const { file } = writeMixed(path.join(root, "proj"));
+  fs.symlinkSync("proj.jsonl", path.join(root, "proj.jsonl")); // where a parent session file would be
+  fs.symlinkSync("mixed", path.join(root, "proj", "mixed")); // where this file's child directory would be
+
+  const result = run(["summary", "--session", file]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = summaryOf(result);
+  assert.equal(summary.coverage.files.read, 1);
+  assert.equal(summary.decisions.total, 10);
+  assert.equal(summary.coverage.files.unreadable, 0, "the only in-scope file was read");
+  assert.equal(summary.scope.childDirsUnreadable, 1, "the child location could not be examined");
+  assert.equal(summary.scope.childFilesNotRead, 0);
+  assert.equal(summary.scope.nestedChildFiles, 0);
+
+  // The call /loadout stats makes: no CLI around it, and it must not throw either.
+  const direct = buildSummary({ scope: { kind: "session", files: [file] }, filters: NO_FILTERS, serviceLogs: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(direct)), summary);
+});
+
+test("cli: a pipe named *.jsonl is counted, never opened, and never blocks a report", (t) => {
+  const root = tmp();
+  stamped(writeMixed(path.join(root, "p")).file);
+  const pipe = path.join(root, "pipe.jsonl");
+  if (!mkfifo(pipe)) return t.skip("mkfifo is not available");
+
+  for (const scope of [["--project", "/p/one"], ["--all-projects"]]) {
+    const label = scope.join(" ");
+    const result = run(historical("summary", root, ...scope));
+    assert.equal(result.status, 0, `${label}: ${result.stderr || "killed: it blocked on the pipe"}`);
+    const summary = summaryOf(result);
+    assert.equal(summary.coverage.files.read, 1, label);
+    assert.equal(summary.decisions.total, 10, label);
+    assert.equal(summary.coverage.files.unreadable, 1, `${label}: the pipe`);
+  }
+
+  // The library entry points never open a pipe, whichever path names it (a call that blocked would be killed).
+  const reader = new URL("../src/report/read.ts", import.meta.url).href;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      ...["--input-type=module", "-e"],
+      `import { readHeader, readServiceLogs, readSessions } from ${JSON.stringify(reader)};
+const pipe = process.argv[1];
+console.log(JSON.stringify({
+  header: readHeader(pipe),
+  sessionUnreadable: readSessions([pipe]).files[0]?.unreadable,
+  logUnreadable: readServiceLogs([pipe]).unreadable,
+}));`,
+      pipe,
+    ],
+    { encoding: "utf8", env: cleanEnv(), timeout: LIMIT_MS, killSignal: "SIGKILL" },
+  );
+  assert.equal(probe.status, 0, probe.stderr || "killed: a reader blocked on the pipe");
+  assert.deepEqual(JSON.parse(probe.stdout), { header: null, sessionUnreadable: true, logUnreadable: 1 });
 });

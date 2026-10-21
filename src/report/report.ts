@@ -166,6 +166,7 @@ function parseScope(args: Args): ScopeSpec {
   if (args.project !== undefined && args["all-projects"] === true) {
     usage("--project and --all-projects are mutually exclusive");
   }
+  if (args.project?.includes("")) usage("--project: the path is empty (it would mean the current directory)");
   const from = parseInstant(since);
   if (from === null) usage(`--since ${since}: not an ISO 8601 date or UTC date-time`);
   const to = parseInstant(until);

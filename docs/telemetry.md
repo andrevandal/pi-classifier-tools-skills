@@ -206,17 +206,17 @@ Source: [`src/report/`](../src/report/). `loadout-report summary` and `loadout-r
 
 Stdout carries only the JSON document: two-space indent, one trailing newline. Every diagnostic goes to stderr. `--help` and `--version` are answered before the subcommand, scope and filters are checked.
 
-Scope errors, all exit 2: no scope; `--session` with a historical flag or with `--sessions-dir`; a historical scope missing `--since`, missing `--until`, or missing `--project` or `--all-projects` (every missing piece is named); `--project` with `--all-projects`; `--since` not before `--until`; an instant the rules in the next subsection reject; an unknown `--branch` or `--outcome` value; a `--session`, `--service-log` or explicit `--sessions-dir` path that is missing or of the wrong kind.
+Scope errors, all exit 2: no scope; `--session` with a historical flag or with `--sessions-dir`; a historical scope missing `--since`, missing `--until`, or missing `--project` or `--all-projects` (every missing piece is named); `--project` with `--all-projects`; an empty `--project` value, which would silently mean the current directory; `--since` not before `--until`; an instant the rules in the next subsection reject; an unknown `--branch` or `--outcome` value; a `--session`, `--service-log` or explicit `--sessions-dir` path that is missing or of the wrong kind.
 
 ### Scope and boundaries
 
-- **Session scope** (`--session`) reads exactly the named files and has no time window. Child sessions of a named file are not read; `scope.childFilesNotRead` counts them.
+- **Session scope** (`--session`) reads exactly the named files and has no time window. Child sessions of a named file are not read; `scope.childFilesNotRead` counts them. A child directory that cannot be listed or examined (no permission, a symlink loop) is counted in `scope.childDirsUnreadable` and makes `childFilesNotRead` a lower bound. It is not part of `coverage.files.unreadable`, because no in-scope file was lost.
 - **Historical scope** reads every `.jsonl` file under each root, recursively, and keeps events with `since <= at < until` (half-open). A date means UTC midnight; a date-time needs `Z` or a `+HH:MM` or `-HH:MM` offset. Zone-less times, relative values such as `7d` and impossible dates are rejected.
 - **Unplaced events:** an event whose entry has no parsable timestamp is removed from a historical scope and counted as `unplaced`. A session scope has no window and keeps such events.
 - **mtime shortcut:** before a file is parsed, a file last modified before `since` is skipped and counted in `coverage.files.skippedByMtime`. Only `since` is compared with the modification time, so a restore or copy tool that resets mtimes can hide old files. A file modified after `until` is read, and its events after the window are removed.
 - **Exact project:** with `--project`, a file is selected when its header `cwd` equals a project path after `path.resolve` (trailing slashes and `..` are normalized), or after `realpath` when both exist, so a symlinked project path matches its target. A parent directory is not the project. A file with no header matches no project.
 - **Nested children:** a child session sits in `<parent>/` beside `<parent>.jsonl`. A historical scope reads each child as its own session and counts it in `scope.nestedChildFiles`. Nothing is rolled up into the parent.
-- **Roots:** several roots are merged, a root given twice lists each file once, and selected files are sorted. Unreadable directories are counted in `coverage.files.unreadable`.
+- **Roots:** several roots are merged, a root given twice lists each file once, and selected files are sorted. Unreadable directories are counted in `coverage.files.unreadable`. So is a listed `.jsonl` entry that does not resolve to a regular file (a pipe, a device, a symlink loop or a dangling link): it is counted and never opened.
 - **pi:** pass `--sessions-dir ~/.pi/agent/sessions`. A pi file has no active-leaf field, so its last entry is the leaf (see [Branch labels](#branch-labels)).
 
 ### Filters
@@ -255,11 +255,11 @@ Transcript turns have no identity, so they are never deduplicated: a copied hist
 
 ### Unknown versus zero
 
-- A missing measurement is `null`, never `0`. A `Sum` (`{sum, known, unknown}`) adds only the known values and counts the unknown ones. A `known` of 0 is not a measured zero.
+- A missing measurement is `null`, never `0`. A `Sum` (`{sum, known, unknown}`) adds only the known values and counts the unknown ones. A `known` of 0 is not a measured zero. A value that would push the total past what a number can hold is counted unknown as well, so no `Sum` or `Stats` ever holds `Infinity` or `NaN`.
 - A `Stats` (`{n, mean, p10, p50, p90, max}`) covers known values only; every field is `null` when `n` is 0. Percentiles are nearest-rank over the in-scope sample.
 - Closed vocabularies (the `Branch`, `TurnOutcome` and `Provenance` counts, `decisions.outcomes` and `decisions.blockers`) are zero-filled. Open maps (`decisions.skips`, `decisions.failures`, `classifier.models`, `usage.toolCalls.byTool` and the other open maps below) list only the keys seen.
 - A boolean count is three-way: `yes`, `no` and `unknown`.
-- A transcript turn whose usage block has no counter above 0 has every token count and its cost `null`. A turn with some counter above 0 keeps its zeros as zeros, and its missing counters stay `null`. The reader applies this rule. Its code names the `loadout.usage` producer as the source, and that producer is not in this checkout (see section 13).
+- A transcript turn's token counts are accepted only as safe integers of 0 or more, the check `normalizeUsage` applies to the counters of a `loadout.usage` record; any other value is `null`. A turn with no valid counter above 0 has every token count and its cost `null`. A turn with some counter above 0 keeps its zeros as zeros, and its missing counters stay `null`. The reader applies the same rule as the `loadout.usage` producer (section 8).
 
 ### Summary
 
@@ -287,6 +287,7 @@ Transcript turns have no identity, so they are never deduplicated: a copied hist
 | `scope.files` | files selected, read or not |
 | `scope.nestedChildFiles` | selected files that are child sessions: their `<name>/` directory has a parent `<name>.jsonl` |
 | `scope.childFilesNotRead` | session scope only: `.jsonl` files under the named files' `<name>/` directories, not read; always 0 in a historical scope |
+| `scope.childDirsUnreadable` | session scope only: child directories that could not be listed or examined, so `scope.childFilesNotRead` is a lower bound; not part of `coverage.files.unreadable`; always 0 in a historical scope |
 | `scope.since`, `scope.until` | ISO UTC instants, `since` inclusive and `until` exclusive; `null` in a session scope |
 | `scope.projects` | `exact` for `--project`, `all-projects`, or `null` in a session scope |
 
@@ -307,7 +308,7 @@ The last column says when each counter is computed: before parsing, at file leve
 | --- | --- | --- |
 | `coverage.files` | object with the four file counts below | |
 | `coverage.files.read` | selected files that were read | file level, before filters |
-| `coverage.files.unreadable` | files that could not be read, plus unreadable directories met while listing | file level, before filters |
+| `coverage.files.unreadable` | files that could not be read, `.jsonl` entries that do not resolve to a regular file (a pipe, a device, a symlink loop, a dangling link), and unreadable directories met while listing a root | file level, before filters |
 | `coverage.files.withoutHeader` | read files with no session header among their first four non-blank lines | file level, before filters |
 | `coverage.files.skippedByMtime` | files skipped because they were last modified before `since` | before parsing |
 | `coverage.malformedLines` | non-blank session-file lines that are not a JSON object | file level, before filters |
@@ -520,13 +521,13 @@ Each `ExportEvent`:
 | `copies` | discarded duplicate instances; `null` for `http` |
 | `record` | the allowlisted fields of the record |
 
-`record` is rebuilt from a declared allowlist: `DECISION`, `USAGE` and `HTTP` in [`src/report/export.ts`](../src/report/export.ts). A field that is not on its list is dropped, whatever the record carried. A new view field stays out of exports until it is added to the list on purpose; the test suite fails when a view field is missing from a list. No free-text field is on any list. Identifier-shaped values in identifier fields are exported (see the disclosure `identifiers-are-local-metadata-not-anonymous`). An export never includes a path, a title, a message, a tool argument or result, or a working directory, and the reporter never adds a session file's own header id. A record's `sessionId` is exported as the plugin recorded it, and it usually equals that header id.
+`record` is rebuilt from a declared allowlist: `DECISION`, `USAGE` and `HTTP` in [`src/report/export.ts`](../src/report/export.ts). A field that is not on its list is dropped, whatever the record carried. A new view field stays out of exports until it is added to the list on purpose; the test suite fails when a view field is missing from a list. No free-text field is on any list. Identifier-shaped values in identifier fields are exported (see the disclosure `identifiers-are-local-metadata-not-anonymous`). An export never includes a path, a title, a message, a tool argument or result, or a working directory, and the reporter never adds a session file's own header id or the entry ids it reads to label branches. A record's own ids are exported as the plugin recorded them: `sessionId`, which usually equals that header id, and a usage record's `hostEntryId`, which is pi's entry id when the plugin recorded one.
 
 ### Disclosures
 
 Every summary and export carries these ids in `disclosures`.
 
-- `identifiers-are-local-metadata-not-anonymous`: session, event, decision and request ids, and tool and skill names, are exported when identifier-shaped; they are local metadata, not anonymous.
+- `identifiers-are-local-metadata-not-anonymous`: the ids a record carries (session, event, decision, run and request ids, and a usage record's host entry id) and the names it carries (model ids, profile, tool and skill names, and an HTTP `errorClass`) are exported as recorded when identifier-shaped; they are local metadata, not anonymous.
 - `proposals-are-not-applied-changes`: a tools or skills proposal is what the classifier asked for; `application` records what the host had afterwards, and no figure is a saving.
 - `unknown-is-not-zero`: a missing measurement is `null` or counted as unknown, never zero.
 - `usage-and-transcript-are-separate-sources`: `loadout.usage` records and transcript turns are reported in separate sections and are never added together.
@@ -539,7 +540,7 @@ Every summary and export carries these ids in `disclosures`.
 - **Whole-file reads.** Each file is read whole, one at a time, so memory is bounded by the largest file plus the extracted events. A whole-machine scan reads every transcript byte; selection prunes before any file is parsed. A file larger than the JavaScript engine's string limit counts as unreadable. Upgrade to streaming if real transcripts approach that limit or scans become too slow.
 - **mtime pre-filter.** A restore or copy tool that resets modification times can hide old files from the pre-filter. `coverage.files.skippedByMtime` makes the count visible.
 - **One object per line.** Concatenated JSON objects on one line count as malformed; the host writes one object per line.
-- **Directory listing.** Unreadable directories are skipped and counted in `coverage.files.unreadable`. Symlinked directories are not followed.
+- **Directory listing.** Unreadable directories are skipped and counted in `coverage.files.unreadable`. Symlinked directories are not followed. A listed `.jsonl` entry that does not resolve to a regular file (a pipe, a device, a symlink loop, a dangling link) is counted there too and never opened.
 - **Service-log framing.** A line is parsed from its first `{`. A prefix that itself contains `{` breaks that line, which then counts as `lines.other`.
 - **Completions.** No shell completions.
 - **Percentiles.** Nearest-rank over the in-scope sample, not estimates.

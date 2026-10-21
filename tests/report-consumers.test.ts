@@ -11,6 +11,7 @@ import type { Summary } from "../src/report/summary.ts";
 import { header, tmp, userMessage, writeMixed, writeSession } from "./fixtures/report.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const VERSION: string = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
 
 function script(name: string, args: string[]) {
   // An empty HOME, so a developer's real sessions and settings cannot change what a script reads.
@@ -27,6 +28,11 @@ test("decisions script: text view and --json share the report's scope rules", ()
   assert.equal(unscoped.stdout, "", "no scope reads nothing");
   assert.notEqual(unscoped.stderr, "");
   assert.equal(script("decisions.ts", ["--since", "2026-10-01", "--json"]).status, 2, "a partial scope is refused too");
+  for (const flag of ["--version", "-v"]) {
+    const version = script("decisions.ts", [flag]);
+    assert.equal(version.status, 0, flag);
+    assert.equal(version.stdout.trim(), VERSION, `${flag} prints the version, not the usage text`);
+  }
 
   const spec = { scope: { kind: "session" as const, files: [file] }, filters: NO_FILTERS, serviceLogs: [] };
   const json = script("decisions.ts", ["--session", file, "--json"]);

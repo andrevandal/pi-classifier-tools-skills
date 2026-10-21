@@ -171,6 +171,25 @@ export function canonical(file: string): string {
   }
 }
 
+/** `fs.statSync`, or null when the path cannot be examined: missing, a symlink loop, no permission. */
+export function statOrNull(file: string): fs.Stats | null {
+  try {
+    return fs.statSync(file);
+  } catch {
+    return null;
+  }
+}
+
+/** The text of a regular file. Null for anything else (opening a pipe or a device would block) or on a read error. */
+function readRegularText(file: string): string | null {
+  if (statOrNull(file)?.isFile() !== true) return null;
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Every `.jsonl` file under `root`, recursive and sorted by plain comparison. A missing root yields none; an
  * unreadable directory calls `onUnreadable` and is skipped.
@@ -223,9 +242,10 @@ function findHeader(lines: readonly string[]): { index: number; id: string | nul
 
 /**
  * A bounded peek at a session's header: at most the first 64 KiB, under the same first-four-non-blank-lines
- * rule as a full read. Null when the file has no header or cannot be read.
+ * rule as a full read. Null when the file has no header, is not a regular file or cannot be read.
  */
 export function readHeader(file: string): { id: string | null; cwd: string | null } | null {
+  if (statOrNull(file)?.isFile() !== true) return null;
   let text: string;
   try {
     const fd = fs.openSync(file, "r");
@@ -287,21 +307,26 @@ function labelBranches(entries: Record<string, unknown>[]): Branch[] {
 // Scan
 // ---------------------------------------------------------------------------
 
-/** A finite number >= 0, else null. */
+/** A finite number >= 0, else null: a message's cost. */
 function measure(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/** A safe integer >= 0, else null: the check `normalizeUsage` applies to token counts, so no sum can overflow. */
+function tokenCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function turnOf(where: Where, message: Record<string, unknown>): TurnEvent {
   const usage = isObject(message.usage) ? message.usage : {};
   let tokens = {
-    input: measure(usage.input),
-    output: measure(usage.output),
-    cacheRead: measure(usage.cacheRead),
-    cacheWrite: measure(usage.cacheWrite),
+    input: tokenCount(usage.input),
+    output: tokenCount(usage.output),
+    cacheRead: tokenCount(usage.cacheRead),
+    cacheWrite: tokenCount(usage.cacheWrite),
   };
   let cost = measure(isObject(usage.cost) ? usage.cost.total : undefined);
-  // Zeros everywhere (or no usage block) carry no measurement: the same rule as the `loadout.usage` producer.
+  // Zeros everywhere (or no usage block) carry no measurement, so they are never reported as measured zeros.
   if (!Object.values(tokens).some((value) => value !== null && value > 0)) {
     tokens = { input: null, output: null, cacheRead: null, cacheWrite: null };
     cost = null;
@@ -327,9 +352,9 @@ interface Scanned {
   unsupported: UnsupportedEvent[];
 }
 
-/** A child session sits in `<parent session file minus .jsonl>/`. */
+/** A child session sits in `<parent session file minus .jsonl>/`. A parent location that cannot be examined is no parent. */
 function isNestedChild(file: string): boolean {
-  return fs.statSync(`${path.dirname(file)}.jsonl`, { throwIfNoEntry: false })?.isFile() === true;
+  return statOrNull(`${path.dirname(file)}.jsonl`)?.isFile() === true;
 }
 
 function scanFile(file: string, fileIndex: number): Scanned {
@@ -343,10 +368,8 @@ function scanFile(file: string, fileIndex: number): Scanned {
     malformedLines: 0,
   };
   const out: Scanned = { info, decisions: [], usage: [], turns: [], toolResults: [], unsupported: [] };
-  let text: string;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch {
+  const text = readRegularText(file);
+  if (text === null) {
     info.unreadable = true;
     return out;
   }
@@ -502,10 +525,8 @@ export function readServiceLogs(files: readonly string[]): ServiceRead {
   };
   const seen = new Map<string, Set<string>>();
   for (const file of paths) {
-    let text: string;
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
+    const text = readRegularText(file);
+    if (text === null) {
       read.unreadable++;
       continue;
     }

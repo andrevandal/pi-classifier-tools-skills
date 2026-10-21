@@ -314,6 +314,28 @@ test("reader: transcript turns keep unknown apart from zero and carry no text", 
   assert.match(fs.readFileSync(file, "utf8"), /CANARY_USER/, "the canary is in the transcript");
 });
 
+test("reader: transcript token counts must be safe integers, so no sum can overflow", () => {
+  const file = writeSession(path.join(tmp(), "t.jsonl"), [
+    header(),
+    ...chain([
+      assistantMessage({
+        usage: { input: 1e308, output: 5, cacheRead: 2.5, cacheWrite: 2 ** 53, cost: { total: 0.25 } },
+      }),
+      assistantMessage({ usage: { input: 1e308, cost: { total: 0.25 } } }),
+    ]),
+  ]);
+
+  const { turns } = readSessions([file]);
+  assert.deepEqual(turns[0]?.tokens, { input: null, output: 5, cacheRead: null, cacheWrite: null });
+  assert.equal(turns[0]?.cost, 0.25);
+  assert.deepEqual(
+    turns[1]?.tokens,
+    { input: null, output: null, cacheRead: null, cacheWrite: null },
+    "no valid counter above 0 is no measurement",
+  );
+  assert.equal(turns[1]?.cost, null);
+});
+
 function copyFixture(dir: string) {
   const lines = (id: string | null) => [
     header({ id, cwd: "/p/one" }),
@@ -405,6 +427,16 @@ test("reader: nested child sessions are flagged, not rolled up", () => {
       ["s-c", uuid(2)],
     ],
   );
+});
+
+test("reader: a looping parent location is no parent and never throws", () => {
+  const dir = tmp();
+  const file = writeSession(path.join(dir, "d", "s.jsonl"), [header({ id: "s-p" })]);
+  fs.symlinkSync("d.jsonl", path.join(dir, "d.jsonl"));
+
+  const info = readSessions([file]).files[0];
+  assert.equal(info?.unreadable, false);
+  assert.equal(info?.nestedChild, false);
 });
 
 test("reader: unreadable paths are reported, never thrown", () => {
