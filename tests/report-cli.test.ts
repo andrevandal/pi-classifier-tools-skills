@@ -193,7 +193,7 @@ test("cli: filters and service logs reach the report", () => {
   assert.equal(joined.http?.joined, 2);
 });
 
-test("cli: an empty match is a warning, not an error", () => {
+test("cli: unreadable history is coverage and an empty match is a warning", (t) => {
   const empty = tmp();
   const result = run(["summary", "--sessions-dir", empty, "--since", A, "--until", B, "--all-projects"]);
   assert.equal(result.status, 0);
@@ -210,9 +210,8 @@ test("cli: an empty match is a warning, not an error", () => {
   const noHome = run(["summary", "--since", A, "--until", B, "--all-projects"]);
   assert.equal(noHome.status, 0, "a missing default directory is zero files and a warning");
   assert.notEqual(noHome.stderr, "");
-});
 
-test("cli: unreadable history is coverage", { skip: process.getuid?.() === 0 && "root reads everything" }, () => {
+  if (process.getuid?.() === 0) return t.diagnostic("running as root: the unreadable-history rows were not run");
   const root = tmp();
   const ok = writeSession(path.join(root, "ok", "valid.jsonl"), [
     header({ id: "s-ok" }),
