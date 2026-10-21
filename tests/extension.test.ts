@@ -13,6 +13,7 @@ import * as path from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import loadout from "../src/index.ts";
+import { buildExport, buildSummary, parseArgv, type ReportSpec } from "../src/report/report.ts";
 import { type DecisionRecordV3, ID_PATTERN, normalizeDecision, type UsageObservationV1 } from "../src/telemetry.ts";
 import type { Answers } from "../src/types.ts";
 import {
@@ -34,7 +35,7 @@ const SKILLS = [
 ];
 
 let server: http.Server;
-let reply: { status: number; answers: Answers; body?: string; extra?: Record<string, unknown> } = {
+let reply: { status: number; answers: Answers; body?: string; extra?: Record<string, unknown>; delayMs?: number } = {
   status: 200,
   answers: {},
 };
@@ -63,8 +64,15 @@ before(async () => {
     });
     req.on("end", () => {
       requests.push(JSON.parse(body));
-      res.writeHead(reply.status, { "Content-Type": "application/json" });
-      res.end(reply.body ?? JSON.stringify({ ...reply.extra, answers: reply.answers }));
+      const current = reply;
+      const respond = () => {
+        res.writeHead(current.status, { "Content-Type": "application/json" });
+        res.end(current.body ?? JSON.stringify({ ...current.extra, answers: current.answers }));
+      };
+      // Only the timeout test sets a delay. The Jev client times out on a real socket timer that fake timers cannot
+      // drive, so the stub must answer late in real time.
+      if (current.delayMs === undefined) respond();
+      else setTimeout(respond, current.delayMs);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -98,6 +106,8 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 
 interface HostOptions {
   skills?: typeof SKILLS;
+  /** The host's session file: `sessionManager.getSessionFile` returns it, and `appendEntry` also writes to it. */
+  sessionFile?: string;
   sessionIdThrows?: boolean;
   /** Make `getAllTools` throw, as a host whose tool registry is not ready does. */
   getAllToolsThrows?: boolean;
@@ -113,12 +123,26 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
   const entries: Array<{ type: string; data: unknown }> = [];
   const notes: string[] = [];
+  const notices: Array<{ message: string; level: string; callsBefore: number }> = [];
   const calls: string[] = [];
   let active = [...BASELINE];
   let setCalls = 0;
   let appendCalls = 0;
   let appendFault: HostOptions["onAppend"] | null = options.onAppend ?? null;
   const sessionId = `session-${++sessionCounter}`;
+  // What the host writes to its session file: a header before the first entry, then one custom entry per append.
+  let fileEntries = 0;
+  let lastFileId: string | null = null;
+  const writeEntry = (file: string, customType: string, data: unknown) => {
+    if (!fs.existsSync(file)) {
+      const header = { type: "session", version: 3, id: sessionId, timestamp: new Date().toISOString(), cwd: ctx.cwd };
+      fs.writeFileSync(file, `${JSON.stringify(header)}\n`);
+    }
+    const id = `e${fileEntries++}`;
+    const entry = { type: "custom", customType, data, id, parentId: lastFileId, timestamp: new Date().toISOString() };
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+    lastFileId = id;
+  };
 
   const pi = {
     on: (name: string, handler: Handler) => handlers.set(name, handler),
@@ -147,6 +171,7 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
       if (fault) throw fault;
       calls.push("append");
       entries.push({ type, data });
+      if (options.sessionFile !== undefined) writeEntry(options.sessionFile, type, data);
     },
   };
   const ctx = {
@@ -157,14 +182,21 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
         if (options.sessionIdThrows) throw new Error("no session");
         return sessionId;
       },
+      ...(options.sessionFile === undefined ? {} : { getSessionFile: () => options.sessionFile }),
     },
-    ui: { notify: (message: string) => notes.push(message) },
+    ui: {
+      notify: (message: string, level: string) => {
+        notes.push(message);
+        notices.push({ message, level, callsBefore: calls.length });
+      },
+    },
   };
   loadout(pi as never);
 
   return {
     entries,
     notes,
+    notices,
     calls,
     sessionId,
     active: () => active,
@@ -571,7 +603,8 @@ test("skips: every prompt the plugin sees leaves one record, and a skip never re
 
   host.notes.length = 0;
   await host.command("explain");
-  assert.match(host.notes.join("\n"), /profile answer/);
+  assert.match(host.notes.join("\n"), /outcome: skipped: slash command, not classified/);
+  assert.match(host.notes.join("\n"), /previous decision: applied answer/);
   host.shutdown();
 });
 
@@ -646,8 +679,9 @@ async function assertSilentAndWorking(host: ReturnType<typeof fakeHost>, reason:
   assert.deepEqual(sorted(host.active()), sorted(ANSWER_SET));
   host.notes.length = 0;
   await host.command("explain");
-  assert.match(host.notes.join("\n"), /profile answer/);
+  assert.match(host.notes.join("\n"), /outcome: applied answer/);
   assert.match(host.notes.join("\n"), /application: applied/);
+  assert.match(host.notes.join("\n"), new RegExp(`record not stored: telemetry off \\(${reason}\\)`));
   host.notes.length = 0;
   await host.command("status");
   assert.match(host.notes.join("\n"), new RegExp(`telemetry: off \\(${reason}\\)`));
@@ -1015,9 +1049,13 @@ test("usage: sessions never mix, a tool result's own usage adds nothing, and a r
   b.shutdown();
 });
 
-test("usage: opt-out writes no usage record in any layer", async () => {
+/**
+ * The layers that turn telemetry off, each arranged on disk over a default config. A function, not a constant,
+ * because `home` is assigned in the `before` hook: call it inside a test.
+ */
+function optOutLayers(): Array<{ reason: string; arrange: () => void }> {
   const explicit = path.join(home, "explicit.json");
-  const layers: Array<{ reason: string; arrange: () => void }> = [
+  return [
     { reason: "machine-off", arrange: () => writeConfig({ telemetry: false }) },
     { reason: "machine-unreadable", arrange: () => fs.writeFileSync(GLOBAL_FILE(), "{ not json") },
     {
@@ -1035,8 +1073,11 @@ test("usage: opt-out writes no usage record in any layer", async () => {
       },
     },
   ];
+}
+
+test("usage: opt-out writes no usage record in any layer", async () => {
   try {
-    for (const { reason, arrange } of layers) {
+    for (const { reason, arrange } of optOutLayers()) {
       writeConfig({});
       delete process.env.LOADOUT_CONFIG;
       arrange();
@@ -1048,7 +1089,11 @@ test("usage: opt-out writes no usage record in any layer", async () => {
       assert.deepEqual(host.entries, [], reason);
       assert.ok(!host.calls.includes("append"), reason);
       await host.command("status");
-      assert.match(host.notes.join("\n"), new RegExp(`telemetry: off \\(${reason}\\) \\| suppressed 3`), reason);
+      assert.match(
+        host.notes.join("\n"),
+        new RegExp(`telemetry: off \\(${reason}\\) \\| records suppressed 3`),
+        reason,
+      );
       host.shutdown();
     }
   } finally {
@@ -1319,5 +1364,578 @@ test("usage: a tool registry that cannot be read leaves the record without tool 
   assert.doesNotMatch(host.notes.join("\n"), /telemetry record not stored/);
   await host.command("status");
   assert.match(host.notes.join("\n"), /failed 0/);
+  host.shutdown();
+});
+
+// Observability: `/loadout status`, `explain` and `stats`, and the per-turn notice.
+
+/** A fresh directory for one test's session file, so a history scan reads only that test's files. */
+function sessionDir(): string {
+  return fs.mkdtempSync(path.join(home, "sessions-"));
+}
+
+/** The report scope `/loadout stats` reads for one session file, parsed the way the command parses it. */
+function sessionSpec(file: string): ReportSpec {
+  const result = parseArgv(["summary", "--session", file]);
+  if (!result.ok || result.parsed.kind !== "run") throw new Error(`no session scope for ${file}`);
+  return result.parsed.spec;
+}
+
+/** Run one `/loadout` subcommand and return the notifications it sent. */
+async function runCommand(host: Host, args: string) {
+  const from = host.notices.length;
+  await host.command(args);
+  return host.notices.slice(from);
+}
+
+/** The info notifications one prompt sent, in order: the per-turn notice, when the turn gets one. */
+async function promptInfo(host: Host, text: string) {
+  const from = host.notices.length;
+  await host.prompt(text);
+  return host.notices.slice(from).filter((notice) => notice.level === "info");
+}
+
+/** The one notification in a list; fails unless there is exactly one. */
+function onlyNotice<T>(notices: T[]): T {
+  assert.equal(notices.length, 1);
+  return notices[0]!;
+}
+
+/** The text `/loadout explain` printed. */
+async function explainOf(host: Host): Promise<string> {
+  return onlyNotice(await runCommand(host, "explain")).message;
+}
+
+/** A per-turn notice is one line of at most 160 characters, with no tool list and no probability list. */
+function assertCompact(text: string): void {
+  assert.ok(text.length <= 160, text);
+  assert.doesNotMatch(text, /\n/);
+  assert.doesNotMatch(text, /\b(?:read|bash|edit|write|grep|find|ls|task), /);
+  assert.doesNotMatch(text, /\bp \d\.\d\d\b|\b(?:answer|edit|full): \d/);
+}
+
+test("extension: commands print exactly one notification each", async () => {
+  const host = fakeHost("pi", { sessionFile: path.join(sessionDir(), "session.jsonl") });
+  await host.prompt("explain this");
+
+  const status = onlyNotice(await runCommand(host, "status")).message;
+  const explain = onlyNotice(await runCommand(host, "explain")).message;
+  const stats = onlyNotice(await runCommand(host, "stats")).message;
+  const json = await runCommand(host, "stats --json");
+  const usage = onlyNotice(await runCommand(host, "bogus"));
+
+  assert.match(status, /^\[loadout\] status\n/);
+  assert.match(explain, /^\[loadout\] explain: latest invocation\n/);
+  assert.match(stats, /^\[loadout\] stats: session files\n/);
+  assert.equal(onlyNotice(json).level, "info");
+  assert.equal(JSON.parse(onlyNotice(json).message).scope.kind, "session");
+  assert.equal(usage.level, "warning");
+  host.shutdown();
+});
+
+test("extension: explain traces the latest invocation of any outcome", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  await host.prompt("/review");
+  const skipped = await explainOf(host);
+  assert.match(skipped, /^ {2}outcome: skipped: slash command, not classified$/m);
+  assert.match(skipped, /^ {2}previous decision: applied answer \(tools 4 of 7\); skills: 1 selected$/m);
+
+  const canary = "CANARY_FAILURE_Q9";
+  reply = { status: 500, answers: {}, body: `upstream said ${canary}` };
+  await host.prompt("now fix it");
+  const failed = await explainOf(host);
+  assert.match(failed, /^ {2}outcome: classification failed: unavailable \(HTTP 500\) after \d+ ms$/m);
+  assert.match(failed, new RegExp(`^  failure text \\(memory only, never stored\\): .*${canary}`, "m"));
+  assert.doesNotMatch(failed, /previous decision/);
+  // Guards: the canary reached the in-memory text, and no record holds it.
+  assert.match(host.notes.join("\n"), new RegExp(canary));
+  assert.doesNotMatch(JSON.stringify(host.entries), new RegExp(canary));
+  host.shutdown();
+});
+
+test("extension: outcomes through the real hook read differently", async () => {
+  // Every outcome's headline is collected, so the check at the end can show that no two read the same.
+  const headlines: string[] = [];
+
+  // Low confidence: no narrower profile is within the risk ceiling, so every tool stays.
+  reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
+  let host = fakeHost("pi");
+  const low = onlyNotice(await promptInfo(host, "explain this")).message;
+  assert.equal(
+    low,
+    "[loadout] all tools kept: low confidence (closest narrower risk 0.15 > max 0.10); skills: 1 selected",
+  );
+  headlines.push(low);
+  const lowExplain = await explainOf(host);
+  assert.match(lowExplain, /^ {2}tools: low confidence, no profile within max risk 0\.10$/m);
+  assert.match(lowExplain, /^ {4}answer: p 0\.55, risk 0\.45 > 0\.10$/m);
+  assert.match(lowExplain, /^ {4}edit: p 0\.30, risk 0\.15 > 0\.10$/m);
+  assert.match(lowExplain, /^ {4}full: p 0\.15 \(broadest, the baseline\)$/m);
+  assert.match(lowExplain, /^ {2}blocked: low confidence$/m);
+  host.shutdown();
+
+  // Skill overflow: two candidates over a limit of one, so no skill is asked and none is filtered.
+  writeConfig({ skills: { enabled: true, maxCandidates: 1 } });
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  host = fakeHost("pi");
+  const overflow = onlyNotice(await promptInfo(host, "explain this")).message;
+  assert.equal(overflow, "[loadout] applied answer (tools 4 of 7); skills: 2 candidates > limit 1, none asked");
+  headlines.push(overflow);
+  const overflowExplain = await explainOf(host);
+  assert.match(overflowExplain, /^ {2}skills: 2 eligible > limit 1 \(discovered 2\): none asked, all skills kept$/m);
+  assert.match(overflowExplain, /^ {2}blocked: skills over the candidate limit$/m);
+  host.shutdown();
+
+  // Dry run: the proposal is named, and the tools are the baseline.
+  writeConfig({ dryRun: true });
+  host = fakeHost("pi");
+  const dry = onlyNotice(await promptInfo(host, "explain this")).message;
+  assert.equal(dry, "[loadout] dry run: would use answer (tools 4), nothing changed; skills: would select 1");
+  headlines.push(dry);
+  assert.deepEqual(host.active(), BASELINE);
+  assert.match(await explainOf(host), /^ {2}blocked: dry run$/m);
+  host.shutdown();
+
+  // Ratchet: after a widening to edit, a narrowing to answer is refused and the tools stay at edit.
+  writeConfig({});
+  host = fakeHost("pi");
+  WIDEN_TO_EDIT();
+  assert.equal(
+    onlyNotice(await promptInfo(host, "run the tests")).message,
+    "[loadout] applied edit (tools 6 of 7); skills: 1 selected",
+  );
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  const ratchet = onlyNotice(await promptInfo(host, "explain that")).message;
+  assert.equal(ratchet, "[loadout] kept edit: widen-only blocked narrowing to answer; skills: 1 selected");
+  headlines.push(ratchet);
+  const ratchetExplain = await explainOf(host);
+  assert.match(ratchetExplain, /^ {2}ratchet: edit -> edit \(blocked, narrowing locked\)$/m);
+  assert.match(ratchetExplain, /^ {2}blocked: widen-only ratchet \(kept edit\)$/m);
+  host.shutdown();
+
+  // Application: the narrowing is applied, and explain reads back the tools the host really has.
+  host = fakeHost("pi");
+  const applied = onlyNotice(await promptInfo(host, "explain this")).message;
+  assert.equal(applied, "[loadout] applied answer (tools 4 of 7); skills: 1 selected");
+  headlines.push(applied);
+  assert.match(await explainOf(host), /^ {2}application: applied \| actual tools: read, grep, find, ls \(4\)$/m);
+  host.shutdown();
+
+  // Already matching: the same widening twice, so the setter is not called the second time.
+  host = fakeHost("pi");
+  WIDEN_TO_EDIT();
+  await host.prompt("run the tests");
+  WIDEN_TO_EDIT();
+  const matching = onlyNotice(await promptInfo(host, "run the tests again")).message;
+  assert.equal(matching, "[loadout] already matching edit (tools 6 of 7); skills: 1 selected");
+  headlines.push(matching);
+  host.shutdown();
+
+  // Collection failure: the decision is applied but its record is not written. Explain says so; the warning is once.
+  host = fakeHost("pi", {
+    onAppend: () => errorWith("EACCES: permission denied, open '/home/x/secret-dir/s.jsonl'", "EACCES"),
+  });
+  WIDEN_TO_EDIT();
+  const collected = onlyNotice(await promptInfo(host, "run the tests")).message;
+  assert.equal(collected, "[loadout] applied edit (tools 6 of 7); skills: 1 selected");
+  headlines.push(collected);
+  const unstored = await explainOf(host);
+  assert.match(unstored, /^ {2}source: in memory \| record not stored: EACCES$/m);
+  assert.doesNotMatch(unstored, /secret-dir/);
+  const warnings = host.notes.filter((note) => note.startsWith("[loadout] telemetry record not stored (EACCES)"));
+  assert.equal(warnings.length, 1);
+  host.shutdown();
+
+  // Timeout: the Jev request is cut at 50 ms; the 300 ms guard budget never fires. Warn, and send no info line.
+  fs.writeFileSync(
+    GLOBAL_FILE(),
+    JSON.stringify({
+      skills: { enabled: true },
+      backend: "jev",
+      jev: { ...(endpointConfig().jev as Record<string, unknown>), timeoutMs: 50 },
+    }),
+  );
+  reply.delayMs = 300;
+  host = fakeHost("pi");
+  assert.deepEqual(await promptInfo(host, "explain this"), []);
+  const timedOut = await explainOf(host);
+  const timeoutHeadline = /^ {2}outcome: (.*)$/m.exec(timedOut)?.[1] ?? "";
+  assert.match(timeoutHeadline, /^classification failed: timeout after \d+ ms \(budget 300 ms\)$/);
+  headlines.push(timeoutHeadline);
+  assert.match(timedOut, /^ {2}timing: \d+ ms of 300 ms budget \(timeout 50 ms\), guard not fired$/m);
+  assert.ok(host.notes.some((note) => note.startsWith("[loadout] classification failed (timeout)")));
+  host.shutdown();
+
+  // Eight outcomes, eight different headlines.
+  assert.equal(headlines.length, 8);
+  assert.equal(new Set(headlines).size, headlines.length, headlines.join("\n"));
+});
+
+test("extension: status prints safe effective settings only", async () => {
+  const envName = "CANARY_ENV_NAME_K6";
+  const jev = {
+    ...(endpointConfig("?q=CANARY_QUERY_K4").jev as Record<string, unknown>),
+    apiKeyEnvVar: envName,
+    timeoutMs: 2500,
+  };
+  fs.writeFileSync(GLOBAL_FILE(), JSON.stringify({ skills: { enabled: true }, backend: "jev", jev }));
+  process.env[envName] = "test-token";
+  try {
+    const host = fakeHost("pi");
+    await host.prompt("explain this");
+    const status = onlyNotice(await runCommand(host, "status")).message;
+    const explain = await explainOf(host);
+    assert.match(status, /^ {2}classifier: jev \| timeout 2500 ms$/m);
+    assert.match(status, /^ {2}telemetry: on \(default\) \| records handed to host 1 \| failed 0$/m);
+    // Guards: the canaries were in the config the plugin read, and the classifier call went out.
+    const config = fs.readFileSync(GLOBAL_FILE(), "utf8");
+    assert.match(config, /CANARY_QUERY_K4/);
+    assert.match(config, new RegExp(envName));
+    assert.equal(requests.length, 1);
+    for (const text of [status, explain, JSON.stringify(host.entries)]) assert.doesNotMatch(text, /CANARY/);
+    host.shutdown();
+  } finally {
+    delete process.env[envName];
+  }
+});
+
+test("extension: status: collection provenance for every layer, and machine-off is a hard override", async () => {
+  const provenance: Record<string, string> = {
+    "machine-off":
+      "hard machine-wide override in ~/.omp/loadout.*; no project, session or LOADOUT_CONFIG setting can turn it back on",
+    "machine-unreadable":
+      "the machine setting in ~/.omp/loadout.* could not be read; nothing is recorded (fail closed)",
+    "config-error": "the config has an error; nothing is recorded until it is fixed and the session restarts",
+    "config-off": "the effective config (explicit) sets telemetry false",
+  };
+  try {
+    for (const { reason, arrange } of optOutLayers()) {
+      writeConfig({});
+      delete process.env.LOADOUT_CONFIG;
+      arrange();
+      requests.length = 0;
+      const host = fakeHost("omp");
+      await host.prompt("explain this");
+
+      // machine-off and config-off keep selection on; an invalid config switches selection off and asks nothing.
+      const selecting = reason === "machine-off" || reason === "config-off";
+      assert.equal(requests.length, selecting ? 1 : 0, reason);
+      assert.deepEqual(sorted(host.active()), sorted(selecting ? ANSWER_SET : BASELINE), reason);
+      assert.deepEqual(host.entries, [], reason);
+      assert.ok(!host.calls.includes("append"), reason);
+
+      const status = onlyNotice(await runCommand(host, "status")).message.split("\n");
+      assert.ok(status.includes(`  telemetry: off (${reason}) | records suppressed 1`), reason);
+      assert.ok(status.includes(`  provenance: ${provenance[reason]}`), reason);
+
+      const explain = await explainOf(host);
+      assert.ok(explain.includes(`  source: in memory | record not stored: telemetry off (${reason})`), reason);
+      assert.match(
+        explain,
+        selecting ? /^ {2}outcome: applied answer/m : /^ {2}outcome: skipped: selection is off$/m,
+        reason,
+      );
+      host.shutdown();
+    }
+  } finally {
+    delete process.env.LOADOUT_CONFIG;
+  }
+});
+
+test("extension: status counts records and session coverage", async () => {
+  for (const mode of ["on", "off"] as const) {
+    if (mode === "off") writeConfig({ telemetry: false });
+    const host = fakeHost("pi");
+    await host.prompt("explain this");
+    host.fire("agent_start");
+    turn(host, "pi");
+    turn(host, "pi", { turnIndex: 1 });
+    await host.prompt("explain that");
+    host.fire("agent_start");
+    turn(host, "pi", { turnIndex: 2 });
+
+    const status = onlyNotice(await runCommand(host, "status")).message;
+    if (mode === "on") assert.match(status, /^ {2}telemetry: on \(default\) \| records handed to host 5 \| failed 0$/m);
+    else assert.match(status, /^ {2}telemetry: off \(machine-off\) \| records suppressed 5$/m);
+    assert.match(
+      status,
+      /^ {2}this session: prompts observed 2 \(classified 2, failed 0, skipped 0\) \| model turns observed 3 \|/m,
+    );
+    assert.match(
+      status,
+      /^ {2}not included: child and subagent sessions \(each has its own plugin instance and records\)$/m,
+    );
+    host.shutdown();
+  }
+});
+
+test("extension: a config reload keeps the latest observation and the counters", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  const other = path.join(path.dirname(project), "other-cwd");
+  fs.mkdirSync(other, { recursive: true });
+  host.setCwd(other);
+
+  const explain = await explainOf(host);
+  assert.match(explain, /^ {2}outcome: applied answer \(tools 4 of 7\); skills: 1 selected$/m);
+  assert.match(explain, /^ {2}source: in memory \| record handed to host$/m);
+  const status = onlyNotice(await runCommand(host, "status")).message;
+  assert.match(status, /^ {2}last decision: applied answer \(tools 4 of 7\); skills: 1 selected$/m);
+  assert.match(status, /^ {2}telemetry: on \(default\) \| records handed to host 1 \| failed 0$/m);
+  assert.match(status, /^ {2}this session: prompts observed 1 \(classified 1, failed 0, skipped 0\)/m);
+  host.shutdown();
+});
+
+test("extension: per-turn notice: one compact line after application, honors notify, never says applied for a dry run or a blocked proposal", async () => {
+  // A dry run proposes; it never says it applied anything.
+  writeConfig({ dryRun: true });
+  let host = fakeHost("pi");
+  const dry = onlyNotice(await promptInfo(host, "explain this")).message;
+  assertCompact(dry);
+  assert.match(dry, /^\[loadout\] dry run: would use answer \(tools 4\), nothing changed/);
+  assert.doesNotMatch(dry, /\bapplied\b/i);
+  host.shutdown();
+
+  // Applied: one line, sent after the tools were set, so the notice's call count is past the set call.
+  writeConfig({});
+  host = fakeHost("pi");
+  const applied = onlyNotice(await promptInfo(host, "explain this"));
+  assertCompact(applied.message);
+  assert.equal(applied.message, "[loadout] applied answer (tools 4 of 7); skills: 1 selected");
+  assert.ok(applied.callsBefore > host.calls.indexOf("set"));
+  host.shutdown();
+
+  // Ratchet block: the blocked profile is named; there is no arrow to a count.
+  host = fakeHost("pi");
+  WIDEN_TO_EDIT();
+  await host.prompt("run the tests");
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  const blocked = onlyNotice(await promptInfo(host, "explain that")).message;
+  assertCompact(blocked);
+  assert.match(blocked, /^\[loadout\] kept edit: widen-only blocked narrowing to answer/);
+  assert.doesNotMatch(blocked, /->/);
+  assert.doesNotMatch(blocked, /\bapplied\b/i);
+  host.shutdown();
+
+  // Already matching: the identical widening again says so, and does not say applied.
+  host = fakeHost("pi");
+  WIDEN_TO_EDIT();
+  await host.prompt("run the tests");
+  WIDEN_TO_EDIT();
+  const matching = onlyNotice(await promptInfo(host, "run them again")).message;
+  assertCompact(matching);
+  assert.match(matching, /^\[loadout\] already matching edit \(tools 6 of 7\)/);
+  assert.doesNotMatch(matching, /\bapplied\b/i);
+  host.shutdown();
+
+  // Low confidence: no narrower profile in reach, so nothing is applied.
+  reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
+  host = fakeHost("pi");
+  const low = onlyNotice(await promptInfo(host, "explain this")).message;
+  assertCompact(low);
+  assert.match(low, /^\[loadout\] all tools kept: low confidence \(closest narrower risk 0\.15 > max 0\.10\)/);
+  assert.doesNotMatch(low, /\bapplied\b/i);
+  host.shutdown();
+
+  // Candidate limit: the tools are applied and the skills part says none were asked.
+  writeConfig({ skills: { enabled: true, maxCandidates: 1 } });
+  reply.answers.tool_profile = answerReply({ answer: 0.9 });
+  host = fakeHost("pi");
+  const limited = onlyNotice(await promptInfo(host, "explain this")).message;
+  assertCompact(limited);
+  assert.equal(limited, "[loadout] applied answer (tools 4 of 7); skills: 2 candidates > limit 1, none asked");
+  host.shutdown();
+
+  // A skip sends no notice at all.
+  writeConfig({});
+  host = fakeHost("pi");
+  assert.deepEqual(await promptInfo(host, "/review"), []);
+  assert.deepEqual(await promptInfo(host, "   "), []);
+  host.shutdown();
+
+  // notify: false hides the info line; a classifier failure still warns and the commands still answer.
+  writeConfig({ notify: false });
+  host = fakeHost("pi");
+  assert.deepEqual(await promptInfo(host, "explain this"), []);
+  reply = { status: 500, answers: {} };
+  assert.deepEqual(await promptInfo(host, "now fix it"), []);
+  assert.ok(
+    host.notices.some(
+      (notice) => notice.level === "warning" && /classification failed \(unavailable\)/.test(notice.message),
+    ),
+  );
+  assert.match(onlyNotice(await runCommand(host, "status")).message, /^\[loadout\] status\n/);
+  host.shutdown();
+});
+
+test("extension: commands add nothing to the model context or the session", async () => {
+  const host = fakeHost("omp", { sessionFile: path.join(sessionDir(), "session.jsonl") });
+  await host.prompt("explain this");
+  const records = host.entries.length;
+  for (const args of [
+    "status",
+    "explain",
+    "stats",
+    "stats --json",
+    "stats export",
+    "stats --since 2026-10-01",
+    "bogus",
+    "off",
+    "on",
+  ]) {
+    await host.command(args);
+    assert.equal(host.entries.length, records, args);
+  }
+  assert.deepEqual(
+    host.notices.filter((notice) => notice.message.includes("selection error")),
+    [],
+  );
+  // The next hook still returns only the skill hint: no command output reaches the model.
+  const { result } = await host.prompt("explain that");
+  assert.match(result?.message?.content ?? "", /^Skills most relevant to this request/);
+  assert.doesNotMatch(result?.message?.content ?? "", /\[loadout\]/);
+  host.shutdown();
+});
+
+test("extension: stats: current session by default, text and JSON agree, and JSON is the report library's summary", async () => {
+  const file = path.join(sessionDir(), "session.jsonl");
+  const host = fakeHost("omp", { sessionFile: file });
+  for (let i = 0; i < 3; i++) {
+    await host.prompt(`explain ${i}`);
+    host.fire("agent_start");
+    turn(host, "omp", { turnIndex: i });
+  }
+  const text = onlyNotice(await runCommand(host, "stats")).message;
+  const json = JSON.parse(onlyNotice(await runCommand(host, "stats --json")).message);
+  const exported = JSON.parse(onlyNotice(await runCommand(host, "stats export")).message);
+
+  assert.equal(json.classifier.attempts, 3);
+  assert.equal(json.usage.turns, 3);
+  assert.match(text, /^ {2}classifier calls \(loadout\.decision attempts; not model turns\): 3$/m);
+  assert.match(
+    text,
+    new RegExp(
+      `^  model turns \\(loadout\\.usage; separate from classifier calls\\): ${json.usage.turns} in ${json.usage.runs} runs$`,
+      "m",
+    ),
+  );
+  assert.match(text, /^ {2}telemetry: on \(default\) \| this process handed 6 records to the host, failed 0$/m);
+  assert.match(
+    text,
+    /^ {2}file: 3 decisions and 3 model-turn records were read here; this process handed 6 to the host/m,
+  );
+  // The JSON is the report library's own summary of this file; export is its export document.
+  assert.deepEqual(json, JSON.parse(JSON.stringify(buildSummary(sessionSpec(file)))));
+  assert.deepEqual(exported, JSON.parse(JSON.stringify(buildExport(sessionSpec(file)))));
+  host.shutdown();
+});
+
+test("extension: stats refuses a partial history and reads only the named scope", async () => {
+  const dir = sessionDir();
+  const file = path.join(dir, "session.jsonl");
+  const host = fakeHost("pi", { sessionFile: file });
+  await host.prompt("explain this");
+
+  const refusals: Array<[string, string]> = [
+    [
+      "stats --since 2026-10-01T00:00:00Z",
+      "incomplete historical scope: missing --until, --project <path> or --all-projects",
+    ],
+    [
+      "stats --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z",
+      "incomplete historical scope: missing --project <path> or --all-projects",
+    ],
+    [
+      "stats --since 2026-10-01T00:00:00Z --until 2026-10-02T00:00:00Z --project /x --all-projects",
+      "--project and --all-projects are mutually exclusive",
+    ],
+    [`stats --session ${file} --since 2026-10-01T00:00:00Z`, "--session cannot be combined with --since"],
+    ["stats --version", "--version is not a stats option (see /loadout stats --help)"],
+  ];
+  for (const [args, reason] of refusals) {
+    const notice = onlyNotice(await runCommand(host, args));
+    assert.equal(notice.level, "warning", args);
+    assert.equal(notice.message, `[loadout] stats: ${reason}`, args);
+  }
+
+  // A window around now, this project and the session's own directory: the session is read.
+  const since = new Date(Date.now() - 3_600_000).toISOString();
+  const until = new Date(Date.now() + 3_600_000).toISOString();
+  const inWindow = onlyNotice(
+    await runCommand(host, `stats --since ${since} --until ${until} --project ${project} --sessions-dir ${dir}`),
+  ).message;
+  assert.match(inWindow, /^\[loadout\] stats: history$/m);
+  assert.match(
+    inWindow,
+    /^ {2}scope: history .* \| exact project match \| files 1 \(read 1, unreadable 0, skipped by mtime 0\) \| nested child sessions read separately 0$/m,
+  );
+  assert.match(inWindow, /^ {2}classifier calls \(loadout\.decision attempts; not model turns\): 1$/m);
+
+  // Another project's path matches no file, so every count is zero.
+  const elsewhere = path.join(path.dirname(project), "elsewhere");
+  const other = onlyNotice(
+    await runCommand(host, `stats --since ${since} --until ${until} --project ${elsewhere} --sessions-dir ${dir}`),
+  ).message;
+  assert.match(other, /no session files matched this scope; every count is zero/);
+  host.shutdown();
+});
+
+test("extension: stats before the first session file explains itself", async () => {
+  const none = fakeHost("pi");
+  await none.prompt("explain this");
+  const absent = onlyNotice(await runCommand(none, "stats"));
+  assert.equal(absent.level, "info");
+  assert.match(absent.message, /^\[loadout\] stats: no session file yet\. /);
+  none.shutdown();
+
+  const file = path.join(sessionDir(), "session.jsonl");
+  const pending = fakeHost("pi", { sessionFile: file });
+  const asText = onlyNotice(await runCommand(pending, "stats"));
+  const asJson = onlyNotice(await runCommand(pending, "stats --json"));
+  assert.equal(asText.level, "info");
+  assert.equal(asJson.level, "info");
+  assert.match(asJson.message, /^\[loadout\] stats: no session file yet\. /);
+  assert.throws(() => JSON.parse(asJson.message));
+  assert.equal(fs.existsSync(file), false);
+  pending.shutdown();
+});
+
+test("extension: stats works while opted out", async () => {
+  const file = path.join(sessionDir(), "session.jsonl");
+  const first = fakeHost("pi", { sessionFile: file });
+  await first.prompt("explain this");
+  first.shutdown();
+  const before = fs.readFileSync(file, "utf8");
+
+  writeConfig({ telemetry: false });
+  const host = fakeHost("pi", { sessionFile: file });
+  const text = onlyNotice(await runCommand(host, "stats")).message;
+  assert.match(text, /^ {2}telemetry: off \(machine-off\) \| nothing from this process was stored \(0 suppressed\)/m);
+  assert.match(text, /^ {2}classifier calls \(loadout\.decision attempts; not model turns\): 1$/m);
+  assert.equal(host.entries.length, 0);
+  assert.equal(fs.readFileSync(file, "utf8"), before);
+  host.shutdown();
+});
+
+test("extension: selection controls and usage text are preserved", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  assert.notDeepEqual(host.active(), BASELINE);
+
+  await host.command("off");
+  assert.deepEqual(host.active(), BASELINE);
+  await host.prompt("explain that");
+  assert.equal(record(host).skip, "disabled");
+  assert.equal(requests.length, 1);
+
+  await host.command("on");
+  await host.prompt("explain once more");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(sorted(host.active()), sorted(ANSWER_SET));
+
+  const usage = onlyNotice(await runCommand(host, "bogus"));
+  assert.equal(usage.level, "warning");
+  assert.equal(usage.message, "[loadout] usage: /loadout [status|on|off|explain|stats]");
   host.shutdown();
 });

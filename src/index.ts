@@ -21,6 +21,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
+import { explainText, noticeText, type Observation, statsText, statusText } from "./diagnostics.ts";
 import {
   buildQuestions,
   decideSkills,
@@ -29,10 +30,12 @@ import {
   skillCandidates,
   skillsAskable,
 } from "./select.ts";
+import { runStats, type StatsResult, splitArgs } from "./stats.ts";
 import {
   type ApplicationStatus,
   buildDecisionRecord,
   DECISION_ENTRY,
+  type DecisionOutcome,
   type DecisionRecordV3,
   newId,
   type PersistResult,
@@ -43,7 +46,6 @@ import {
   type SkillDelivery,
   type SkipReason,
   settingsSnapshot,
-  type ToolsRecord,
   USAGE_ENTRY,
 } from "./telemetry.ts";
 import { errorText, runTurn, type TurnOutcome } from "./turn.ts";
@@ -53,7 +55,6 @@ import type {
   LoadoutConfig,
   SkillCandidate,
   SkillsDecision,
-  SkillsReason,
   TelemetryState,
 } from "./types.ts";
 import {
@@ -73,7 +74,7 @@ import {
 
 const PREFIX = "[loadout]";
 const COMMAND = "loadout";
-const SUBCOMMANDS = ["status", "on", "off", "explain"] as const;
+const SUBCOMMANDS = ["status", "on", "off", "explain", "stats"] as const;
 const HINT_MESSAGE = "loadout.skills";
 
 /** The parts of the prompt event this extension reads; `systemPromptOptions` is pi-only. */
@@ -102,8 +103,10 @@ interface SessionState {
   allowNarrow: boolean;
   /** Latest non-skipped record; a skip never replaces it. */
   lastRecord: DecisionRecordV3 | null;
-  /** Failure text of `lastRecord`; memory only, never persisted. */
-  lastMessage: string | null;
+  /** The latest hook call of any outcome, skips included. Memory only: what `/loadout explain` and `status` read. */
+  latest: Observation | null;
+  /** Records built by this process, by outcome. Memory only; a config reload keeps it. */
+  seen: Record<DecisionOutcome, number>;
   /** The latest record built, skips included; null when building it threw. */
   lastDecisionId: string | null;
   /** Run and decision links for usage observations; session-local, carried across config reloads. */
@@ -243,7 +246,8 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     baseline: existing?.baseline ?? null,
     lastApplied: existing?.lastApplied ?? null,
     lastRecord: existing?.lastRecord ?? null,
-    lastMessage: existing?.lastMessage ?? null,
+    latest: existing?.latest ?? null,
+    seen: existing?.seen ?? { classified: 0, failed: 0, skipped: 0 },
     lastDecisionId: existing?.lastDecisionId ?? null,
     usage: existing?.usage ?? createUsageTracker(),
     collection: existing?.collection ?? { handedOff: 0, suppressed: 0, failed: 0, lastFailure: null },
@@ -295,29 +299,6 @@ function refreshBaseline(pi: ExtensionAPI, state: SessionState): string[] {
 async function restoreBaseline(pi: ExtensionAPI, state: SessionState): Promise<"restored" | "unchanged" | null> {
   if (state.baseline === null || state.lastApplied === null) return null;
   return (await activateTools(pi, state, state.baseline)) ? "restored" : "unchanged";
-}
-
-function summarize(
-  tools: Pick<ToolsRecord, "active" | "profile" | "risk" | "reason">,
-  skills: { selected: string[] | null; reason: SkillsReason | null },
-  baselineSize: number,
-): string {
-  const toolPart =
-    tools.active === null
-      ? `tools: all (${tools.reason})`
-      : `tools: ${tools.profile} (risk ${tools.risk?.toFixed(2) ?? "-"}) -> ${tools.active.length}/${baselineSize}`;
-  const skillPart =
-    skills.selected === null
-      ? `skills: all (${skills.reason})`
-      : `skills: ${skills.selected.length > 0 ? skills.selected.join(", ") : "none"}`;
-  return `${toolPart} | ${skillPart}`;
-}
-
-function describe(record: DecisionRecordV3, message: string | null, baselineSize: number): string {
-  if (record.tools === null || record.skills === null) {
-    return `failed (${record.failure ?? "error"}): ${message ?? "no details kept"}`;
-  }
-  return summarize(record.tools, record.skills, baselineSize);
 }
 
 /** The user-facing reason a turn fell back to the baseline. */
@@ -438,12 +419,6 @@ async function runHook(
   }
 
   state.lastFailure = null;
-  notify(
-    ctx,
-    config,
-    `${config.dryRun ? "(dry run) " : ""}${summarize(decision.tools, decision.skills, baseline.length)}`,
-    "info",
-  );
   const selected = decision.skills.selected;
   if (config.dryRun) {
     trace.status = "dry-run";
@@ -525,18 +500,26 @@ function recordDecision(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionS
       },
     });
     state.lastDecisionId = record.decisionId;
-    if (record.outcome !== "skipped") {
-      state.lastRecord = record;
-      state.lastMessage = trace.message;
-    }
-    countRecord(
-      ctx,
-      state,
-      persistRecord((type, data) => pi.appendEntry(type, data), state.telemetry, DECISION_ENTRY, record),
-    );
+    if (record.outcome !== "skipped") state.lastRecord = record;
+    const stored = persistRecord((type, data) => pi.appendEntry(type, data), state.telemetry, DECISION_ENTRY, record);
+    state.latest = { record, message: trace.message, stored };
+    state.seen[record.outcome]++;
+    countRecord(ctx, state, stored);
   } catch {
     state.lastDecisionId = null;
+    state.latest = { record: null, message: trace.message, stored: { outcome: "failed", code: "error" } };
     countRecord(ctx, state, { outcome: "failed", code: "error" });
+  }
+}
+
+/** The per-turn notice, sent once the tools are applied and the record is built. Best effort, like `track`. */
+function announce(ctx: ExtensionContext, state: SessionState): void {
+  try {
+    const record = state.latest?.record;
+    const text = record ? noticeText(record, state.baseline?.length) : null;
+    if (text !== null) notify(ctx, state.config, text, "info");
+  } catch {
+    // A notice must not affect the turn.
   }
 }
 
@@ -581,72 +564,88 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
   }
   recordDecision(pi, ctx, state, trace);
   // The next run, or the next turn of an open one, belongs to this decision (null when none was built).
-  if (state) armDecision(state.usage, state.lastDecisionId);
+  if (state) {
+    armDecision(state.usage, state.lastDecisionId);
+    announce(ctx, state);
+  }
   return result;
 }
 
-function commandStatus(ctx: ExtensionContext, state: SessionState): void {
-  const { config, collection } = state;
-  const telemetry = state.telemetry.persist
-    ? `on | handed to host ${collection.handedOff} | failed ${collection.failed}${collection.lastFailure ? ` (${collection.lastFailure})` : ""}`
-    : `off (${state.telemetry.reason}) | suppressed ${collection.suppressed}`;
-  const lines = [
-    `${config.enabled ? "enabled" : "disabled"}${config.dryRun ? " (dry run)" : ""} | backend ${config.backend}`,
-    `config: ${state.source ?? "built-in defaults"}`,
-    `tools: ${config.tools.enabled ? `profiles ${Object.keys(config.tools.profiles).join(", ")}` : "off"} | skills: ${config.skills.enabled ? config.skills.mode : "off"}`,
-    `baseline tools: ${state.baseline?.join(", ") ?? "not captured yet"}`,
-    `last decision: ${state.lastRecord ? describe(state.lastRecord, state.lastMessage, state.baseline?.length ?? 0) : "none"}`,
-    `telemetry: ${telemetry}`,
-  ];
-  for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
+/** Command output: one notification, whatever the `notify` setting says, because the user asked. */
+function say(ctx: ExtensionContext, text: string, level: "info" | "warning"): void {
+  try {
+    ctx.ui.notify(text, level);
+  } catch {
+    // A headless host may have no UI.
+  }
 }
 
-function applicationLine(record: DecisionRecordV3): string {
-  const { application } = record;
-  const restore = application.restoration ? ` (restore: ${application.restoration})` : "";
-  const error = application.error ? ` [${application.error}]` : "";
-  return `application: ${application.status}${restore}${error} | actual tools: ${application.actualTools?.join(", ") ?? "unknown"}`;
+/** The host's current session file; undefined until the host has written one, or when it keeps none. */
+function sessionFileOf(ctx: ExtensionContext): string | undefined {
+  try {
+    const file = ctx.sessionManager.getSessionFile();
+    return typeof file === "string" && file !== "" ? file : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function commandExplain(ctx: ExtensionContext, state: SessionState): void {
-  const record = state.lastRecord;
-  if (!record) {
-    ctx.ui.notify(`${PREFIX} no decision yet`, "info");
-    return;
+type View = "status" | "explain" | "stats";
+
+function renderView(
+  ctx: ExtensionContext,
+  state: SessionState,
+  view: View,
+  args: string,
+): { text: string; level: "info" | "warning" } {
+  if (view === "status") {
+    const { config, source, scope, telemetry, collection, baseline, lastRecord, latest, seen } = state;
+    const modelTurns = state.usage.observed;
+    return {
+      text: statusText({
+        config,
+        source,
+        scope,
+        telemetry,
+        collection,
+        baseline,
+        lastRecord,
+        latest,
+        seen,
+        modelTurns,
+      }),
+      level: "info",
+    };
   }
-  const { tools, skills } = record;
-  const latency = `latency: ${record.classifier?.elapsedMs ?? "-"}ms`;
-  if (tools === null || skills === null) {
-    const baselineSize = state.baseline?.length ?? 0;
-    for (const line of [describe(record, state.lastMessage, baselineSize), latency, applicationLine(record)]) {
-      ctx.ui.notify(`${PREFIX} ${line}`, "info");
-    }
-    return;
+  if (view === "explain") {
+    const { latest, lastRecord, telemetry } = state;
+    return {
+      text: explainText({ latest, lastRecord, baselineSize: state.baseline?.length, telemetry }),
+      level: "info",
+    };
   }
-  const scores = Object.entries(skills.scores)
-    .sort(([, a], [, b]) => b - a)
-    .map(([name, score]) => `${name}=${score.toFixed(2)}`)
-    .join(", ");
-  const probabilities = Object.entries(tools.probabilities)
-    .sort(([, a], [, b]) => b - a)
-    .map(([name, p]) => `${name}=${p.toFixed(2)}`)
-    .join(", ");
-  const risks = tools.risks?.map(({ profile, risk }) => `${profile}=${risk?.toFixed(2) ?? "-"}`).join(" ");
-  const { ratchet } = record;
-  const lines = [
-    `tools: profile ${tools.profile ?? "-"} | risk ${tools.risk?.toFixed(2) ?? "-"} | reason ${tools.reason}`,
-    `profile probabilities: ${probabilities || "none"}`,
-    risks ? `risks: ${risks} (max ${tools.maxRisk.toFixed(2)})` : "risks: none",
-    `proposed: ${tools.active?.join(", ") ?? "baseline"}`,
-    ratchet
-      ? `ratchet: ${ratchet.before ?? "-"} -> ${ratchet.after ?? "-"} (${ratchet.admitted ? "admitted" : "blocked"}, narrowing ${ratchet.narrowAllowed ? "open" : "locked"})`
-      : "ratchet: none",
-    applicationLine(record),
-    `skills: reason ${skills.reason ?? "-"} | selected ${skills.selected?.join(", ") ?? "all"} | discovered ${skills.discovered} eligible ${skills.eligible} cap ${skills.maxCandidates} asked ${skills.asked}`,
-    `skill scores: ${scores || "none"}`,
-    latency,
-  ];
-  for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
+  const tokens = splitArgs(args.trim().slice(view.length));
+  const result: StatsResult =
+    tokens === null
+      ? { kind: "refused", level: "warning", text: `${PREFIX} stats: unterminated quote in the arguments` }
+      : runStats(tokens, sessionFileOf(ctx));
+  if (result.kind === "refused") return { text: result.text, level: result.level };
+  if (result.kind === "json") return { text: result.text, level: "info" };
+  const { telemetry, collection } = state;
+  return {
+    text: statsText({ summary: result.summary, compare: result.compare, telemetry, collection }),
+    level: "info",
+  };
+}
+
+/** `status`, `explain` and `stats`: one notification each. A failure becomes one warning and never reaches the host. */
+function showView(ctx: ExtensionContext, state: SessionState, view: View, args: string): void {
+  try {
+    const { text, level } = renderView(ctx, state, view, args);
+    say(ctx, text, level);
+  } catch (error) {
+    say(ctx, `${PREFIX} ${view}: failed: ${errorText(error)}`, "warning");
+  }
 }
 
 /** Usage bookkeeping for one lifecycle event: best effort, never throws into the host. */
@@ -747,10 +746,9 @@ export default function loadout(pi: ExtensionAPI): void {
       const subcommand = args.trim().split(/\s+/)[0] || "status";
       switch (subcommand) {
         case "status":
-          commandStatus(ctx, state);
-          return;
         case "explain":
-          commandExplain(ctx, state);
+        case "stats":
+          showView(ctx, state, subcommand, args);
           return;
         case "on":
           state.config.enabled = true;
