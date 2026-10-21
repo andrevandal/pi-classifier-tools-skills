@@ -1,142 +1,82 @@
 /**
- * Summarize `loadout.decision` entries across session transcripts: how often
- * each profile was picked, how much risk the classifier left, which skills it
- * selected, and what it cost in latency.
+ * The decision report as text: how often each profile was picked, how much risk the classifier left, which skills
+ * it selected and what it cost in latency. It reads through `src/report/`, so its scope rules are the CLI's: it takes
+ * the `loadout-report summary` flags (see `loadout-report --help`) plus `--json`, which prints the same JSON.
  *
- *   node scripts/decisions.ts [--folder <substr>] [--since 7d|24h|<ISO date>] [--sessions-dir <dir>] [--json]
+ *   node scripts/decisions.ts --since <ISO> --until <ISO> (--project <path> | --all-projects) [--sessions-dir <dir>]
+ *   node scripts/decisions.ts --session <file>
  */
 
-import * as fs from "node:fs";
-import { parseArgs } from "node:util";
+import { buildSummary, parseArgv, USAGE } from "../src/report/report.ts";
+import type { Count, Stats, Summary } from "../src/report/summary.ts";
 
-import {
-  type Decision,
-  defaultSessionsDir,
-  listSessionFiles,
-  metricsFor,
-  percentile,
-  sessionCwd,
-} from "./lib/sessions.ts";
+const fixed = (n: number | null, digits = 2): string => (n === null ? "-" : n.toFixed(digits));
 
-const { values } = parseArgs({
-  options: {
-    folder: { type: "string" },
-    since: { type: "string" },
-    "sessions-dir": { type: "string", default: defaultSessionsDir() },
-    json: { type: "boolean", default: false },
-    help: { type: "boolean", short: "h", default: false },
-  },
-});
+function render(summary: Summary): string {
+  const { decisions, classifier, coverage } = summary;
+  const attempts = classifier.attempts;
+  const pct = (n: number): string => `${((n * 100) / Math.max(attempts, 1)).toFixed(0)}%`;
+  const table = (counts: Count): string =>
+    Object.entries(counts)
+      .map(([key, count]) => `  ${key.padEnd(24)} ${String(count).padStart(5)}  ${pct(count)}`)
+      .join("\n") || "  (none)";
+  const skipped = Object.entries(decisions.skips)
+    .map(([reason, n]) => `${reason} ${n}`)
+    .join(", ");
 
-if (values.help) {
-  console.log(
-    "usage: node scripts/decisions.ts [--folder <substr>] [--since 7d|24h|<ISO>] [--sessions-dir <dir>] [--json]",
-  );
-  process.exit(0);
-}
-
-function parseSince(value: string | undefined): number | null {
-  if (!value) return null;
-  const relative = /^(\d+)([hd])$/.exec(value);
-  if (relative) return Date.now() - Number(relative[1]) * (relative[2] === "d" ? 86_400_000 : 3_600_000);
-  const absolute = Date.parse(value);
-  if (Number.isNaN(absolute)) throw new Error(`--since: expected 7d, 24h or an ISO date, got "${value}"`);
-  return absolute;
-}
-
-const since = parseSince(values.since);
-const files = listSessionFiles(values["sessions-dir"]!).filter((file) => {
-  if (since !== null && fs.statSync(file).mtimeMs < since) return false;
-  if (!values.folder) return true;
-  return (sessionCwd(file) ?? file).includes(values.folder);
-});
-const metrics = metricsFor(files);
-
-function countBy<T>(items: T[], key: (item: T) => string | string[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const item of items) {
-    for (const value of [key(item)].flat()) counts[value] = (counts[value] ?? 0) + 1;
+  const lines = [`loadout decisions: ${attempts} in ${decisions.sessions} sessions (${decisions.dryRun.yes} dry run)`];
+  if (skipped) lines.push(`skipped: ${skipped}`);
+  if (coverage.unsupported.decisions > 0) {
+    lines.push(`unsupported records: ${coverage.unsupported.decisions} (unknown version or shape; not counted above)`);
   }
-  return Object.fromEntries(Object.entries(counts).sort(([, a], [, b]) => b - a));
+  if (attempts === 0) {
+    lines.push("no loadout.decision attempts matched; check the scope and the filters");
+    return lines.join("\n");
+  }
+
+  const { proposals, application, skills } = decisions;
+  const risk: Stats = proposals.risk;
+  const latency = decisions.latencyMs;
+  lines.push(`\ntool profile\n${table(proposals.profiles)}`);
+  lines.push(`\ntool reason\n${table(proposals.reasons)}`);
+  lines.push(`\nfailures\n${table(decisions.failures)}`);
+  lines.push(
+    `\nrisk p10/p50/p90: ${fixed(risk.p10)} / ${fixed(risk.p50)} / ${fixed(risk.p90)}` +
+      ` | kept baseline ${((proposals.keepBaseline * 100) / Math.max(proposals.tools, 1)).toFixed(0)}%` +
+      ` | mean tools proposed when narrowing ${fixed(proposals.proposedTools.mean, 1)}`,
+  );
+  lines.push(`\napplication status\n${table(application.statuses)}`);
+  lines.push(`\nskill reason\n${table(skills.reasons)}`);
+  lines.push(`\nskills selected (per decision)\n${table(skills.selected)}`);
+  lines.push(
+    `\nclassifier latency p50/p90/max: ${fixed(latency.p50, 0)} / ${fixed(latency.p90, 0)} / ${fixed(latency.max, 0)} ms`,
+  );
+  if (coverage.duplicatesRemoved.decisions > 0) {
+    lines.push(`\nnote: ${coverage.duplicatesRemoved.decisions} duplicate decision records removed (copied sessions)`);
+  }
+  if (coverage.unidentifiable.decisions > 0) {
+    lines.push(
+      `note: ${coverage.unidentifiable.decisions} v2 decision records have no event id and cannot be deduplicated`,
+    );
+  }
+  return lines.join("\n");
 }
 
-function summarize(all: Decision[], unsupported: number) {
-  const list = all.filter((d) => d.outcome !== "skipped");
-  const decided = list.flatMap((d) => (d.tools === null ? [] : [d.tools]));
-  const risks = decided.flatMap((t) => (t.risk === null ? [] : [t.risk]));
-  const narrowed = decided.flatMap((t) => (t.active === null ? [] : [t.active]));
-  const latencies = list.flatMap((d) => (d.latencyMs === null ? [] : [d.latencyMs]));
-  return {
-    decisions: list.length,
-    sessions: new Set(list.map((d) => d.file)).size,
-    dryRun: list.filter((d) => d.dryRun === true).length,
-    failures: countBy(
-      list.flatMap((d) => (d.failure === null ? [] : [d.failure])),
-      (reason) => reason,
-    ),
-    toolProfiles: countBy(list, (d) => d.tools?.profile ?? "(none)"),
-    toolReasons: countBy(list, (d) => d.tools?.reason ?? "failed"),
-    keptBaselineRate:
-      decided.length === 0 ? 0 : decided.filter((t) => t.reason === "low-confidence").length / decided.length,
-    risk: {
-      p10: percentile(risks, 10),
-      p50: percentile(risks, 50),
-      p90: percentile(risks, 90),
-    },
-    avgActiveTools: narrowed.length === 0 ? null : narrowed.reduce((s, a) => s + a.length, 0) / narrowed.length,
-    skillReasons: countBy(list, (d) => d.skills?.reason ?? "failed"),
-    skillsSelected: countBy(
-      list.flatMap((d) => (d.skills?.selected ? [d.skills.selected] : [])),
-      (selected) => (selected.length > 0 ? selected : ["(none)"]),
-    ),
-    latencyMs: { p50: percentile(latencies, 50), p90: percentile(latencies, 90), max: Math.max(...latencies, 0) },
-    skipped: countBy(
-      all.filter((d) => d.outcome === "skipped"),
-      (d) => d.skip ?? "(unknown)",
-    ),
-    unsupported,
-  };
+function main(argv: string[]): number {
+  const json = argv.includes("--json");
+  const result = parseArgv(["summary", ...argv.filter((arg) => arg !== "--json")]);
+  if (!result.ok) {
+    console.error(`decisions: ${result.message}`);
+    return 2;
+  }
+  if (result.parsed.kind !== "run") {
+    console.log(`usage: node scripts/decisions.ts <loadout-report summary flags> [--json]\n\n${USAGE}`);
+    return 0;
+  }
+  const summary = buildSummary(result.parsed.spec);
+  if (summary.scope.files === 0) console.error("decisions: warning: no session files matched the scope");
+  console.log(json ? JSON.stringify(summary, null, 2) : render(summary));
+  return 0;
 }
 
-const inRange = metrics.decisions.filter((d) => since === null || Date.parse(d.timestamp ?? "") >= since);
-const report = summarize(inRange, metrics.unsupportedDecisions);
-
-if (values.json) {
-  console.log(JSON.stringify(report, null, 2));
-  process.exit(0);
-}
-
-const pct = (n: number) => `${(n * 100).toFixed(0)}%`;
-const fixed = (n: number | null, digits = 2) => (n === null || Number.isNaN(n) ? "-" : n.toFixed(digits));
-const table = (counts: Record<string, number>) =>
-  Object.entries(counts)
-    .map(
-      ([key, count]) =>
-        `  ${key.padEnd(24)} ${String(count).padStart(5)}  ${pct(count / Math.max(report.decisions, 1))}`,
-    )
-    .join("\n") || "  (none)";
-
-console.log(`loadout decisions: ${report.decisions} in ${report.sessions} sessions (${report.dryRun} dry run)`);
-const skippedText = Object.entries(report.skipped)
-  .map(([reason, n]) => `${reason} ${n}`)
-  .join(", ");
-if (skippedText) console.log(`skipped: ${skippedText}`);
-if (report.unsupported > 0) {
-  console.log(`unsupported records: ${report.unsupported} (unknown version or shape; not counted above)`);
-}
-if (report.decisions === 0) {
-  console.log("no loadout.decision entries matched; check --sessions-dir, --folder and --since");
-  process.exit(0);
-}
-console.log(`\ntool profile\n${table(report.toolProfiles)}`);
-console.log(`\ntool reason\n${table(report.toolReasons)}`);
-console.log(`\nfailures\n${table(report.failures)}`);
-console.log(
-  `\nrisk p10/p50/p90: ${fixed(report.risk.p10)} / ${fixed(report.risk.p50)} / ${fixed(report.risk.p90)}` +
-    ` | kept baseline (low-confidence) ${pct(report.keptBaselineRate)} | avg active tools when narrowed ${fixed(report.avgActiveTools, 1)}`,
-);
-console.log(`\nskill reason\n${table(report.skillReasons)}`);
-console.log(`\nskills selected (per decision)\n${table(report.skillsSelected)}`);
-console.log(
-  `\nclassifier latency p50/p90/max: ${report.latencyMs.p50} / ${report.latencyMs.p90} / ${report.latencyMs.max} ms`,
-);
+process.exitCode = main(process.argv.slice(2));

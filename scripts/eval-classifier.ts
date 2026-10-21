@@ -20,7 +20,7 @@ import { parseConfig } from "../src/config.ts";
 import { buildQuestions, clipPrompt, pickProfile, profileOrder, TOOLS_QUESTION_ID } from "../src/select.ts";
 import type { Classifier, LoadoutConfig } from "../src/types.ts";
 import { errorText } from "../src/turn.ts";
-import { defaultSessionsDir, listSessionFiles } from "./lib/sessions.ts";
+import { defaultSessionsDir, listSessionFiles } from "../src/report/read.ts";
 
 const USAGE = `usage: node scripts/eval-classifier.ts --labels <jsonl> [--config <json>] [--json]
        node scripts/eval-classifier.ts --mine --out <jsonl> [--sessions-dir <dir>] [--since 30d]

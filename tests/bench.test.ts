@@ -11,7 +11,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cacheRate, metricsFor, promptTokensPerRequest } from "../scripts/lib/sessions.ts";
+import { readSessions } from "../src/report/read.ts";
+import { cacheRate, promptTokensPerRequest, type Summary, transcriptTotals } from "../src/report/summary.ts";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FAKE_OMP = path.join(ROOT, "tests", "fixtures", "fake-omp.mjs");
@@ -129,19 +130,33 @@ test("decisions reports profiles, failures and skills across sessions", () => {
     ],
     { FAKE_SESSIONS_DIR: ctx.sessions },
   );
-  const result = runScript("decisions.ts", ["--sessions-dir", ctx.sessions, "--json"], {});
+  const day = 86_400_000;
+  const window = [
+    ...["--since", new Date(Date.now() - day).toISOString()],
+    ...["--until", new Date(Date.now() + day).toISOString()],
+  ];
+  const result = runScript("decisions.ts", ["--sessions-dir", ctx.sessions, ...window, "--all-projects", "--json"], {});
   assert.equal(result.status, 0, result.stderr);
-  const report = JSON.parse(result.stdout);
-  assert.equal(report.decisions, 4);
-  assert.deepEqual(report.skipped, { command: 4 });
-  assert.equal(report.unsupported, 0);
-  assert.equal(report.dryRun, 2);
-  assert.deepEqual(report.toolProfiles, { answer: 4 });
-  assert.deepEqual(report.skillsSelected, { pdf: 4 });
-  assert.deepEqual(report.failures, {});
+  const report: Summary = JSON.parse(result.stdout);
+  assert.equal(report.classifier.attempts, 4);
+  assert.deepEqual(report.decisions.skips, { command: 4 });
+  assert.equal(report.coverage.unsupported.decisions, 0);
+  assert.equal(report.decisions.dryRun.yes, 2);
+  assert.deepEqual(report.decisions.proposals.profiles, { answer: 4 });
+  assert.deepEqual(report.decisions.skills.selected, { pdf: 4 });
+  assert.deepEqual(report.decisions.failures, {});
+  assert.deepEqual(report.decisions.application.statuses, { applied: 2, "dry-run": 2 });
+  assert.deepEqual(Object.values(report.coverage.removedByFilters.decisions), [0, 0, 0, 0]);
 
-  const filtered = runScript("decisions.ts", ["--sessions-dir", ctx.sessions, "--folder", "wt-control", "--json"], {});
-  assert.equal(JSON.parse(filtered.stdout).decisions, 2);
+  const control = path.join(fs.realpathSync(ctx.out), "wt-control");
+  const filtered = runScript(
+    "decisions.ts",
+    ["--sessions-dir", ctx.sessions, ...window, "--project", control, "--json"],
+    {},
+  );
+  assert.equal(filtered.status, 0, filtered.stderr);
+  const scoped: Summary = JSON.parse(filtered.stdout);
+  assert.equal(scoped.classifier.attempts, 2);
 });
 
 test("bench refuses to run when the machine opts out of telemetry", () => {
@@ -194,14 +209,15 @@ test("session metrics sum usage, tool calls and cache rate", () => {
       "{ truncated",
     ].join("\n"),
   );
-  const metrics = metricsFor([file]);
+  const read = readSessions([file]);
+  const totals = transcriptTotals(read.turns, read.toolResults);
   assert.deepEqual(
-    [metrics.requests, metrics.errors, metrics.input, metrics.cacheRead, metrics.toolErrors],
+    [totals.turns, totals.outcomes.error, totals.tokens.input.sum, totals.tokens.cacheRead.sum, totals.toolErrors],
     [1, 1, 100, 300, 1],
   );
-  assert.deepEqual(metrics.toolCalls, { bash: 1 });
-  assert.equal(cacheRate(metrics), 300 / 405);
-  assert.equal(promptTokensPerRequest(metrics), 405);
+  assert.deepEqual(totals.toolCalls.byTool, { bash: 1 });
+  assert.equal(cacheRate(totals.tokens), 300 / 405);
+  assert.equal(promptTokensPerRequest(totals), 405);
 });
 
 test("bench refuses to run without --model, so the arms cannot differ in model", () => {
