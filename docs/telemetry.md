@@ -83,7 +83,7 @@ Durations are milliseconds. Lengths are characters (JS string length). Counts ar
 - `requestId`: a UUIDv4 *offered to the transport*, generated only when persisting and a request is actually issued. A record carries it even when the transport failed before sending (for example an unset Jev token). Only the Laya HTTP transport may forward it, and none does until #4.
 - `sessionId`: the host's id, or null.
 
-`classifier.status` is the HTTP status of a failed call; null on success and for non-HTTP transports. `classifier.server` and `status` stay null until #4 fills them.
+`classifier.status` is the HTTP status of a failed call: the Laya and Jev HTTP transports set it for any response that arrived, including a 200 whose body was unusable. It is null on success, when no response arrived (timeout, abort, transport failure) and for non-HTTP transports. `classifier.server` holds the `queue` and `infer` times, in ms, that the Laya HTTP server reported in its `Server-Timing` header (section 8). It is null for every other transport and whenever the server sent none (an older server, an opted-out request, a rejected or unparsable request). Inside `server`, a phase the server did not report is null, never 0.
 
 ## 7. Durability
 
@@ -111,16 +111,32 @@ Defined here, with normalizers (`normalizeUsage`, `normalizeHttp`); nothing prod
 | `costTotal`, `toolCalls` (name to count), `toolErrors`, `errorStatus` | totals for the message |
 | `retryAttempt` | informational only |
 
-`loadout.http` v1, one per Laya HTTP server request:
+`loadout.http` v1, one per `POST` to the Laya HTTP server (`python/laya_http_server.py`), written as one JSON line on the server's stderr. That is the server's existing log (the journal under systemd), not a new file or datastore. `GET` health checks write no line.
 
 | field | meaning |
 | --- | --- |
 | `type`, `v` | `loadout.http`, `1` |
-| `requestId`, `idStatus` | the `X-Request-Id`; `idStatus` is `valid`, `absent` or `invalid`, and is derived from the id on read |
-| `at` | UTC ISO timestamp |
-| `outcome` | `ok` `client-gone` `error` `rejected`. `ok` means the write did not raise, not that it was delivered. Never infer a timeout from EPIPE |
-| `status`, `queueMs`, `inferenceMs`, `totalMs` | from the response and `Server-Timing` (`queue`, `infer`); Laya only |
-| `errorClass` | `^[A-Za-z][A-Za-z0-9_]{0,63}$` or null |
+| `requestId`, `idStatus` | `requestId` is the `X-Request-Id` header when the request carried exactly one and it is a lowercase UUIDv4 (`idStatus` `valid`). Otherwise it is null and `idStatus` is `absent` (no header) or `invalid` (anything else, including a repeated header); an invalid value is never copied. `idStatus` is derived from the id on read |
+| `at` | UTC ISO timestamp with milliseconds: when the line was written, after the answer write was attempted |
+| `outcome` | `ok`: a 2xx answer was written and the write did not raise. `rejected`: the server refused the request itself (`401` unauthorized, `413` body over 1 MiB). `error`: the answer was a 5xx, an exception while reading, parsing or predicting. `client-gone`: writing the answer raised a connection error. `ok` is not delivery: a peer that closed cleanly often still accepts the write, so an abandoned request can read `ok`. Never infer a timeout from the outcome |
+| `status` | the HTTP status the server chose to send; for `client-gone` it may never have arrived |
+| `queueMs` | milliseconds waiting for the server's single prediction lock; null when the request never reached it |
+| `inferenceMs` | milliseconds holding that lock, until the model answered or raised (a failed inference still reports it); null when the request never reached it |
+| `totalMs` | milliseconds from the start of handling (request line and headers already read) to the end of the write attempt; always present |
+| `errorClass` | a class name matching `^[A-Za-z][A-Za-z0-9_]{0,63}$`, never its text: the exception behind an `error`, the connection error behind a `client-gone`; null otherwise |
+
+Durations come from `time.monotonic()` and carry three decimals. A phase that was not measured is null, never 0. Lines appear in the order handlers finish, not the order requests arrived.
+
+Headers (Laya HTTP transport only; Jev and the python sidecar neither send nor read them):
+
+- `X-Request-Id` (request): the plugin's `classifier.requestId`, which it generates only when it persists records.
+- `Server-Timing` (response): `queue;dur=<ms>, infer;dur=<ms>`, only for the phases that were measured. A 5xx after a failed inference carries both; a rejection or an early failure (bad JSON, bad length) carries none. The plugin keeps `queue` and `infer`, ignores any other metric, and treats a repeated or malformed one as unknown (`classifier.server`, section 6).
+
+Opt-out. A plugin that does not persist records (any reason in section 3) sends `X-Loadout-Telemetry: off` and no `X-Request-Id`. The server also takes `--no-telemetry`. In both cases the request gets no line and no `Server-Timing` header. The server fails closed: any `X-Loadout-Telemetry` value other than `on` counts as off. Opting out never touches the server's ordinary error output, and nothing already written is deleted.
+
+Reading the evidence. A client timeout is recorded by the client (`failure`, `elapsedMs`, `budgetMs`, `guardFired`); the server line joins it through `requestId`, and `queueMs` shows whether the request spent its time waiting behind another. The server has no deadline and notices a disconnect only when it writes the answer, so an abandoned request still runs its inference and its line says `ok` or `client-gone`; neither says why the client left. Under systemd: `journalctl --user -u laya-server -o cat | grep '"type":"loadout.http"'`.
+
+Never logged: bodies, prompts, answers, tokens, headers other than the two named, URLs, and exception text.
 
 ## 9. Versioning
 
