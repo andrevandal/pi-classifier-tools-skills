@@ -12,16 +12,21 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type {
-  ApplicationRecord,
-  ClassifierEvidence,
-  DecisionRecordV3,
-  HttpServerRecordV1,
-  RatchetRecord,
-  SafeSettings,
-  SkillsRecord,
-  ToolsRecord,
-  UsageObservationV1,
+import { readServiceLogs, readSessions } from "../../src/report/read.ts";
+import { applyFilters, type FilterSpec, NO_FILTERS, type ScopeSpec, selectFiles } from "../../src/report/scope.ts";
+import type { ReportInput } from "../../src/report/summary.ts";
+import {
+  type ApplicationRecord,
+  type ClassifierEvidence,
+  DECISION_ENTRY,
+  type DecisionRecordV3,
+  type HttpServerRecordV1,
+  type RatchetRecord,
+  type SafeSettings,
+  type SkillsRecord,
+  type ToolsRecord,
+  USAGE_ENTRY,
+  type UsageObservationV1,
 } from "../../src/telemetry.ts";
 
 export const T0 = "2026-10-10T00:00:00.000Z";
@@ -294,4 +299,194 @@ export function serviceLog(file: string, opts: { withoutR2?: boolean } = {}): st
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${lines.join("\n")}\n`);
   return file;
+}
+
+export const BASE7 = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+export const SIX = ["read", "grep", "find", "ls", "edit", "write"];
+
+/**
+ * Fixture M: one session (header `sess-M`, cwd `/p/one`) holding ten decision records one minute apart: two v2
+ * (one failed) and eight v3 covering a plain apply, a dry run, a low-confidence answer, a refused narrowing, a
+ * failed attempt, a skip, a failed apply and a candidate-limit.
+ */
+export function writeMixed(dir: string): { file: string } {
+  const decision = (n: number, over: Partial<DecisionRecordV3> = {}): Record<string, unknown> =>
+    custom(DECISION_ENTRY, decisionV3({ eventId: uuid(n), decisionId: uuid(200 + n), ...over }));
+  const records = [
+    custom(DECISION_ENTRY, decisionV2({ message: "CANARY_V2_MESSAGE" })),
+    custom(
+      DECISION_ENTRY,
+      decisionV2({
+        failure: "timeout",
+        message: "CANARY_V2_FAILURE",
+        latencyMs: 4300,
+        tools: null,
+        skills: null,
+        applied: null,
+      }),
+    ),
+    decision(3, {
+      classifier: classifier({
+        requestId: R1,
+        elapsedMs: 50,
+        usage: { inputTokens: 41, outputTokens: 3 },
+        server: { queueMs: 5, inferenceMs: 40 },
+      }),
+    }),
+    decision(4, {
+      settings: settings({ dryRun: true }),
+      classifier: classifier({ elapsedMs: 60 }),
+      tools: tools({
+        profile: "edit",
+        active: SIX,
+        risk: 0.02,
+        probabilities: { answer: 0.02, edit: 0.96, full: 0.02 },
+      }),
+      application: application({ status: "dry-run", actualTools: BASE7 }),
+    }),
+    decision(5, {
+      classifier: classifier({ elapsedMs: 70 }),
+      tools: tools({
+        reason: "low-confidence",
+        profile: "full",
+        active: null,
+        probabilities: { answer: 0.42, edit: 0.31, full: 0.27 },
+        risk: null,
+        risks: [
+          { profile: "answer", risk: 0.58 },
+          { profile: "edit", risk: 0.27 },
+        ],
+        maxRisk: 0.1,
+      }),
+      ratchet: ratchet({ after: "full" }),
+      application: application({ status: "unchanged", actualTools: BASE7 }),
+    }),
+    decision(6, {
+      classifier: classifier({ elapsedMs: 80 }),
+      ratchet: ratchet({ narrowAllowed: false, before: "full", after: "full", admitted: false }),
+      application: application({ status: "not-admitted", actualTools: BASE7 }),
+    }),
+    decision(7, {
+      outcome: "failed",
+      failure: "timeout",
+      classifier: classifier({ requestId: R2, elapsedMs: 3250, guardFired: true }),
+      tools: null,
+      skills: skills({ reason: null }),
+      ratchet: null,
+      application: application({ status: "not-attempted", actualTools: BASE7 }),
+    }),
+    decision(8, {
+      outcome: "skipped",
+      skip: "command",
+      classifier: null,
+      tools: null,
+      skills: null,
+      ratchet: null,
+      application: application({ status: "restored", restoration: "restored", actualTools: BASE7 }),
+    }),
+    decision(9, {
+      classifier: classifier({ elapsedMs: 90 }),
+      tools: tools({ profile: "edit", active: SIX, risk: 0.02 }),
+      application: application({ status: "failed", restoration: "restored", actualTools: BASE7, error: "EIO" }),
+    }),
+    decision(10, {
+      classifier: classifier({ elapsedMs: 100 }),
+      skills: skills({ reason: "too-many-candidates", discovered: 50, eligible: 50, maxCandidates: 40 }),
+    }),
+  ];
+  const file = writeSession(path.join(dir, "mixed.jsonl"), [
+    header({ id: "sess-M", cwd: "/p/one" }),
+    ...chain(records),
+  ]);
+  return { file };
+}
+
+/**
+ * Fixture U: five usage records (header `sess-U`, cwd `/p/two`): a stop, a tool use with two tools and a tool error,
+ * a 529 error on its first retry, a stop on its second retry, and an abort. Records 1 and 2 belong to decision
+ * `uuid(201)`; the first four share run `uuid(900)`, the last is run `uuid(901)`. `fork` is a verbatim copy with
+ * header `sess-U2`.
+ */
+export function writeUsageHistory(dir: string): { file: string; fork: string } {
+  const none = { input: null, output: null, cacheRead: null, cacheWrite: null, reasoning: null };
+  const rows: Array<Partial<UsageObservationV1>> = [
+    {
+      decisionId: uuid(201),
+      stopReason: "stop",
+      tokens: { input: 10, output: 5, cacheRead: 100, cacheWrite: 0, reasoning: null },
+      costTotal: 0.001,
+      toolErrors: 0,
+    },
+    {
+      decisionId: uuid(201),
+      stopReason: "toolUse",
+      tokens: { input: 20, output: 8, cacheRead: 100, cacheWrite: 0, reasoning: 3 },
+      costTotal: 0.002,
+      toolCalls: { read: 2, bash: 1 },
+      toolErrors: 1,
+    },
+    { stopReason: "error", tokens: none, errorStatus: 529, retryAttempt: 1 },
+    {
+      stopReason: "stop",
+      tokens: { input: 30, output: 9, cacheRead: 120, cacheWrite: 10, reasoning: null },
+      costTotal: 0.003,
+      toolCalls: { edit: 1 },
+      toolErrors: 0,
+      retryAttempt: 2,
+    },
+    {
+      runId: uuid(901),
+      stopReason: "aborted",
+      tokens: { input: 5, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: null },
+    },
+  ];
+  const entries = (id: string): Array<Record<string, unknown>> => [
+    header({ id, cwd: "/p/two" }),
+    ...chain(rows.map((row, i) => custom(USAGE_ENTRY, usageV1({ eventId: uuid(501 + i), ...row })))),
+  ];
+  return {
+    file: writeSession(path.join(dir, "usage.jsonl"), entries("sess-U")),
+    fork: writeSession(path.join(dir, "usage-fork.jsonl"), entries("sess-U2")),
+  };
+}
+
+/**
+ * Fixture V: a user message `u1` with two assistant replies, `a1` (input 10) and `a2` (input 20), each followed by a
+ * usage record (`c1`, `c2`); the leaf is `c2`, so `a1` and `c1` sit on an abandoned branch.
+ */
+export function writeBranches(dir: string): { file: string } {
+  const reply = (input: number): Record<string, unknown> =>
+    assistantMessage({ usage: { input, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } } });
+  const link = (entry: Record<string, unknown>, id: string, parentId: string | null, minute: number) => ({
+    ...entry,
+    id,
+    parentId,
+    timestamp: new Date(Date.parse(T0) + minute * 60_000).toISOString(),
+  });
+  const file = writeSession(path.join(dir, "branches.jsonl"), [
+    header({ id: "sess-V", cwd: "/p/three" }),
+    link(userMessage("synthetic prompt"), "u1", null, 1),
+    link(reply(10), "a1", "u1", 2),
+    link(custom(USAGE_ENTRY, usageV1({ eventId: uuid(521), sessionId: "sess-V" })), "c1", "a1", 3),
+    link(reply(20), "a2", "u1", 4),
+    link(custom(USAGE_ENTRY, usageV1({ eventId: uuid(522), sessionId: "sess-V" })), "c2", "a2", 5),
+  ]);
+  return { file };
+}
+
+/** What the summary and export take: select, read and filter as `buildSummary` does, without the CLI. */
+export function reportInput(
+  files: string[],
+  opts: { filters?: FilterSpec; serviceLogs?: string[]; scope?: ScopeSpec } = {},
+): ReportInput {
+  const scope: ScopeSpec = opts.scope ?? { kind: "session", files };
+  const filters = opts.filters ?? NO_FILTERS;
+  const selection = selectFiles(scope);
+  return {
+    scope,
+    selection,
+    filters,
+    filtered: applyFilters(readSessions(selection.files), scope, filters),
+    service: opts.serviceLogs === undefined ? null : readServiceLogs(opts.serviceLogs),
+  };
 }
