@@ -39,7 +39,7 @@ flowchart LR
   another extension change tools mid-session, that becomes the new baseline.
 - **"Don't know" keeps everything.** When no profile's risk is within `tools.maxRisk`,
   the answer is missing, or too many skills are candidates, all tools or all skills stay.
-- **Every prompt it sees is recorded unless you opt out.** With telemetry on (the default) each prompt the host hands the plugin becomes one content-free `loadout.decision` session entry — skips and failures included — written after tools were applied. See [Telemetry](#telemetry).
+- **Every prompt it sees is recorded unless you opt out.** With telemetry on (the default) each prompt the host hands the plugin becomes one content-free `loadout.decision` session entry — skips and failures included — written after tools were applied, and each observed model turn becomes one `loadout.usage` entry. See [Telemetry](#telemetry).
 
 ## Quick start
 
@@ -106,8 +106,8 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `enabled` | `true` | classify prompts at all |
 | `backend` | `"laya"` | `"laya"` (local sidecar by default, or a shared host via `laya.transport: "http"`) or `"jev"` |
 | `dryRun` | `false` | classify and record, never change anything |
-| `notify` | `true` | show a one-line decision per turn; errors always show |
-| `telemetry` | `true` | write `loadout.decision` entries; `false` writes none. A machine-wide `false` in `~/.omp/loadout.*` cannot be overridden (see [Telemetry](#telemetry)) |
+| `notify` | `true` | show a one-line notice per classified turn, after the tools were applied (skips get none); failures always show |
+| `telemetry` | `true` | write the plugin's trace records (`loadout.decision`, `loadout.usage`); `false` writes none. A machine-wide `false` in `~/.omp/loadout.*` cannot be overridden (see [Telemetry](#telemetry)) |
 | `maxPromptChars` | `8000` | longest prompt sent to the classifier (min 200; `null` = no limit) |
 | `tools.enabled` | `true` | select tools |
 | `tools.question` | `answer` / `edit` / `full` choice | the `choice` question; its options are the profile ids |
@@ -146,29 +146,140 @@ See [`examples/loadout.json`](examples/loadout.json) for an omp config with a
 
 ## Command
 
-`/loadout [status|explain|on|off]`
+`/loadout [status|explain|stats|on|off]`. With no argument it runs `status`. `status`, `explain` and `stats` each send one notification: a block of text whose first line is `[loadout] <title>`. With `stats --json` or `stats export` the notification is the JSON document alone. That notification is shown even with `notify: false`. A usage error (an unknown subcommand, a bad `stats` argument) sends one warning. In print mode (`-p`) the host has no UI, so none of this output is shown.
 
-- `status`: config source, baseline tools, last decision, telemetry state.
-- `explain`: last decision in full: per-profile risks, the proposal versus the tools actually active, skill counts and scores.
-- `on` / `off`: toggle for this session; `off` restores the baseline.
+- `status`: the settings in effect, the baseline tools, the last decision, the telemetry state and this session's counts. It prints no endpoint, environment variable name, Python path, repository or question text; `config:` shows where the settings came from.
+- `explain`: the latest invocation in full: the outcome, the risk of each narrower profile, the proposal against the tools the host had afterwards, the ratchet, the skills and the classifier's evidence.
+- `stats`: the figures of the session files (see below).
+- `on` / `off`: toggle selection for this session; `off` restores the baseline.
+
+`status` and `explain` read this process's memory only: they cover this session in this process and never read a file. `stats` reads session files through the same library as [`loadout-report`](#reporting-loadout-report), so it counts what is on disk, which can differ from what this process handed to the host.
+
+### `status`
+
+```text
+[loadout] status
+  selection: enabled | dry run off | notices on
+  classifier: laya (http) | timeout 4000 ms
+  config: ~/.omp/loadout.json (global)
+  tools: profiles answer, edit, full (max risk 0.10) | skills: off
+  baseline tools: read, bash, edit, eval, glob, grep, task, wait, todo, web_search, write, ast_edit, debug, lsp (14)
+  last decision: applied answer (tools 6 of 14)
+  telemetry: on (default) | records handed to host 10 | failed 0
+  this session: prompts observed 5 (classified 4, failed 0, skipped 1) | model turns observed 5 | memory only, this session in this process
+  not included: child and subagent sessions (each has its own plugin instance and records)
+```
+
+### `explain`
+
+Before the first prompt, `explain` says `[loadout] explain: nothing observed yet in this process`. The block below is the latest invocation of a dry run whose answer was low confidence and whose skills were over the candidate limit:
+
+```text
+[loadout] explain: latest invocation
+  source: in memory | record handed to host
+  outcome: dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked
+  tools: low confidence, no profile within max risk 0.10
+    answer: p 0.55, risk 0.45 > 0.10
+    edit: p 0.30, risk 0.15 > 0.10
+    full: p 0.15 (broadest, the baseline)
+  proposal: keep all tools (baseline)
+  ratchet: - -> full (admitted, narrowing open)
+  application: dry-run | actual tools: read, bash, edit, eval, glob, grep, task, wait, todo, web_search, write, ast_edit, debug, lsp (14)
+  blocked: dry run, low confidence, skills over the candidate limit
+  skills: 3 eligible > limit 2 (discovered 3): none asked, all skills kept
+  classifier: 1 question (tools 1, skills 0) | prompt 30 chars, sent 30 (not clipped) | model smoke-stub-1 | tokens in 41, out 3
+  timing: 6 ms of 4250 ms budget (timeout 4000 ms), guard not fired
+  server: not reported | request 9ecd2f18-32eb-4ddd-86a9-9b2288244e93
+  settings then: dry run on | max risk 0.10 | laya (http) | skills auto | config global
+```
+
+### `stats`
+
+`/loadout stats [summary|export] [--json] [scope] [filters]`. `summary` (the default) prints the figures, and `export` prints the events behind them.
+
+- **Default scope:** the host's current session file. The host writes it with the first assistant message, so before the first reply, or in a session that keeps no file, `stats` sends one info line that says there is no session file yet.
+- **Scope:** `--session <file>` names a file. A history is `--since <ISO> --until <ISO>` (events with since <= time < until) with `--project <path>` (the working directory must match exactly) or `--all-projects`. `--sessions-dir <dir>` replaces the root. The root defaults to OMP's, `~/.omp/agent/sessions`, whatever the host, so on pi pass `--sessions-dir ~/.pi/agent/sessions`. Dates follow the same rules as `loadout-report`.
+- **Filters:** `--branch <all|active|abandoned>`, `--outcome <value>` (repeatable), and `--service-log <file>` (a Laya server log for the request-id join; see [Telemetry](#telemetry)).
+- **`--json`** prints the summary document and `export` prints the export document, as JSON with no prefix. They are the documents `loadout-report` prints. `--json` may appear anywhere on the line.
+- **Cost:** a history scan reads the session files synchronously inside the host and blocks it until the scan finishes. Prefer `--project` and a short window.
+- `stats --help` prints the usage.
+
+```text
+[loadout] stats: session files
+  telemetry: on (default) | this process handed 10 records to the host, failed 0
+  file: 5 decisions and 5 model-turn records were read here; this process handed 10 to the host (earlier history, or records the host has not written yet, explain a difference)
+  scope: session files | files 1 (read 1, unreadable 0) | child sessions not read 0
+  loadout decisions: 4 in 1 sessions (0 dry run)
+  skipped: disabled 1
+...
+  classifier calls (loadout.decision attempts; not model turns): 4
+    tokens: in 164, out 12
+    server timing: reported 3, not reported 1 | queue p50 2.1 / p90 3.2 | inference p50 38 / p90 41.5
+    guard fired: 0 yes, 4 no, 0 unknown | prompt clipped: 0 yes, 4 no, 0 unknown | request ids: 4 present, 0 absent
+    models: smoke-stub-1 4
+  model turns (loadout.usage; separate from classifier calls): 5 in 5 runs
+    hosts: omp 5 | outcomes: stop 5
+    assigned to a decision: 5, unassigned: 0
+    tokens: input 60, output 10, cache read 0, cache write 0, reasoning unknown
+    cost: 0.00008 (the host's own pricing, not a bill)
+    tool calls: 0 | tool errors: 0
+    retries: reported 0, unreported 5
+  host transcript turns (the host's own messages, never added to the model-turn figures): 5
+    tokens: input 60, output 10 | cost 0.00008
+  service log: not read (--service-log <file> joins server records by request id)
+  coverage: files read 1, unreadable 0, without header 0 | malformed lines 0 | unsupported records: decisions 0, model turns 0 | duplicates removed: decisions 0, model turns 0 | v2 decisions without event id 0
+  read as: identifiers are local metadata; unknown is not zero; usage is observed, not billed; child sessions are not rolled up
+```
+
+A history with a missing bound or project is refused with one warning:
+
+```text
+[loadout] stats: incomplete historical scope: missing --until, --project <path> or --all-projects
+[loadout] stats: incomplete historical scope: missing --project <path> or --all-projects
+```
+
+### Per-turn notices
+
+After each classified turn, once the tools are applied, one info line says what happened:
+
+```text
+[loadout] applied edit (tools 9 of 14)
+[loadout] kept edit: widen-only blocked narrowing to answer
+[loadout] already matching edit (tools 9 of 14)
+[loadout] applied answer (tools 6 of 14)
+[loadout] dry run: would use answer (tools 6), nothing changed
+[loadout] all tools kept: low confidence (closest narrower risk 0.15 > max 0.10)
+[loadout] dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked
+```
+
+Skipped turns (selection off, empty prompt, slash command, nothing to ask) get no notice. A failed classification keeps its own warning, and a failed application its own error. Both show even with `notify: false`:
+
+```text
+[loadout] classification failed (timeout): laya request exceeded 400ms; using the full loadout until it recovers
+```
 
 ## Telemetry
 
-With telemetry on (the default) each prompt the host hands the plugin becomes one `loadout.decision` session entry, written after the tools were applied or restored.
+With telemetry on (the default) each prompt the host hands the plugin becomes one `loadout.decision` session entry, written after the tools were applied or restored. Each observed model turn becomes one `loadout.usage` entry.
 
 - **What a record holds:** the outcome (`classified`, `failed` or `skipped`, with the reason), a safe settings snapshot, classifier evidence (model id, token counts, elapsed and budget milliseconds, prompt length), the proposed tools with the risk of every narrower profile, skill counts, the widen-only ratchet state, and what happened when the plugin applied the tools: the status, a restore result, and the tools the host actually had afterwards.
-- **What it never holds:** prompt text, skill descriptions, rubrics, endpoints, environment variable names, file paths, or backend response and error text. Tool and skill names are stored only when they look like identifiers.
+- **Usage records:** one per assistant model turn the host reports: the host (`omp` or `pi`), the turn index, the stop reason, token counts (input, output, cache read, cache write, reasoning), the host's cost total, tool-call counts by tool name, tool errors, the error status and the retry attempt. A usage record is linked to a decision only through lifecycle events the plugin saw: the hook that finished, then the run or turn that started after it. Anything uncertain has no decision (`decisionId` is null). A turn whose host reports no token counter above zero keeps its token and cost fields unknown (null), not zero.
+- **Request correlation:** with `laya.transport: "http"`, each classifier call sends `X-Request-Id` while telemetry is on, and the decision keeps that id in `classifier.requestId`. The Laya server's queue and inference times come back in a `Server-Timing` header and are kept in `classifier.server`, which is null when the server sent none. Jev and the local sidecar get neither header. While telemetry is off the call sends `X-Loadout-Telemetry: off` instead.
+- **The server's side:** the Laya HTTP server writes one `loadout.http` line per POST to its service log (stderr, which is the journal under systemd). `X-Loadout-Telemetry: off` opts one request out, and the server's `--no-telemetry` flag opts out every request; an opted-out request writes no line and gets no `Server-Timing` header. To capture the journal for `loadout-report`, see [Reporting: loadout-report](#reporting-loadout-report).
+- **What it never holds:** prompt text, skill descriptions, rubrics, endpoints, environment variable names, file paths, or backend response and error text. Tool and skill names are stored only when they look like identifiers. Tool names in usage records are only names the host registered.
 - **How to turn it off:** put `{"telemetry": false}` in `~/.omp/loadout.json`. Only the first existing `~/.omp/loadout.*` file is read. A project file or `LOADOUT_CONFIG` file can also turn it off, but neither can turn it back on.
 - **Fail closed:** an unreadable or non-boolean machine setting, or any config error, writes nothing. The setting is read when a session loads its config, so restart after changing it.
-- **Opting out** writes nothing and deletes nothing. `/loadout explain` and `/loadout status` keep working from memory, and the `loadout.skills` hint message is unchanged.
+- **Opting out** writes nothing and deletes nothing. `/loadout explain` and `/loadout status` keep working from memory, and the `loadout.skills` hint message is unchanged. `/loadout stats` still reads records already on disk; it writes nothing.
 - **Handed to the host is not durable.** pi may throw on a disk error but keep the entry in memory, OMP swallows disk errors, and both defer writes until the first assistant message. A failed hand-off never aborts the turn; `/loadout status` counts them.
-- **Reading it back:** `loadout-report` summarizes and exports these records without writing anything. See [Reporting: loadout-report](#reporting-loadout-report).
+- **Reading it back:** `loadout-report` and `/loadout stats` summarize and export these records without writing anything. See [Reporting: loadout-report](#reporting-loadout-report) and [Command](#command).
 
 Full schemas, the `loadout.usage` and `loadout.http` contracts and the v2 mapping are in [`docs/telemetry.md`](docs/telemetry.md). It lives in the repository and is not part of the npm package.
 
 ## Reporting: loadout-report
 
 `loadout-report` summarizes and exports the `loadout.decision`, `loadout.usage` and `loadout.http` records from local session transcripts and, optionally, a service log. It is read-only: it writes nothing and keeps no transcript text. It prints one JSON document on stdout; diagnostics go to stderr.
+
+`/loadout stats` is the in-host view of the same report. It calls the same library with the same flags, except that with no scope flag it reads the host's current session file (see [Command](#command)).
 
 The installed binary is TypeScript with a Bun shebang, so `bun` must be on PATH. From a checkout, `npm run report -- <args>` runs the same CLI under Node.
 
@@ -350,6 +461,7 @@ those.
 | --- | --- | --- |
 | Unit and end-to-end tests (`npm test`, fake host + stub server) | yes | yes |
 | Loaded with `-e src/index.ts`, real binary | yes | yes |
+| `/loadout` commands and per-turn notices, in the real OMP TUI (tmux) and RPC mode | yes (omp 18.12.5) | in-process pi session tests only |
 | Installed from the `npm pack` tarball, no `-e` | yes | not yet |
 | Installed via `.omp-plugin/marketplace.json` (local clone) | yes | n/a |
 | Default config: Laya sidecar spawned, NDJSON round trip | yes, with a stand-in `laya` module | not yet |
@@ -375,7 +487,10 @@ npm run report -- --help   # loadout-report usage, from the checkout
 | `src/select.ts` | pure logic: questions, tool/skill decisions, prompt clipping |
 | `src/config.ts` | discovery, trust gate, validation, defaults |
 | `src/telemetry.ts` | trace record schemas, privacy allowlists, safe persistence, v2/v3 readers |
-| `src/report/*` | session reader, aggregation, export and the `loadout-report` CLI |
+| `src/usage.ts` | session-local usage observation: one `loadout.usage` per assistant model turn, linked to a decision only by lifecycle events |
+| `src/diagnostics.ts` | the text of `/loadout status`, `explain` and `stats`, and the one-line notices |
+| `src/stats.ts` | `/loadout stats` argument handling over the shared report library |
+| `src/report/*` | session reader, aggregation, export, the text renderer and the `loadout-report` CLI |
 | `src/classify/*`, `python/` | Jev/Laya clients and the Laya worker (from pi-classifier-router) |
 | `scripts/bench.ts`, `scripts/decisions.ts` | A/B benchmark and decision report over session transcripts |
 

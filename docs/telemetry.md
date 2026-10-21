@@ -7,10 +7,10 @@ Source of truth: [`src/telemetry.ts`](../src/telemetry.ts). This page is in the 
 | entry (`customType`) | version | producer |
 | --- | --- | --- |
 | `loadout.decision` | 3 (2 is still read) | the extension, once per prompt it sees |
-| `loadout.usage` | 1 | defined here, no producer yet (slice #4) |
-| `loadout.http` | 1 | defined here, no producer yet (slice #5) |
+| `loadout.usage` | 1 | the extension, once per assistant model turn (slice #5) |
+| `loadout.http` | 1 | the Laya HTTP server (`python/laya_http_server.py`), one line per `POST` on its stderr (slice #4); not a session entry |
 
-All three are session entries the host stores next to the conversation. The plugin only ever appends them; it never reads them back during a session.
+`loadout.decision` and `loadout.usage` are session entries the host stores next to the conversation. `loadout.http` is not one: it is a line in the Laya server's log (section 8). The plugin only appends the session entries. Apart from `/loadout stats`, which reads the session files, it never reads them back.
 
 ## 2. Privacy
 
@@ -34,7 +34,7 @@ Truncation happens only in the plugin: `classifier.promptChars` > `classifier.se
 
 A machine file with `telemetry: true` or no `telemetry` key behaves the same: it is a ceiling, not a switch.
 
-The decision is made when a session loads its config (session start, or a cwd or project-trust change), so **restart the session after editing** the setting. Opt-out stops every record the plugin appends. It does not stop the host's own conversation logging, nor the `loadout.skills` hint message (selection behavior, which the host may store). `/loadout explain` and `/loadout status` keep working from memory.
+The decision is made when a session loads its config (session start, or a cwd or project-trust change), so **restart the session after editing** the setting. Opt-out stops every record the plugin appends. It does not stop the host's own conversation logging, nor the `loadout.skills` hint message (selection behavior, which the host may store). `/loadout explain` and `/loadout status` keep working from memory, and `/loadout stats` keeps reading the session files, because reading is not collection.
 
 ## 4. `loadout.decision` v3
 
@@ -79,8 +79,8 @@ Durations are milliseconds. Lengths are characters (JS string length). Counts ar
 ## 6. IDs
 
 - `eventId`: unique per record; the dedup key when a host forks a session and copies its entries.
-- `decisionId`: identifies one decision. In memory, `lastDecisionId` is set for every record built, skips included, and is `null` when building failed. A later slice uses it to link usage to a decision.
-- `requestId`: a UUIDv4 *offered to the transport*, generated only when persisting and a request is actually issued. A record carries it even when the transport failed before sending (for example an unset Jev token). Only the Laya HTTP transport may forward it, and none does until #4.
+- `decisionId`: identifies one decision. In memory, `lastDecisionId` is set for every record built, skips included, and is `null` when building failed. `loadout.usage` records carry it, linking each model turn to its decision (section 8).
+- `requestId`: a UUIDv4 *offered to the transport*, generated only when persisting and a request is actually issued. A record carries it even when the transport failed before sending (for example an unset Jev token). Only the Laya HTTP transport forwards it, as the `X-Request-Id` header (section 8); the Jev transport and the Laya `python` transport do not.
 - `sessionId`: the host's id, or null.
 
 `classifier.status` is the HTTP status of a failed call: the Laya and Jev HTTP transports keep it, and the Laya transport keeps the server's timing, for any response whose body was read, including a 200 whose body was unusable. It is null on success, when no response arrived or its body could not be read (timeout, abort, transport failure), and for non-HTTP transports. `classifier.server` holds the `queue` and `infer` times, in ms, that the Laya HTTP server reported in its `Server-Timing` header (section 8). It is null for every other transport, when no response arrived or its body could not be read, and whenever the server sent none (an older server, an opted-out request, a rejected or unparsable request). Inside `server`, a phase the server did not report is null, never 0.
@@ -93,11 +93,11 @@ Durations are milliseconds. Lengths are characters (JS string length). Counts ar
 - OMP swallows disk errors; the plugin cannot see them.
 - Both defer writes until the first assistant message.
 
-The plugin counts per session `{handedOff, suppressed, failed, lastFailure}`, shown by `/loadout status`, and shows one `warning` notice (code only) on the first failure. A persistence failure never aborts the turn. An unserializable payload is refused before the host sees it (code `serialize`).
+The plugin counts per session `{handedOff, suppressed, failed, lastFailure}`, for decision and usage records together, shown by `/loadout status` and `/loadout stats`, and shows one `warning` notice (code only) on the first failure. A persistence failure never aborts the turn. An unserializable payload is refused before the host sees it (code `serialize`).
 
 ## 8. `loadout.usage` v1 and `loadout.http` v1
 
-Defined here, with normalizers (`normalizeUsage`, `normalizeHttp`); nothing produces them yet. Completeness is per field: `null` means not observed or not reported by this host, `decisionId: null` means unassigned. There is no separate completeness flag. A producer builds a candidate and appends `normalizeUsage(candidate)`; a null result is not appended.
+Defined here, with normalizers (`normalizeUsage`, `normalizeHttp`). The extension produces `loadout.usage`, and the Laya HTTP server produces `loadout.http`. Completeness is per field: `null` means not observed or not reported by this host, `decisionId: null` means unassigned. There is no separate completeness flag. The extension builds each candidate, normalizes it with `normalizeUsage` and appends the result; a null result is not appended.
 
 `loadout.usage` v1, one per assistant model turn the host reports through `turn_end` (OMP and pi). This plugin produces it: one record per observed turn, appended with the session's other records through the same persistence path and opt-out as `loadout.decision`.
 
@@ -124,10 +124,10 @@ Coverage. These records do not claim complete billing or complete coverage:
 
 - One record per assistant message that reaches `turn_end`: failed and interrupted ones, and a stop message the host writes itself without a model call, are included. Classifier calls are not model turns and are never in these records.
 - Not observed: model calls the host makes without telling extensions (session titles, memory consolidation, compaction summaries), transport retries the host performs inside one model call (no message exists, so nothing is reported), usage fields the schema has no slot for (OMP's orchestration, server-tool and credit counters), and anything before the plugin loaded or after it was disabled. A pi turn whose message entry id cannot be resolved is not delivered by pi, so it is not observed.
-- Subagent and child sessions are never added to the parent's records. Each session's plugin instance writes its own records, nothing here reads or sums other sessions' logs, and a reader that combines sessions deduplicates by `eventId` (the collab guest below is the exception).
+- Subagent and child sessions are never added to the parent's records. Each session's plugin instance writes its own records, and the producer never adds other sessions' records to its own. `/loadout stats` and `loadout-report` read another session only when a scope names it (`--session <file>` or a history scope), and deduplicate by `eventId` (the collab guest below is the exception).
 - An OMP collab guest that runs `/loadout` while joined mirrors the host's turns into its own replica session, and the plugin there can record them again with new `eventId`s. Those copies cannot be told apart by `eventId`, so usage summed over the host's and that guest's session files counts those turns twice.
 - A replayed `turn_end` for the same message object (OMP can replay one when it resumes unpaired tool calls) counts once. The same usage arriving as a different object cannot be told apart and counts again.
-- With telemetry off nothing is written. The plugin still counts the turns in memory, and `/loadout status` shows them as suppressed.
+- With telemetry off nothing is written. The plugin still counts the records in memory, and `/loadout status` shows them as suppressed.
 
 `loadout.http` v1, one per `POST` to the Laya HTTP server (`python/laya_http_server.py`), written as one JSON line on the server's stderr. That is the server's existing log (the journal under systemd), not a new file or datastore. `GET` health checks write no line.
 
@@ -176,12 +176,12 @@ v2 `probabilities` and `scores` keys are only shape-checked against the identifi
 ## 11. Reading records
 
 - `normalizeDecision(data)` returns a `DecisionView` for v2 and v3, or null.
-- `loadout-report` and the `npm run decisions` text view read all three record families (`loadout.decision`, `loadout.usage`, `loadout.http`) through `src/report/`. Skipped and unsupported records are counted apart from the decision figures; see section 11a.
+- `loadout-report` and the `npm run decisions` text view read all three record families (`loadout.decision`, `loadout.usage`, `loadout.http`) through `src/report/`. `/loadout stats` (section 11b) reads through the same library. Skipped and unsupported records are counted apart from the decision figures; see section 11a.
 - `npm run bench` refuses to run when the machine opts out or the setting is unreadable, and sets `telemetry: true` in each arm's config. A YAML machine file read under Node has no parser, so use a JSON machine file or run under Bun. Bench `activeToolNames` and `applied` reflect the host's real tools when a v3 record provides them. Its sessions are read through the same reader as `loadout-report`.
 
 ## 11a. Reporting and export (loadout-report)
 
-Source: [`src/report/`](../src/report/). `loadout-report summary` and `loadout-report export` read session transcripts and explicit service logs. `npm run decisions` prints a text view of the same summary, and `npm run report -- <args>` runs the CLI from a checkout under Node. Reading never writes, and no output carries transcript text.
+Source: [`src/report/`](../src/report/). `loadout-report summary` and `loadout-report export` read session transcripts and explicit service logs. `npm run decisions` prints a text view of the same summary, and `npm run report -- <args>` runs the CLI from a checkout under Node. That text view is `renderDecisions` in [`src/report/text.ts`](../src/report/text.ts); `/loadout stats` prints `renderSummary` from the same file (section 11b). Reading never writes, and no output carries transcript text.
 
 ### CLI
 
@@ -545,6 +545,216 @@ Every summary and export carries these ids in `disclosures`.
 - **Completions.** No shell completions.
 - **Percentiles.** Nearest-rank over the in-scope sample, not estimates.
 
+## 11b. `/loadout` diagnostics
+
+Source: [`src/diagnostics.ts`](../src/diagnostics.ts) (the wording), [`src/stats.ts`](../src/stats.ts) (the `stats` arguments) and the command handler in [`src/index.ts`](../src/index.ts). `status` and `explain` read the plugin's memory. `stats` reads session files through [`src/report/`](../src/report/). None of the three appends a session entry or changes a tool.
+
+### Output channel
+
+- `status`, `explain` and `stats` each send their whole text in one `ctx.ui.notify` call. The first line is `[loadout] <title>`; the other lines are indented. `status` and `explain` are `info`. `stats` is `info`; an argument refusal and a failure are `warning` (`[loadout] stats: failed: <message>`); `--help` and a missing session file are `info`.
+- An unknown subcommand gets one `warning` with the usage line, `usage: /loadout [status|on|off|explain|stats]`.
+- `notify: false` hides only the per-turn notice. Command output, warnings and errors are shown.
+- Why one call: OMP 18.12.5 shows an `info` notice through `showStatus`, which replaces the status line before it when the two are consecutive. Separate calls would leave only the last line. One call keeps every line, and a long text is not cut (probed on OMP 18.12.5 and pi 0.87.1). Over RPC (`omp --mode rpc`) the same text arrives as one `extension_ui_request` event with `method` `notify` (probed on OMP 18.12.5).
+- `stats --json` and `stats export` print the JSON document only, with no prefix, so the notification parses.
+- The per-turn notice is one `info` line. It is sent after the tools were applied and built from the final record (`noticeText`). A skip gets none. A failed classification keeps its own notice (`warning`, or `error` when the failure is `error`), shown once per distinct text until a turn succeeds. An error in the hook, including a failed apply, keeps its own `error` (`selection error: ...`).
+
+### Outcome vocabulary
+
+The headlines of `status`, `explain` and the per-turn notice all come from `headline()` in [`src/diagnostics.ts`](../src/diagnostics.ts); the per-turn notice is `noticeText()`. The table lists each branch and the record fields it reads. Placeholders in angle brackets are filled from those fields.
+
+| headline | when | record fields read |
+| --- | --- | --- |
+| `skipped: selection is off` | `outcome` is `skipped` and `skip` is `disabled` | `outcome`, `skip` |
+| `skipped: empty prompt` | `skip` is `empty-prompt` | `skip` |
+| `skipped: slash command, not classified` | `skip` is `command` | `skip` |
+| `skipped: nothing to ask` | `skip` is `no-questions`; ` (<eligible> candidates > limit <max>)` follows when `skills.reason` is `too-many-candidates` | `skip`, `skills.reason`, `skills.eligible`, `skills.maxCandidates` |
+| `skipped` | any other `skip` value | `skip` |
+| `classifier still loading; full loadout kept` | `outcome` is `failed` and `failure` is `warming` | `failure` |
+| `classification failed: timeout` | `failure` is `timeout` and there is no `classifier` record | `failure`, `classifier` |
+| `classification failed: timeout after <ms> ms (budget <ms> ms[, guard fired])` | `failure` is `timeout` and a `classifier` record exists; `, guard fired` when the guard fired | `failure`, `classifier.elapsedMs`, `classifier.budgetMs`, `classifier.guardFired` |
+| `classification failed: <failure>[ (HTTP <status>)][ after <ms> ms]` | any other `failure` (`error` when none); `(HTTP <status>)` when `classifier.status` is set; `after <ms> ms` when a `classifier` record exists | `failure`, `classifier.status`, `classifier.elapsedMs` |
+| `proposed nothing (application <status>)` | `outcome` is `classified` and `tools` is null | `tools`, `application.status` |
+| `applied <profile> (tools <m> of <b>)` | `application.status` is `applied` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile`, `application.actualTools` |
+| `applied: baseline restored (<keep>)` | `application.status` is `applied` and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
+| `already matching <profile> (tools <m> of <b>)` | `application.status` is `unchanged` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile`, `application.actualTools` |
+| `all tools kept: <keep>` | `application.status` is `unchanged`, `restored` or `not-attempted`, and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
+| `dry run: would keep all tools (<keep>)` | `application.status` is `dry-run` and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
+| `dry run: would use <profile> (tools <n>), nothing changed` | `application.status` is `dry-run` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile` |
+| `kept <before>: widen-only blocked narrowing to <profile>` | `application.status` is `not-admitted`; `<before>` is `ratchet.before`, or `the current tools` when that is null | `application.status`, `ratchet.before`, `tools.profile` |
+| `could not apply <profile>: <error>[, baseline restored]` | `application.status` is `failed`; `<error>` is `application.error` or `error`; the suffix is `, baseline restored` or `, baseline restore failed` from `application.restoration` | `application.status`, `application.error`, `application.restoration`, `tools.active`, `tools.profile` |
+| `proposed <profile> (application <status>)` | any other combination, such as `restored` or `not-attempted` with `tools.active` set; `<profile>` is `nothing` when `tools.profile` is null | `application.status`, `tools.profile` |
+| `; skills: <eligible> candidates > limit <max>, none asked` | suffix of a classified headline when `skills.reason` is `too-many-candidates` | `skills.reason`, `skills.eligible`, `skills.maxCandidates` |
+| `; skills: <k> selected` | suffix when `skills.reason` is `selected`; `; skills: would select <k>` when `application.status` is `dry-run` | `skills.reason`, `skills.selected`, `application.status` |
+| `; skills: no answer` | suffix when `skills.reason` is `missing-answer` | `skills.reason` |
+| `noticeText`: the headline, at most 150 characters | `outcome` is `classified` and `application.status` is not `failed`; null otherwise | the fields of the headline |
+
+- `<profile>` is `tools.profile`, or `a narrower set` when that is null. In the `could not apply` row it is `tools.profile` when `tools.active` is set, and `tools` otherwise.
+- `<m>` is the length of `application.actualTools`, the host's read-back. When that is null the whole `(tools <m> of <b>)` part is left out. `<b>` is the baseline size the caller passes; it is not a record field, and `of <b>` is left out when no size is passed.
+- `<n>` is the length of `tools.active`, the proposal.
+- `<keep>` depends on `tools.reason`:
+
+| `tools.reason` | `<keep>` | fields read |
+| --- | --- | --- |
+| `low-confidence` | `low confidence (closest narrower risk <c> > max <max>)`, or `low confidence (no risk known)` when no narrower risk is known; risks and the max print with two decimals | `tools.risks` (the smallest known `risk`), `tools.maxRisk` |
+| `missing-answer` | `no answer to the tool question` | `tools.reason` |
+| `disabled` | `tool selection off` | `tools.reason` |
+| any other | `baseline` | `tools.reason` |
+
+A headline longer than 150 characters is cut to 149 characters and `…`. The delivered notice adds the `[loadout] ` prefix.
+
+### `status`
+
+`/loadout status` prints the settings in force and what this process has seen, from memory:
+
+- `selection:` enabled or disabled, dry run on or off, notices on or off.
+- `classifier:` the backend, with its transport for `laya`, and the timeout the turns use for that backend.
+- `config:` the config file the session loaded and its scope, or `built-in defaults`.
+- `tools:` the profiles and max risk, or `off`; `skills:` the skills mode, or `off`.
+- `baseline tools:` the captured baseline and its count, or `not captured yet`.
+- `last decision:` the headline of the latest non-skipped record, or `none yet`.
+- `latest invocation:` the headline of the latest hook call when that call was a skip, or `no record could be built (<code>)` when it built no record.
+- `telemetry:` `on` with the reason, the records handed to the host and the failures with the last code; or `off` with the reason and the records suppressed, plus a `provenance:` line that says why (section 3).
+- `this session:` prompts observed by outcome, model turns observed, and `memory only, this session in this process`.
+- `not included:` child and subagent sessions, which have their own plugin instance and records.
+
+It prints no endpoint, environment variable name, python path or question text. The `config:` line prints the source path, as before.
+
+### `explain`
+
+`/loadout explain` prints the latest hook call of any outcome, skips included, from memory. It works with telemetry off.
+
+- `source:` where the record went: `record handed to host` (the host's append did not throw; section 7), `record not stored: telemetry off (<reason>)`, `record not stored: <code>`, or `no record could be built (<code>)`. Explain never says `handed to host` unless the append happened.
+- `outcome:` the headline.
+- `tools:` the reason, then one row per narrower profile, narrowest first, with its probability and its risk against the max risk (`<=` or `>`). The chosen profile's row ends in `<- chosen`. The broadest profile has no risk and is the baseline. `risks: unknown` replaces the rows when the answer had no probabilities.
+- `proposal:` what the classifier asked for (section 4), or `keep all tools (baseline)`.
+- `ratchet:` before and after, admitted or blocked, and narrowing open or locked.
+- `application:` the status, the restoration, the error, and the tools the host reports after applying (`actual tools`).
+- `blocked:` what kept the proposal from changing the tools, in this order: dry run, widen-only ratchet, low confidence, no tool answer, skills over the candidate limit; `none` when there is none.
+- `skills:` the skill reason with its counts and, when skills were selected, the best scores.
+- `classifier:` questions asked, prompt and sent characters (`clipped` or `not clipped`), the model, and the tokens or `tokens not reported`.
+- `timing:` elapsed time, budget, timeout, whether the guard fired, and the HTTP status when there is one.
+- `server:` the queue and inference times the server reported, or `not reported`, and the request id, or `none`.
+- `settings then:` the settings in force when the record was built.
+- `failure text (memory only, never stored):` the failure text of that call, on one line, at most 200 characters, when one exists.
+- `previous decision:` the latest non-skipped headline, when the latest call was a skip or built no record.
+
+### `stats`
+
+`/loadout stats` reads session files through the report library that `loadout-report` uses. The text view is the title, the telemetry line, the `file:` line when it applies (below), then `renderSummary` in [`src/report/text.ts`](../src/report/text.ts): the scope line, the `npm run decisions` text (`renderDecisions`), and the blockers, classifier, model-turn, host-transcript, service-log and coverage sections.
+
+- `summary` (the default) or `export`. `--json` prints the summary document; `export` prints the export document. Both are the CLI's JSON, byte for byte, without the CLI's trailing newline.
+- Scope: without a scope flag, the host's current session file. `--session <file>` (repeatable) names files. A history needs `--since <ISO>` and `--until <ISO>` with `--project <path>` (an exact match) or `--all-projects`; `--sessions-dir <dir>` (repeatable) sets the roots. The default root is OMP's `~/.omp/agent/sessions` for either host, so a pi history needs `--sessions-dir`.
+- Filters pass through to the library: `--branch all|active|abandoned`, `--outcome <value>` (repeatable; section 11a) and `--service-log <file>` (repeatable; the request-id join).
+- Quotes: `"..."` and `'...'` group a value with spaces. There are no escapes, an unterminated quote is refused, and `--flag=value` works.
+- Refused at `warning`: a partial history, with the CLI's own message (see the examples), `--version`, and an unknown view word (`unknown view <word> (use summary or export)`). `--help` prints the usage text at `info`.
+- The `file:` line appears only for the default scope with no filter flag, and only with telemetry on. It compares what the file holds with what this process handed to the host. The two can differ: earlier history, or records the host has not written yet.
+- With telemetry off, the telemetry line says so and that nothing from this process was stored (`N suppressed`). The figures still cover the records in the files read, because reading is not collection.
+- The `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records.
+- `export` puts the whole export in one notification, so use `loadout-report` for large scopes.
+
+### Memory and files
+
+- `status` and `explain` read this process's memory: the latest hook call, the records built, the counters and the baseline. They read no session file, and they work with telemetry off.
+- The counters (`records handed to host`, `failed`, `records suppressed`) belong to the session in this process. A restart or a resume starts them at zero; the earlier records are only in the session file, which `stats` reads.
+- `stats` reads the files, not memory, and works with telemetry off, because reading is not collection.
+- `handed to host` means the host's append did not throw. It is not a disk write (section 7).
+
+### Blocking cost
+
+- A history scan in the host reads session files synchronously (`readFileSync`), so the host waits until the scan finishes. A historical scope reads every `.jsonl` under each root, after skipping files last modified before `since` (section 11a). A `--project` scope first peeks at up to 64 KiB of each candidate file's header to match the project.
+- The default scope reads the one current file.
+- Extension commands run immediately, even while a turn streams (OMP 18.12.5). So a history scan blocks the host until it finishes, and a prompt classified meanwhile can record a timeout.
+- The host's 30 s limit applies to event handlers only (OMP 18.12.5). A command is not cut off, so a long scan runs to its end.
+
+### Print mode
+
+In print mode (`omp -p`, `pi -p`) the host has no UI: `hasUI` is false and nothing is shown. No `/loadout` output and no per-turn notice appears there (probed on OMP 18.12.5 and pi 0.87.1).
+
+### `getSessionFile` before the first reply
+
+`stats` takes the host's current session file from `ctx.sessionManager.getSessionFile()`, guarded: a throw or an empty string counts as no file.
+
+Before the first assistant reply the host may report a path, but the file is written with that reply. Until then `stats` prints `[loadout] stats: no session file yet. The host writes it with the first assistant message; ask again after the first reply, or name a scope (see /loadout stats --help)` at `info`, and reads nothing else. The same text is printed when the host reports no file. After a reply, a `stats` run reads every record handed to the host before it (probed on OMP 18.12.5 and pi 0.87.1).
+
+### Examples
+
+Captured from OMP 18.12.5 with synthetic stubs: the classifier and the model answer scripted replies. The config path is shown as `~/.omp/loadout.json`.
+
+Explain for one record with a dry run, a low-confidence answer and skills over the candidate limit:
+
+```
+[loadout] explain: latest invocation
+  source: in memory | record handed to host
+  outcome: dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked
+  tools: low confidence, no profile within max risk 0.10
+    answer: p 0.55, risk 0.45 > 0.10
+    edit: p 0.30, risk 0.15 > 0.10
+    full: p 0.15 (broadest, the baseline)
+  proposal: keep all tools (baseline)
+  ratchet: - -> full (admitted, narrowing open)
+  application: dry-run | actual tools: read, bash, edit, eval, glob, grep, task, wait, todo, web_search, write, ast_edit, debug, lsp (14)
+  blocked: dry run, low confidence, skills over the candidate limit
+  skills: 3 eligible > limit 2 (discovered 3): none asked, all skills kept
+  classifier: 1 question (tools 1, skills 0) | prompt 30 chars, sent 30 (not clipped) | model smoke-stub-1 | tokens in 41, out 3
+  timing: 6 ms of 4250 ms budget (timeout 4000 ms), guard not fired
+  server: not reported | request 9ecd2f18-32eb-4ddd-86a9-9b2288244e93
+  settings then: dry run on | max risk 0.10 | laya (http) | skills auto | config global
+```
+
+Status after five prompts:
+
+```
+[loadout] status
+  selection: enabled | dry run off | notices on
+  classifier: laya (http) | timeout 4000 ms
+  config: ~/.omp/loadout.json (global)
+  tools: profiles answer, edit, full (max risk 0.10) | skills: off
+  baseline tools: read, bash, edit, eval, glob, grep, task, wait, todo, web_search, write, ast_edit, debug, lsp (14)
+  last decision: applied answer (tools 6 of 14)
+  telemetry: on (default) | records handed to host 10 | failed 0
+  this session: prompts observed 5 (classified 4, failed 0, skipped 1) | model turns observed 5 | memory only, this session in this process
+  not included: child and subagent sessions (each has its own plugin instance and records)
+```
+
+Stats, text view (cut):
+
+```
+[loadout] stats: session files
+  telemetry: on (default) | this process handed 10 records to the host, failed 0
+  file: 5 decisions and 5 model-turn records were read here; this process handed 10 to the host (earlier history, or records the host has not written yet, explain a difference)
+  scope: session files | files 1 (read 1, unreadable 0) | child sessions not read 0
+  loadout decisions: 4 in 1 sessions (0 dry run)
+  skipped: disabled 1
+...
+  classifier calls (loadout.decision attempts; not model turns): 4
+    tokens: in 164, out 12
+    server timing: reported 3, not reported 1 | queue p50 2.1 / p90 3.2 | inference p50 38 / p90 41.5
+    guard fired: 0 yes, 4 no, 0 unknown | prompt clipped: 0 yes, 4 no, 0 unknown | request ids: 4 present, 0 absent
+    models: smoke-stub-1 4
+...
+  coverage: files read 1, unreadable 0, without header 0 | malformed lines 0 | unsupported records: decisions 0, model turns 0 | duplicates removed: decisions 0, model turns 0 | v2 decisions without event id 0
+  read as: identifiers are local metadata; unknown is not zero; usage is observed, not billed; child sessions are not rolled up
+```
+
+A partial history is refused, and nothing is read:
+
+```
+[loadout] stats: incomplete historical scope: missing --until, --project <path> or --all-projects
+[loadout] stats: incomplete historical scope: missing --project <path> or --all-projects
+```
+
+One-line notices, one `info` line per classified turn:
+
+| case | notice |
+| --- | --- |
+| applied | `[loadout] applied edit (tools 9 of 14)` |
+| widen-only ratchet blocked a narrowing | `[loadout] kept edit: widen-only blocked narrowing to answer` |
+| already matching | `[loadout] already matching edit (tools 9 of 14)` |
+| applied after `/loadout on` | `[loadout] applied answer (tools 6 of 14)` |
+| dry run | `[loadout] dry run: would use answer (tools 6), nothing changed` |
+| low confidence | `[loadout] all tools kept: low confidence (closest narrower risk 0.15 > max 0.10)` |
+| dry run, low confidence and skill overflow | `[loadout] dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked` |
+
 ## 12. Synthetic examples
 
 Classified (abridged):
@@ -576,7 +786,13 @@ Failed (abridged): `"outcome":"failed","failure":"unavailable","tools":null`, a 
 ## 13. Known limits
 
 - This page is not packaged with the npm release.
-- `classifier.status` and `classifier.server` are null until #4; `loadout.usage` and `loadout.http` have no producer until #4 and #5.
+- `classifier.server` is null except for the Laya HTTP transport when the server sent `Server-Timing` (section 6). `loadout.http` exists only where this repository's server runs without `--no-telemetry`; the per-request `X-Loadout-Telemetry: off` header also suppresses it. It is a line in the server's log, not a session entry.
 - After a low-confidence or failed turn the ratchet keeps narrowing locked until compaction or `/loadout on|off`. This is visible in `ratchet` but unchanged.
 - The Laya HTTP server has no request deadline.
 - No durability guarantee: see section 7.
+- A history scan in the host (`/loadout stats` with a historical scope) blocks the host until it finishes. Extension commands run while a turn streams, so a prompt classified meanwhile can record a timeout (section 11b).
+- Print mode (`-p`) has no UI, so no `/loadout` output and no per-turn notice is shown there (section 11b).
+- `/loadout explain` covers only the latest invocation of this process. When that invocation was a skip, `previous decision:` shows the latest non-skipped decision.
+- After a restart or a resume, `status` and `explain` have observed nothing yet and the counters start at zero. The earlier records are in the session file, which only `stats` reads.
+- `/loadout stats export` puts the whole export in one notification, so use `loadout-report` for large scopes (section 11b).
+- The text view's `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records (section 11b).
