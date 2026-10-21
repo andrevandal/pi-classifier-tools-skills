@@ -44,6 +44,7 @@ import {
   type SkipReason,
   settingsSnapshot,
   type ToolsRecord,
+  USAGE_ENTRY,
 } from "./telemetry.ts";
 import { errorText, runTurn, type TurnOutcome } from "./turn.ts";
 import type {
@@ -55,6 +56,19 @@ import type {
   SkillsReason,
   TelemetryState,
 } from "./types.ts";
+import {
+  armDecision,
+  clearRetry,
+  createUsageTracker,
+  dropArmed,
+  endContext,
+  endRun,
+  noteRetry,
+  observeTurn,
+  openTurn,
+  startRun,
+  type UsageTracker,
+} from "./usage.ts";
 
 const PREFIX = "[loadout]";
 const COMMAND = "loadout";
@@ -91,6 +105,8 @@ interface SessionState {
   lastMessage: string | null;
   /** The latest record built, skips included; null when building it threw. */
   lastDecisionId: string | null;
+  /** Run and decision links for usage observations; session-local, carried across config reloads. */
+  usage: UsageTracker;
   collection: { handedOff: number; suppressed: number; failed: number; lastFailure: string | null };
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
   lastFailure: string | null;
@@ -228,6 +244,7 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     lastRecord: existing?.lastRecord ?? null,
     lastMessage: existing?.lastMessage ?? null,
     lastDecisionId: existing?.lastDecisionId ?? null,
+    usage: existing?.usage ?? createUsageTracker(),
     collection: existing?.collection ?? { handedOff: 0, suppressed: 0, failed: 0, lastFailure: null },
     // A config reload is not a new session: keep the ratchet, so a cwd change cannot reopen narrowing.
     appliedRank: existing?.appliedRank ?? null,
@@ -562,6 +579,8 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     }
   }
   recordDecision(pi, ctx, state, trace);
+  // The next run, or the next turn of an open one, belongs to this decision (null when none was built).
+  if (state) armDecision(state.usage, state.lastDecisionId);
   return result;
 }
 
@@ -629,6 +648,30 @@ function commandExplain(ctx: ExtensionContext, state: SessionState): void {
   for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
 }
 
+/** Usage bookkeeping for one lifecycle event: best effort, never throws into the host. */
+function track(ctx: ExtensionContext, update: (usage: UsageTracker) => void): void {
+  try {
+    const state = sessions.get(sessionKey(ctx));
+    if (state) update(state.usage);
+  } catch {
+    // Usage tracking must not affect the agent.
+  }
+}
+
+/** One `loadout.usage` per assistant model turn. Returns nothing: pi reads a `turn_end` result as boundary entries. */
+function onTurnEnd(pi: ExtensionAPI, event: unknown, ctx: ExtensionContext): void {
+  const state = sessions.get(sessionKey(ctx));
+  if (!state) return;
+  try {
+    const record = observeTurn(state.usage, hostSessionId(ctx), event);
+    if (!record) return;
+    const append = (type: string, data: unknown) => pi.appendEntry(type, data);
+    countRecord(ctx, state, persistRecord(append, state.telemetry, USAGE_ENTRY, record));
+  } catch {
+    countRecord(ctx, state, { outcome: "failed", code: "error" });
+  }
+}
+
 export default function loadout(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     try {
@@ -649,10 +692,31 @@ export default function loadout(pi: ExtensionAPI): void {
   pi.on("session_compact", (_event, ctx) => {
     // Compaction summarizes the history, so the next decision may narrow again.
     const state = sessions.get(sessionKey(ctx));
-    if (state) state.allowNarrow = true;
+    if (!state) return;
+    state.allowNarrow = true;
+    // The usage run ends too; a pending decision stays because omp compacts between the hook and the run.
+    endRun(state.usage);
   });
 
   pi.on("before_agent_start", (event, ctx) => onBeforeAgentStart(pi, event as PromptEvent, ctx));
+
+  // Usage observation. Handlers are best effort and return nothing.
+  pi.on("agent_start", (_event, ctx) => track(ctx, startRun));
+  pi.on("turn_start", (_event, ctx) => track(ctx, openTurn));
+  pi.on("turn_end", (event, ctx) => onTurnEnd(pi, event, ctx));
+  pi.on("agent_end", (_event, ctx) => track(ctx, dropArmed));
+  pi.on("session_tree", (_event, ctx) => track(ctx, endContext));
+  // omp-only events: pi's typed `on` does not list them and pi never emits them.
+  const onHost = pi.on.bind(pi) as unknown as (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void,
+  ) => void;
+  onHost("auto_retry_start", (event, ctx) =>
+    track(ctx, (usage) => noteRetry(usage, (event as { attempt?: unknown } | null)?.attempt)),
+  );
+  onHost("auto_retry_end", (_event, ctx) => track(ctx, clearRetry));
+  onHost("session_branch", (_event, ctx) => track(ctx, endContext));
+  onHost("session_switch", (_event, ctx) => track(ctx, endContext));
 
   pi.registerCommand(COMMAND, {
     description: "Inspect and control classifier-driven tool and skill selection",

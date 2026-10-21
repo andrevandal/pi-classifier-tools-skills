@@ -13,8 +13,9 @@ import * as path from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import loadout from "../src/index.ts";
-import { type DecisionRecordV3, ID_PATTERN, normalizeDecision } from "../src/telemetry.ts";
+import { type DecisionRecordV3, ID_PATTERN, normalizeDecision, type UsageObservationV1 } from "../src/telemetry.ts";
 import type { Answers } from "../src/types.ts";
+import { CANARY, ompTurnEnd, piTurnEnd, toolResult, type TurnSpec } from "./fixtures/usage-events.ts";
 
 const TOKEN_VAR = "LOADOUT_TEST_TOKEN";
 const BASELINE = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -167,6 +168,12 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
     command: (args: string) => commands.get("loadout")!.handler(args, ctx),
     shutdown: () => handlers.get("session_shutdown")!({}, ctx),
     compact: () => handlers.get("session_compact")!({}, ctx),
+    /** Fire one host event by name, without a default event; returns the handler's result. */
+    fire: (name: string, event?: unknown) => handlers.get(name)?.(event, ctx),
+    /** Move the host's working directory: the next hook reloads this session's config. */
+    setCwd: (dir: string) => {
+      ctx.cwd = dir;
+    },
   };
 }
 
@@ -175,6 +182,17 @@ const record = (host: { entries: Array<{ data: unknown }> }, i = host.entries.le
 const sorted = (list: readonly string[] | null | undefined) => [...(list ?? [])].sort();
 const setCount = (host: { calls: string[] }) => host.calls.filter((call) => call === "set").length;
 const errorWith = (message: string, code: string) => Object.assign(new Error(message), { code });
+
+type Host = ReturnType<typeof fakeHost>;
+const usageOf = (host: Host) =>
+  host.entries.filter((entry) => entry.type === "loadout.usage").map((entry) => entry.data as UsageObservationV1);
+const decisionsOf = (host: Host) =>
+  host.entries.filter((entry) => entry.type === "loadout.decision").map((entry) => entry.data as DecisionRecordV3);
+/** One model turn as the host reports it: `turn_start`, then `turn_end`. Returns the `turn_end` handler's result. */
+const turn = (host: Host, kind: "pi" | "omp", spec?: TurnSpec) => {
+  host.fire("turn_start", { type: "turn_start", turnIndex: spec?.turnIndex ?? 0 });
+  return host.fire("turn_end", (kind === "pi" ? piTurnEnd : ompTurnEnd)(spec));
+};
 
 test("pi: narrows tools and filters skills out of the prompt", async () => {
   const host = fakeHost("pi");
@@ -751,5 +769,390 @@ test("persist failure: the turn continues, tools are applied, and the failure is
   assert.match(host.notes.join("\n"), /failed 2 \(EACCES\)/);
   assert.match(host.notes.join("\n"), /handed to host 1/);
   assert.doesNotMatch(host.notes.join("\n") + JSON.stringify(host.entries), /secret-dir/);
+  host.shutdown();
+});
+
+// loadout.usage: one record per assistant model turn, linked to a decision only through lifecycle events.
+
+const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+const NO_TOKENS = { input: null, output: null, cacheRead: null, cacheWrite: null, reasoning: null };
+
+for (const kind of ["omp", "pi"] as const) {
+  test(`usage: model turns under one decision link to it and keep separate identities (${kind})`, async () => {
+    const host = fakeHost(kind);
+    await host.prompt("explain this");
+    host.fire("agent_start");
+    const returned = [turn(host, kind, { stopReason: "toolUse", calls: ["read"] }), turn(host, kind, { turnIndex: 1 })];
+    assert.deepEqual(returned, [undefined, undefined]);
+    assert.deepEqual(
+      host.entries.map((entry) => entry.type),
+      ["loadout.decision", "loadout.usage", "loadout.usage"],
+    );
+    const [first, second] = usageOf(host);
+    const [decision] = decisionsOf(host);
+    assert.ok(first && second && decision);
+    assert.equal(first.decisionId, decision.decisionId);
+    assert.equal(second.decisionId, decision.decisionId);
+    assert.equal(first.runId, second.runId);
+    assert.notEqual(first.eventId, second.eventId);
+    assert.deepEqual([first.turnIndex, second.turnIndex], [0, 1]);
+    assert.deepEqual([first.host, second.host], [kind, kind]);
+    assert.deepEqual([first.sessionId, second.sessionId], [host.sessionId, host.sessionId]);
+    assert.deepEqual([first.stopReason, first.toolCalls], ["toolUse", { read: 1 }]);
+
+    await host.prompt("explain that");
+    host.fire("agent_start");
+    turn(host, kind);
+    const third = usageOf(host)[2];
+    assert.ok(third);
+    assert.notEqual(third.runId, first.runId);
+    assert.equal(third.turnIndex, 0);
+    assert.equal(third.decisionId, decisionsOf(host)[1]?.decisionId);
+    assert.notEqual(third.decisionId, decision.decisionId);
+    host.shutdown();
+  });
+}
+
+test("usage: a queued follow-up's decision applies from its own turn", async () => {
+  const host = fakeHost("omp");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  turn(host, "omp", { stopReason: "toolUse", calls: ["read"] });
+  turn(host, "omp", { turnIndex: 1 });
+  // The host runs the hook again for a queued follow-up. No agent_start follows: the run is still open.
+  await host.prompt("and this");
+  turn(host, "omp", { turnIndex: 2 });
+  // A second follow-up arrives while turn 3 is in flight: its hook runs between that turn's start and end.
+  host.fire("turn_start", { type: "turn_start", turnIndex: 3 });
+  await host.prompt("and that");
+  host.fire("turn_end", ompTurnEnd({ turnIndex: 3 }));
+  turn(host, "omp", { turnIndex: 4 });
+
+  const [d1, d2, d3] = decisionsOf(host).map((decision) => decision.decisionId);
+  const records = usageOf(host);
+  assert.equal(new Set([d1, d2, d3]).size, 3);
+  assert.deepEqual(
+    records.map((r) => r.decisionId),
+    [d1, d1, d2, d2, d3],
+  );
+  assert.deepEqual(
+    records.map((r) => r.turnIndex),
+    [0, 1, 2, 3, 4],
+  );
+  assert.equal(new Set(records.map((r) => r.runId)).size, 1);
+  host.shutdown();
+});
+
+test("usage: a continuation without a decision hook is unassigned and carries the host's retry number on omp only", async () => {
+  const omp = fakeHost("omp");
+  await omp.prompt("explain this");
+  omp.fire("agent_start");
+  turn(omp, "omp", { stopReason: "error", usage: ZERO_USAGE });
+  omp.fire("auto_retry_start", { attempt: 1, maxAttempts: 3, delayMs: 10 });
+  omp.fire("agent_end");
+  omp.fire("agent_start");
+  turn(omp, "omp");
+  omp.fire("auto_retry_end", { success: true, attempt: 1 });
+  const [failed, retried] = usageOf(omp);
+  assert.ok(failed && retried);
+  assert.equal(failed.stopReason, "error");
+  assert.equal(failed.decisionId, decisionsOf(omp)[0]?.decisionId);
+  assert.equal(failed.retryAttempt, null);
+  assert.deepEqual(failed.tokens, NO_TOKENS);
+  assert.equal(failed.costTotal, null);
+  assert.equal(retried.decisionId, null);
+  assert.notEqual(retried.runId, failed.runId);
+  assert.equal(retried.retryAttempt, 1);
+  // A retry that was announced but never ran (cancelled during its delay) must not mark an unrelated later turn.
+  omp.fire("auto_retry_start", { attempt: 2, maxAttempts: 3, delayMs: 10 });
+  omp.fire("auto_retry_end", { success: false, attempt: 2 });
+  turn(omp, "omp", { turnIndex: 1 });
+  assert.equal(usageOf(omp)[2]?.retryAttempt, null);
+  omp.shutdown();
+
+  // pi has no retry event: the continuation is still unassigned, and its retry number stays unknown.
+  const pi = fakeHost("pi");
+  await pi.prompt("explain this");
+  pi.fire("agent_start");
+  turn(pi, "pi", { stopReason: "error", usage: ZERO_USAGE });
+  pi.fire("agent_end");
+  pi.fire("agent_start");
+  turn(pi, "pi");
+  pi.fire("agent_start");
+  turn(pi, "pi");
+  const [piFailed, piRetried, piLater] = usageOf(pi);
+  assert.ok(piFailed && piRetried && piLater);
+  assert.equal(piFailed.decisionId, decisionsOf(pi)[0]?.decisionId);
+  assert.deepEqual([piFailed.retryAttempt, piRetried.retryAttempt, piLater.retryAttempt], [null, null, null]);
+  assert.deepEqual([piRetried.decisionId, piLater.decisionId], [null, null]);
+  assert.notEqual(piRetried.runId, piFailed.runId);
+  pi.shutdown();
+});
+
+test("usage: compaction, branch and tree boundaries leave later turns unassigned", async () => {
+  const started = async () => {
+    const host = fakeHost("omp");
+    await host.prompt("explain this");
+    return host;
+  };
+
+  // (a) compaction inside a run ends the run.
+  const compacted = await started();
+  compacted.fire("agent_start");
+  turn(compacted, "omp");
+  await compacted.compact();
+  turn(compacted, "omp", { turnIndex: 1 });
+  const [before, after] = usageOf(compacted);
+  assert.ok(before && after);
+  assert.equal(before.decisionId, decisionsOf(compacted)[0]?.decisionId);
+  assert.notEqual(after.runId, before.runId);
+  assert.equal(after.decisionId, null);
+  compacted.shutdown();
+
+  // (b) compaction between the hook and the run keeps the decision pending.
+  const early = await started();
+  await early.compact();
+  early.fire("agent_start");
+  turn(early, "omp");
+  assert.equal(usageOf(early)[0]?.decisionId, decisionsOf(early)[0]?.decisionId);
+  early.shutdown();
+
+  // (c) a tree move, branch or switch inside a run ends the run.
+  for (const name of ["session_tree", "session_branch", "session_switch"]) {
+    const host = await started();
+    host.fire("agent_start");
+    turn(host, "omp");
+    host.fire(name);
+    turn(host, "omp", { turnIndex: 1 });
+    const [one, two] = usageOf(host);
+    assert.ok(one && two, name);
+    assert.notEqual(two.runId, one.runId, name);
+    assert.equal(two.decisionId, null, name);
+    host.shutdown();
+  }
+
+  // (d) a tree move before the run drops the pending decision.
+  const moved = await started();
+  moved.fire("session_tree");
+  moved.fire("agent_start");
+  turn(moved, "omp");
+  assert.equal(usageOf(moved)[0]?.decisionId, null);
+  moved.shutdown();
+
+  // (e) agent_end drops a decision that no run claimed.
+  const unclaimed = await started();
+  unclaimed.fire("agent_end");
+  unclaimed.fire("agent_start");
+  turn(unclaimed, "omp");
+  assert.equal(usageOf(unclaimed)[0]?.decisionId, null);
+  unclaimed.shutdown();
+});
+
+test("usage: sessions never mix, a tool result's own usage adds nothing, and a replayed turn counts once", async () => {
+  const a = fakeHost("omp");
+  const b = fakeHost("pi");
+  await a.prompt("explain this");
+  await b.prompt("explain that");
+  a.fire("agent_start");
+  b.fire("agent_start");
+  turn(a, "omp", { stopReason: "toolUse", calls: ["task"], results: [toolResult("task")] });
+  turn(b, "pi");
+  turn(a, "omp", { turnIndex: 1 });
+  // The same event object arrives twice: one model call, one record.
+  const replayed = piTurnEnd({ turnIndex: 1 });
+  b.fire("turn_start");
+  b.fire("turn_end", replayed);
+  b.fire("turn_end", replayed);
+
+  const [a0, a1] = usageOf(a);
+  const [b0, b1] = usageOf(b);
+  assert.ok(a0 && a1 && b0 && b1);
+  assert.equal(usageOf(a).length, 2);
+  assert.equal(usageOf(b).length, 2);
+  assert.deepEqual([a0.sessionId, a1.sessionId], [a.sessionId, a.sessionId]);
+  assert.deepEqual([b0.sessionId, b1.sessionId], [b.sessionId, b.sessionId]);
+  const [decisionA] = decisionsOf(a);
+  const [decisionB] = decisionsOf(b);
+  assert.ok(decisionA && decisionB);
+  assert.notEqual(decisionA.decisionId, decisionB.decisionId);
+  assert.deepEqual([a0.decisionId, a1.decisionId], [decisionA.decisionId, decisionA.decisionId]);
+  assert.deepEqual([b0.decisionId, b1.decisionId], [decisionB.decisionId, decisionB.decisionId]);
+  assert.equal(a0.runId, a1.runId);
+  assert.equal(b0.runId, b1.runId);
+  assert.notEqual(a0.runId, b0.runId);
+  // A tool result's own usage (and its details' usage) is not this turn's usage.
+  assert.deepEqual(a0.tokens, { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, reasoning: null });
+  assert.equal(a0.costTotal, 0.0005);
+  assert.deepEqual([a0.toolCalls, a0.toolErrors], [{ task: 1 }, 0]);
+  a.shutdown();
+  b.shutdown();
+});
+
+test("usage: opt-out writes no usage record in any layer", async () => {
+  const explicit = path.join(home, "explicit.json");
+  const layers: Array<{ reason: string; arrange: () => void }> = [
+    { reason: "machine-off", arrange: () => writeConfig({ telemetry: false }) },
+    { reason: "machine-unreadable", arrange: () => fs.writeFileSync(GLOBAL_FILE(), "{ not json") },
+    {
+      reason: "config-error",
+      arrange: () => fs.writeFileSync(GLOBAL_FILE(), JSON.stringify({ backend: "jev", jev: { timeoutMs: 30000 } })),
+    },
+    {
+      reason: "config-off",
+      arrange: () => {
+        fs.writeFileSync(
+          explicit,
+          JSON.stringify({ skills: { enabled: true }, telemetry: false, ...endpointConfig() }),
+        );
+        process.env.LOADOUT_CONFIG = explicit;
+      },
+    },
+  ];
+  try {
+    for (const { reason, arrange } of layers) {
+      writeConfig({});
+      delete process.env.LOADOUT_CONFIG;
+      arrange();
+      const host = fakeHost("omp");
+      await host.prompt("explain this");
+      host.fire("agent_start");
+      turn(host, "omp", { stopReason: "toolUse", calls: ["read"] });
+      turn(host, "omp", { turnIndex: 1 });
+      assert.deepEqual(host.entries, [], reason);
+      assert.ok(!host.calls.includes("append"), reason);
+      await host.command("status");
+      assert.match(host.notes.join("\n"), new RegExp(`telemetry: off \\(${reason}\\) \\| suppressed 3`), reason);
+      host.shutdown();
+    }
+  } finally {
+    delete process.env.LOADOUT_CONFIG;
+  }
+});
+
+test("usage: canaries in messages, arguments, results and errors never reach a record", async () => {
+  for (const kind of ["omp", "pi"] as const) {
+    const host = fakeHost(kind);
+    await host.prompt("explain this");
+    host.fire("agent_start");
+    const build = kind === "pi" ? piTurnEnd : ompTurnEnd;
+    const events = [
+      build({ stopReason: "error", calls: ["read"] }),
+      build({ turnIndex: 1, calls: ["read"], results: [toolResult("read", true)] }),
+    ];
+    // Guard: every canary is really in the events, so a clean record is not a clean input.
+    for (const canary of Object.values(CANARY)) assert.ok(JSON.stringify(events).includes(canary), canary);
+    for (const event of events) {
+      host.fire("turn_start");
+      host.fire("turn_end", event);
+    }
+    assert.equal(usageOf(host).length, 2, kind);
+    assert.doesNotMatch(JSON.stringify(usageOf(host)), /CANARY/, kind);
+    host.shutdown();
+  }
+});
+
+test("usage: a failing append never reaches the agent and later turns are still recorded", async () => {
+  const host = fakeHost("pi", {
+    onAppend: (call) =>
+      call >= 2 ? errorWith("EACCES: permission denied, open '/home/x/secret-dir/s.jsonl'", "EACCES") : undefined,
+  });
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  assert.equal(host.entries.length, 1);
+  const tools = [...host.active()];
+
+  assert.doesNotThrow(() => {
+    turn(host, "pi");
+    turn(host, "pi", { turnIndex: 1 });
+  });
+  assert.equal(host.entries.length, 1);
+  assert.equal(host.notes.filter((note) => /telemetry record not stored \(EACCES\)/.test(note)).length, 1);
+  assert.deepEqual(host.active(), tools);
+
+  host.setAppendFault(null);
+  turn(host, "pi", { turnIndex: 2 });
+  assert.equal(usageOf(host).length, 1);
+
+  await host.command("status");
+  assert.match(host.notes.join("\n"), /failed 2 \(EACCES\)/);
+  assert.match(host.notes.join("\n"), /handed to host 2/);
+  assert.doesNotMatch(host.notes.join("\n") + JSON.stringify(host.entries), /secret-dir/);
+  host.shutdown();
+});
+
+test("usage: hostile events never throw and never change the event", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  const notes = host.notes.length;
+
+  for (const hostile of [null, undefined, 7, "x", []]) assert.equal(host.fire("turn_end", hostile), undefined);
+  assert.equal(usageOf(host).length, 0);
+  assert.equal(host.notes.length, notes);
+
+  const throwing = {
+    type: "turn_end",
+    turnIndex: 0,
+    toolResults: [],
+    get message(): unknown {
+      throw new Error("CANARY_THROWN_TEXT");
+    },
+  };
+  assert.equal(host.fire("turn_end", throwing), undefined);
+  assert.equal(host.notes.filter((note) => /telemetry record not stored \(error\)/.test(note)).length, 1);
+  assert.doesNotMatch(host.notes.join("\n"), /CANARY/);
+
+  const event = piTurnEnd({ calls: ["read"], results: [toolResult()] });
+  const before = structuredClone(event);
+  assert.equal(host.fire("turn_end", event), undefined);
+  assert.deepEqual(event, before);
+  assert.equal(usageOf(host).length, 1);
+  host.shutdown();
+});
+
+test("usage: classifier calls are not model turns", async () => {
+  reply.extra = { usage: { input_tokens: 4141, output_tokens: 313 } };
+  const host = fakeHost("omp");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  assert.deepEqual(decisionsOf(host)[0]?.classifier?.usage, { inputTokens: 4141, outputTokens: 313 });
+  assert.equal(usageOf(host).length, 0);
+
+  turn(host, "omp");
+  const records = usageOf(host);
+  assert.equal(records.length, 1);
+  assert.deepEqual(records[0]?.tokens, { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, reasoning: null });
+  host.shutdown();
+});
+
+test("usage: skip decisions link too", async () => {
+  writeConfig({ enabled: false });
+  const host = fakeHost("omp");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  turn(host, "omp");
+  const [decision] = decisionsOf(host);
+  assert.equal(decision?.outcome, "skipped");
+  assert.match(decision?.decisionId ?? "", ID_PATTERN);
+  assert.equal(usageOf(host)[0]?.decisionId, decision?.decisionId);
+  host.shutdown();
+});
+
+test("usage: a config reload inside a run does not split the run", async () => {
+  const other = path.join(path.dirname(project), "other-cwd");
+  fs.mkdirSync(other, { recursive: true });
+  const host = fakeHost("omp");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  turn(host, "omp");
+  host.setCwd(other);
+  await host.prompt("and this");
+  turn(host, "omp", { turnIndex: 1 });
+
+  const [first, second] = usageOf(host);
+  const [d1, d2] = decisionsOf(host).map((decision) => decision.decisionId);
+  assert.ok(first && second);
+  assert.equal(second.runId, first.runId);
+  assert.deepEqual([first.decisionId, second.decisionId], [d1, d2]);
   host.shutdown();
 });

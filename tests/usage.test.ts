@@ -1,11 +1,27 @@
 /**
- * The usage tracker and the observation builder, driven directly with synthetic `turn_end` events.
+ * The usage tracker and the observation builder, driven directly with synthetic `turn_end` events, and the plugin
+ * inside real in-process pi sessions on pi's faux provider (no network, no credentials).
  */
 
-import { test } from "node:test";
+import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import { findPackageJSON } from "node:module";
+import * as os from "node:os";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { ID_PATTERN, newId, type UsageObservationV1 } from "../src/telemetry.ts";
+import {
+  type AgentSession,
+  createAgentSession,
+  DefaultResourceLoader,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+
+import loadout from "../src/index.ts";
+import { type DecisionRecordV3, ID_PATTERN, newId, type UsageObservationV1 } from "../src/telemetry.ts";
 import {
   armDecision,
   clearRetry,
@@ -28,6 +44,12 @@ import {
   toolResult,
   type TurnSpec,
 } from "./fixtures/usage-events.ts";
+
+// npm nests pi-ai under pi's shrinkwrap, Bun hoists it: resolve from pi so both layouts load pi's own copy.
+const piAiJson = findPackageJSON("@earendil-works/pi-ai", import.meta.resolve("@earendil-works/pi-coding-agent"));
+if (piAiJson === undefined) throw new Error("@earendil-works/pi-ai not found next to @earendil-works/pi-coding-agent");
+const piAiEntry = path.join(path.dirname(piAiJson), JSON.parse(fs.readFileSync(piAiJson, "utf8")).exports["."].import);
+const { fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(piAiEntry).href);
 
 const SESSION = "session-usage-1";
 const KEYS = [
@@ -395,4 +417,184 @@ test("usage: the record is rebuilt from an allowlist", () => {
   assert.doesNotMatch(JSON.stringify(observation), /CANARY/);
   assert.deepEqual(Object.keys(observation).sort(), KEYS);
   assert.deepEqual(observation.toolCalls, { read: 1 });
+});
+
+// Real pi sessions: the plugin loaded as an extension of an in-process AgentSession on pi's faux provider.
+
+let home = "";
+
+before(() => {
+  home = fs.mkdtempSync(path.join(os.tmpdir(), "loadout-usage-"));
+  fs.mkdirSync(path.join(home, ".omp"));
+  process.env.HOME = home;
+  delete process.env.LOADOUT_CONFIG;
+});
+
+after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+async function piSession(loadoutConfig: Record<string, unknown>) {
+  fs.writeFileSync(path.join(home, ".omp", "loadout.json"), JSON.stringify(loadoutConfig));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "loadout-usage-pi-"));
+  const cwd = path.join(root, "cwd");
+  const agentDir = path.join(root, "agent");
+  fs.mkdirSync(cwd);
+  fs.mkdirSync(agentDir);
+  fs.writeFileSync(path.join(cwd, "notes.txt"), "synthetic notes\n");
+  const faux = fauxProvider({ models: [{ id: "faux-1" }] });
+  const modelRuntime = await ModelRuntime.create({
+    authPath: path.join(agentDir, "auth.json"),
+    modelsPath: path.join(agentDir, "models.json"),
+  });
+  modelRuntime.registerNativeProvider(faux.provider);
+  const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, extensionFactories: [loadout] });
+  await resourceLoader.reload();
+  const { session } = await createAgentSession({
+    cwd,
+    agentDir,
+    model: faux.getModel(),
+    modelRuntime,
+    resourceLoader,
+    sessionManager: SessionManager.inMemory(cwd),
+    settingsManager: SettingsManager.inMemory({
+      compaction: { enabled: false },
+      retry: { enabled: true, maxRetries: 2, baseDelayMs: 10 },
+    }),
+    tools: ["read"],
+  });
+  return {
+    session,
+    faux,
+    dispose: () => {
+      session.dispose();
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function customEntries(session: AgentSession, customType: string): unknown[] {
+  return session.sessionManager
+    .getEntries()
+    .flatMap((entry) => (entry.type === "custom" && entry.customType === customType ? [entry.data] : []));
+}
+
+const usageEntries = (session: AgentSession) => customEntries(session, "loadout.usage") as UsageObservationV1[];
+const decisionEntries = (session: AgentSession) => customEntries(session, "loadout.decision") as DecisionRecordV3[];
+
+/** The persisted assistant message that a record's `hostEntryId` points at. */
+function assistantMessageOf(session: AgentSession, entryId: string | null) {
+  const entry = entryId === null ? undefined : session.sessionManager.getEntry(entryId);
+  assert.ok(entry?.type === "message" && entry.message.role === "assistant", `no assistant message entry ${entryId}`);
+  return entry.message;
+}
+
+test("pi session: two model turns and a tool call give two observations linked to the decision", async () => {
+  const { session, faux, dispose } = await piSession({ enabled: false, notify: false });
+  try {
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("DONE"),
+    ]);
+    await session.prompt("Read notes.txt and reply DONE.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    const decisions = decisionEntries(session);
+    const usages = usageEntries(session);
+    assert.equal(decisions.length, 1);
+    assert.equal(usages.length, 2);
+    const [first, second] = usages;
+    assert.ok(first && second);
+    assert.equal(first.decisionId, decisions[0]?.decisionId);
+    assert.equal(second.decisionId, decisions[0]?.decisionId);
+    assert.equal(first.runId, second.runId);
+    assert.deepEqual([first.turnIndex, second.turnIndex], [0, 1]);
+    assert.deepEqual([first.host, second.host], ["pi", "pi"]);
+    assert.deepEqual([first.toolCalls, second.toolCalls], [{ read: 1 }, {}]);
+    assert.deepEqual([first.toolErrors, second.toolErrors], [0, 0]);
+    for (const observation of usages) {
+      const message = assistantMessageOf(session, observation.hostEntryId);
+      assert.equal(message.stopReason, observation.stopReason);
+      assert.equal(message.usage.input, observation.tokens.input);
+      assert.equal(message.usage.cost.total, observation.costTotal);
+    }
+  } finally {
+    dispose();
+  }
+});
+
+test("pi session: a second prompt starts a new run under its own decision", async () => {
+  const { session, faux, dispose } = await piSession({ enabled: false, notify: false });
+  try {
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("first done"),
+      fauxAssistantMessage("second done"),
+    ]);
+    await session.prompt("Read notes.txt and reply.");
+    await session.prompt("Reply once more.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    const decisions = decisionEntries(session);
+    const usages = usageEntries(session);
+    assert.equal(decisions.length, 2);
+    assert.equal(usages.length, 3);
+    const [first, , third] = usages;
+    assert.ok(first && third);
+    assert.notEqual(third.runId, first.runId);
+    assert.equal(third.turnIndex, 0);
+    assert.equal(third.decisionId, decisions[1]?.decisionId);
+    assert.notEqual(decisions[1]?.decisionId, decisions[0]?.decisionId);
+    assert.equal(new Set(usages.map((observation) => observation.eventId)).size, 3);
+  } finally {
+    dispose();
+  }
+});
+
+test("pi session: a provider error and its continuation are two observations and the continuation is unassigned", async () => {
+  const { session, faux, dispose } = await piSession({ enabled: false, notify: false });
+  try {
+    faux.setResponses([
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 Service Unavailable: overloaded" }),
+      fauxAssistantMessage("recovered"),
+    ]);
+    await session.prompt("Reply once.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    const decisions = decisionEntries(session);
+    const usages = usageEntries(session);
+    assert.equal(decisions.length, 1);
+    assert.equal(usages.length, 2);
+    const [failed, recovered] = usages;
+    assert.ok(failed && recovered);
+    assert.equal(failed.stopReason, "error");
+    assert.equal(failed.decisionId, decisions[0]?.decisionId);
+    assert.equal(assistantMessageOf(session, failed.hostEntryId).stopReason, "error");
+    assert.equal(recovered.stopReason, "stop");
+    assert.equal(recovered.decisionId, null);
+    assert.notEqual(recovered.runId, failed.runId);
+    assert.equal(recovered.turnIndex, 0);
+    assert.equal(recovered.retryAttempt, null);
+  } finally {
+    dispose();
+  }
+});
+
+test("pi session: machine telemetry off writes nothing while the turns complete", async () => {
+  const { session, faux, dispose } = await piSession({ telemetry: false, enabled: false, notify: false });
+  try {
+    faux.setResponses([
+      fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage("DONE"),
+    ]);
+    await session.prompt("Read notes.txt and reply DONE.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    const entries = session.sessionManager.getEntries();
+    assert.equal(
+      entries.filter((entry) => entry.type === "custom" && entry.customType.startsWith("loadout.")).length,
+      0,
+    );
+    assert.equal(entries.filter((entry) => entry.type === "message" && entry.message.role === "assistant").length, 2);
+  } finally {
+    dispose();
+  }
 });
