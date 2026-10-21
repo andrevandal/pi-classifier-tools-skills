@@ -12,6 +12,8 @@ Source of truth: [`src/telemetry.ts`](../src/telemetry.ts). This page is in the 
 
 `loadout.decision` and `loadout.usage` are session entries the host stores next to the conversation. `loadout.http` is not one: it is a line in the Laya server's log (section 8). The plugin only appends the session entries. Apart from `/loadout stats`, which reads the session files, it never reads them back.
 
+Retention is not managed here. Session entries stay in the host's session file for as long as the host keeps that file, and `loadout.http` lines stay in the server's log for as long as its receiver keeps them (the journal under systemd). The plugin and the server delete, rotate, expire and copy nothing, and an opt-out deletes nothing already written.
+
 ## 2. Privacy
 
 Never stored: prompt text, skill descriptions, rubrics, endpoints, environment variable names, file paths, backend response or error text, and any payload that is not in an allowlist below.
@@ -800,3 +802,4 @@ Failed (abridged): `"outcome":"failed","failure":"unavailable","tools":null`, a 
 - `/loadout stats export` puts the whole export in one notification, so use `loadout-report` for large scopes (section 11b).
 - The text view's `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records (section 11b).
 - A config reload (a cwd or project-trust change) can change the telemetry setting in the middle of a session, while the latest observation and the counters carry over. Afterwards `explain` names the reason in force now for a record built earlier (it can read `record not stored: telemetry off (default)` for a record that was suppressed before the reload), and `stats` can say that nothing from this process was stored although the process handed records to the host before the reload.
+- A tarball packed from a development checkout also holds that checkout's git-ignored Python bytecode (for example `python/__pycache__/*.pyc`): `files` in `package.json` names the whole `python` directory, and a root `.gitignore` does not narrow it. The local activation runs the plugin and the service from the checkout, so no tarball is published.
