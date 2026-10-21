@@ -18,6 +18,7 @@ import {
   tally,
   transcriptTotals,
 } from "../src/report/summary.ts";
+import { renderSummary } from "../src/report/text.ts";
 import { DECISION_ENTRY, USAGE_ENTRY } from "../src/telemetry.ts";
 import {
   application,
@@ -30,11 +31,13 @@ import {
   httpRecord,
   INVENTED_TOOL_NAMES,
   R1,
+  ratchet,
   reportInput,
   serviceLog,
   settings,
   tmp,
   toolCallTurn,
+  tools,
   usageV1,
   uuid,
   writeBranches,
@@ -186,7 +189,7 @@ test("summary: mixed v2 and v3 history keeps counts, unknowns and coverage", () 
   checkStats(lowConfidence?.closestNarrowerRisk as Stats, one(0.27), "closestNarrowerRisk");
   assert.equal(lowConfidence?.riskUnknown, 0);
   assert.deepEqual(lowConfidence?.maxRisk, [0.1]);
-  assert.deepEqual(lead("ratchet-refused"), {});
+  assert.deepEqual(lead("ratchet-refused"), { dryRun: 0 });
 
   assert.deepEqual(s.coverage.files, { read: 1, unreadable: 0, withoutHeader: 0, skippedByMtime: 0 });
   assert.equal(s.coverage.malformedLines, 0);
@@ -520,6 +523,70 @@ test("summary: leads are descriptive and appear only with evidence", () => {
     "candidate-limit": 0,
     "application-failed": 0,
   });
+});
+
+test("summary: the ratchet-refused lead counts live and dry-run refusals, and reports the dry-run share", () => {
+  const refused = ratchet({ narrowAllowed: false, before: "full", after: "full", admitted: false });
+  const file = writeSession(path.join(tmp(), "ratchet.jsonl"), [
+    header({ id: "sess-M" }),
+    ...chain([
+      custom(
+        DECISION_ENTRY,
+        decisionV3({ eventId: uuid(1), ratchet: refused, application: application({ status: "not-admitted" }) }),
+      ),
+      custom(
+        DECISION_ENTRY,
+        decisionV3({
+          eventId: uuid(2),
+          settings: settings({ dryRun: true }),
+          ratchet: refused,
+          application: application({ status: "dry-run" }),
+        }),
+      ),
+      custom(
+        DECISION_ENTRY,
+        decisionV3({
+          eventId: uuid(3),
+          settings: settings({ dryRun: true }),
+          application: application({ status: "dry-run" }),
+        }),
+      ),
+      custom(
+        DECISION_ENTRY,
+        decisionV3({
+          eventId: uuid(4),
+          tools: tools({ active: null }),
+          ratchet: refused,
+          application: application({ status: "unchanged" }),
+        }),
+      ),
+    ]),
+  ]);
+  const s = summarize(reportInput([file]));
+  const lead = s.leads.find((candidate) => candidate.id === "ratchet-refused");
+  assert.equal(lead?.count, 2, "the live and the dry-run refusal");
+  assert.equal(lead?.of, 3, "narrowing proposals only; the keep-baseline record is outside the population");
+  assert.deepEqual(lead?.evidence, { dryRun: 1 });
+  assert.equal(s.decisions.blockers["ratchet-refused"], 2);
+  assert.equal(
+    s.decisions.ratchet.blocked,
+    3,
+    "the keep-baseline record's refused ratchet is counted here, not in the lead",
+  );
+  assert.match(renderSummary(s), /ratchet-refused: 2 of 3 \| dry run: 1/);
+
+  const live = writeSession(path.join(tmp(), "live.jsonl"), [
+    header({ id: "sess-M" }),
+    ...chain([
+      custom(
+        DECISION_ENTRY,
+        decisionV3({ eventId: uuid(1), ratchet: refused, application: application({ status: "not-admitted" }) }),
+      ),
+    ]),
+  ]);
+  const liveSummary = summarize(reportInput([live]));
+  assert.deepEqual(liveSummary.leads.find((candidate) => candidate.id === "ratchet-refused")?.evidence, { dryRun: 0 });
+  assert.doesNotMatch(renderSummary(liveSummary), /dry run:/);
 });
 
 test("summary: empty input is zero counts and null statistics", () => {

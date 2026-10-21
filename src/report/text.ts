@@ -109,6 +109,8 @@ function evidenceText(lead: Lead): string | null {
       return `eligible ${statsText(e.eligible, ms)}, limit ${numbers(e.maxCandidates, String) || "unknown"}`;
     case "application-failed":
       return `errors ${countsText(e.errors)}`;
+    case "ratchet-refused":
+      return finite(e.dryRun) && e.dryRun > 0 ? `dry run: ${e.dryRun}` : null;
     default:
       return null;
   }

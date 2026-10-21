@@ -482,7 +482,7 @@ A lead is a count with the population it is out of. Leads name no remedy and mak
 | --- | --- | --- | --- |
 | `classifier-failed` | failed attempts | attempts | `failures` (per failure reason); `guardFired` (failed attempts whose budget guard fired); `serverEvidence`: `null` without a service log, else `joined` (the failed attempts' joined records) and their `outcomes` |
 | `low-confidence` | attempts whose tools reason is `low-confidence` | attempts with a tools record | `closestNarrowerRisk` (`Stats` of each attempt's smallest known risk among narrower profiles); `riskUnknown` (attempts with no known narrower risk); `maxRisk` (distinct values, sorted) |
-| `ratchet-refused` | narrowing proposals whose application status is `not-admitted` | narrowing proposals with an application record | none (`{}`) |
+| `ratchet-refused` | narrowing proposals whose `ratchet.admitted` is false, whatever the application status (`not-admitted` live, `dry-run` in a dry run) | narrowing proposals with an application record | `dryRun` (how many of the counted refusals have application status `dry-run`; the text view prints `dry run: <n>` only when `n` > 0) |
 | `candidate-limit` | attempts whose skill reason is `too-many-candidates` | attempts with a skills record | `eligible` (`Stats`); `maxCandidates` (distinct values, sorted) |
 | `application-failed` | attempts whose application status is `failed` | attempts with an application record | `errors` (per error code, `unknown` when none); `restoration` (per restoration value, `none` when none) |
 
@@ -800,4 +800,3 @@ Failed (abridged): `"outcome":"failed","failure":"unavailable","tools":null`, a 
 - `/loadout stats export` puts the whole export in one notification, so use `loadout-report` for large scopes (section 11b).
 - The text view's `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records (section 11b).
 - A config reload (a cwd or project-trust change) can change the telemetry setting in the middle of a session, while the latest observation and the counters carry over. Afterwards `explain` names the reason in force now for a record built earlier (it can read `record not stored: telemetry off (default)` for a record that was suppressed before the reload), and `stats` can say that nothing from this process was stored although the process handed records to the host before the reload.
-- The blockers section of the `stats` text counts `ratchet-refused` by application status, so a dry run whose proposal the ratchet would have refused is not counted there. The JSON `decisions.ratchet.blocked` counts every record whose ratchet did not admit the proposal, dry runs included.

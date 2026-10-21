@@ -536,7 +536,8 @@ function leadCandidates(
   const narrowing = attempts.filter(
     (attempt) => attempt.view.application !== null && attempt.view.tools?.active != null,
   );
-  const refused = narrowing.filter((attempt) => attempt.view.application?.status === "not-admitted");
+  // The ratchet is evaluated in a dry run too (src/index.ts), so the application status only says whether it was applied.
+  const refused = narrowing.filter((attempt) => attempt.view.ratchet?.admitted === false);
 
   const withSkills = attempts.filter((attempt) => attempt.view.skills !== null);
   const limited = withSkills.filter((attempt) => attempt.view.skills?.reason === "too-many-candidates");
@@ -568,7 +569,12 @@ function leadCandidates(
         maxRisk: sortedDistinct(lowConfidence.map((attempt) => attempt.view.tools?.maxRisk ?? null)),
       },
     },
-    { id: "ratchet-refused", count: refused.length, of: narrowing.length, evidence: {} },
+    {
+      id: "ratchet-refused",
+      count: refused.length,
+      of: narrowing.length,
+      evidence: { dryRun: refused.filter((attempt) => attempt.view.application?.status === "dry-run").length },
+    },
     {
       id: "candidate-limit",
       count: limited.length,
