@@ -13,10 +13,11 @@ import type { AddressInfo, Socket } from "node:net";
 
 import { createClassifier, type LayaSpawn } from "../src/classify/index.ts";
 import { createHttpClassifier } from "../src/classify/http.ts";
+import { createJevClassifier } from "../src/classify/jev.ts";
 import { createLayaHttpClassifier } from "../src/classify/laya-http.ts";
 import { defaultConfig } from "../src/config.ts";
 import { ClassifierError } from "../src/types.ts";
-import type { Answers, LayaBackendConfig, Questions, LoadoutConfig } from "../src/types.ts";
+import type { Answers, LayaBackendConfig, Questions, LoadoutConfig, ServerTiming } from "../src/types.ts";
 
 const TOKEN_VAR = "CLASS_ROUTER_TEST_LAYAA_HTTP_TOKEN";
 const TOKEN = "s3cret-laya-token";
@@ -86,6 +87,23 @@ const server = http.createServer((request, response) => {
         response.writeHead(200, { "Content-Type": "application/json" });
         response.end(JSON.stringify({ model: "laya-stub", answers: [] }));
         return;
+      case "/timing":
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Server-Timing": "queue;dur=1.500, infer;dur=38.250",
+        });
+        response.end(JSON.stringify({ model: "laya-stub", answers: ANSWERS }));
+        return;
+      case "/failed-with-timing":
+        response.writeHead(500, { "Content-Type": "application/json", "Server-Timing": "queue;dur=2, infer;dur=40" });
+        response.end(JSON.stringify({ error: "ValueError: CANARY-BODY" }));
+        return;
+      case "/garbage-with-timing":
+        response.writeHead(200, { "Server-Timing": "queue;dur=2, infer;dur=40" });
+        response.end("this is not json");
+        return;
+      case "/stall":
+        return; // never answers: only the client's own timeout or abort ends the call
       default:
         response.writeHead(404);
         response.end();
@@ -296,4 +314,146 @@ test("createClassifier still uses the python sidecar for the python transport", 
   const error = await rejection(classifier.classify("x", QUESTIONS), "unavailable");
   assert.match(error.message, /could not spawn laya worker/);
   assert.equal(spawnCalls.length, 1);
+});
+
+// --- request correlation and server timing ---------------------------------------------------------------------------
+
+const REQUEST_ID = "6f1c2a9e-3b4d-4c5e-8f60-7a8b9c0d1e2f";
+
+test("laya http sends the request id and reads the server's queue and inference time", async () => {
+  const laya = createLayaHttpClassifier(layaConfig("/timing"), { env: {} });
+  const result = await laya.classify("x", QUESTIONS, { requestId: REQUEST_ID });
+
+  const headers = captured.at(-1)!.headers;
+  assert.equal(headers["x-request-id"], REQUEST_ID);
+  assert.equal("x-loadout-telemetry" in headers, false);
+  assert.deepEqual(result.timing, { queueMs: 1.5, inferenceMs: 38.25 });
+  assert.deepEqual(result.answers, ANSWERS, "the answers are unaffected");
+});
+
+test("an opted-out request carries the off signal and no request id, even if one is offered", async () => {
+  const laya = createLayaHttpClassifier(layaConfig("/timing"), { env: {} });
+  await laya.classify("x", QUESTIONS, { requestId: REQUEST_ID, telemetryOff: true });
+
+  const headers = captured.at(-1)!.headers;
+  assert.equal(headers["x-loadout-telemetry"], "off");
+  assert.equal("x-request-id" in headers, false);
+});
+
+test("a call without telemetry options sends no correlation header", async () => {
+  await createLayaHttpClassifier(layaConfig("/timing"), { env: {} }).classify("x", QUESTIONS);
+  const headers = captured.at(-1)!.headers;
+  assert.equal("x-request-id" in headers, false);
+  assert.equal("x-loadout-telemetry" in headers, false);
+});
+
+test("a request id that is not a UUIDv4 is never sent, and the call still succeeds", async () => {
+  const laya = createLayaHttpClassifier(layaConfig("/ok"), { env: {} });
+  for (const requestId of ["", "not-an-id", REQUEST_ID.toUpperCase(), `${REQUEST_ID}\r\nX-Injected: 1`]) {
+    const result = await laya.classify("x", QUESTIONS, { requestId });
+    assert.deepEqual(result.answers, ANSWERS);
+    const headers = captured.at(-1)!.headers;
+    assert.equal("x-request-id" in headers, false, JSON.stringify(requestId));
+    assert.equal("x-injected" in headers, false);
+  }
+});
+
+test("jev never receives correlation headers and never has its timing read", async () => {
+  const jevOptions = { model: "jev-test-model", apiKeyEnvVar: "", timeoutMs: 2000 };
+  const timed = createJevClassifier({ ...jevOptions, endpoint: `${endpoint}/timing` }, { env: {} });
+  const failing = createJevClassifier({ ...jevOptions, endpoint: `${endpoint}/failed-with-timing` }, { env: {} });
+
+  for (const options of [{ requestId: REQUEST_ID }, { telemetryOff: true }]) {
+    const result = await timed.classify("x", QUESTIONS, options);
+    const headers = captured.at(-1)!.headers;
+    assert.equal("x-request-id" in headers, false);
+    assert.equal("x-loadout-telemetry" in headers, false);
+    assert.equal("timing" in result, false, "the server sent a timing header; jev ignores it");
+  }
+  // The HTTP status of a failed call is plain HTTP, so jev reports it; its timing is still not read.
+  const error = await rejection(failing.classify("x", QUESTIONS), "unavailable", "jev");
+  assert.deepEqual([error.status, error.timing], [500, undefined]);
+});
+
+test("only plain queue and infer durations are read; anything else stays unknown", async () => {
+  const table: Array<[string, ServerTiming | undefined]> = [
+    ["queue;dur=0, infer;dur=12.5", { queueMs: 0, inferenceMs: 12.5 }],
+    ["infer;dur=12.5", { inferenceMs: 12.5 }],
+    ["queue;dur=3", { queueMs: 3 }],
+    ['cache;desc="hit", queue;dur=1.25, infer;dur=2;desc="x"', { queueMs: 1.25, inferenceMs: 2 }],
+    ["queue;dur=1, queue;dur=2, infer;dur=3", { inferenceMs: 3 }],
+    ['queue;desc="a, b";dur=7, queue;dur=9', undefined],
+    ["queue;dur=-1, infer;dur=NaN", undefined],
+    ["queue;dur=1e3", undefined],
+    ["queue;dur=Infinity", undefined],
+    ["queue;dur=12345678901", undefined],
+    ["queue", undefined],
+    ["queue;dur=", undefined],
+    ['queue;dur="5"', undefined],
+    ["queue;dur=CANARY-SECRET, infer;dur=CANARY-SECRET", undefined],
+    ["", undefined],
+  ];
+  for (const [header, expected] of table) {
+    const fetchImpl = async (): Promise<Response> =>
+      new Response(JSON.stringify({ answers: ANSWERS }), {
+        headers: { "Content-Type": "application/json", "Server-Timing": header },
+      });
+    const laya = createHttpClassifier(
+      {
+        name: "laya",
+        endpoint: "http://stub.invalid/",
+        model: null,
+        apiKeyEnvVar: "",
+        timeoutMs: 2000,
+        correlation: true,
+      },
+      { env: {}, fetchImpl },
+    );
+    const result = await laya.classify("x", QUESTIONS);
+    assert.deepEqual(result.answers, ANSWERS, header);
+    if (expected === undefined) assert.equal("timing" in result, false, header);
+    else assert.deepEqual(result.timing, expected, header);
+    assert.equal(JSON.stringify(result).includes("CANARY"), false);
+  }
+});
+
+test("a failed call carries the HTTP status and the phases the server reported, nothing from the body", async () => {
+  const failed = await rejection(
+    createLayaHttpClassifier(layaConfig("/failed-with-timing"), { env: {} }).classify("x", QUESTIONS, {
+      requestId: REQUEST_ID,
+    }),
+    "unavailable",
+  );
+  assert.deepEqual([failed.status, failed.timing], [500, { queueMs: 2, inferenceMs: 40 }]);
+  assert.equal(JSON.stringify({ status: failed.status, timing: failed.timing }).includes("CANARY"), false);
+
+  const rejected = await rejection(
+    createLayaHttpClassifier(layaConfig("/unauthorized"), { env: {} }).classify("x", QUESTIONS),
+    "auth",
+  );
+  assert.deepEqual([rejected.status, rejected.timing], [401, undefined]);
+
+  const malformed = await rejection(
+    createLayaHttpClassifier(layaConfig("/garbage-with-timing"), { env: {} }).classify("x", QUESTIONS),
+    "protocol",
+  );
+  assert.deepEqual([malformed.status, malformed.timing], [200, { queueMs: 2, inferenceMs: 40 }]);
+});
+
+test("a call that never got a response carries no status and no timing", async () => {
+  const timedOut = await rejection(
+    createLayaHttpClassifier(layaConfig("/stall", "", 100), { env: {} }).classify("x", QUESTIONS, {
+      requestId: REQUEST_ID,
+    }),
+    "timeout",
+  );
+  assert.deepEqual([timedOut.status, timedOut.timing], [undefined, undefined]);
+
+  const controller = new AbortController();
+  const pending = createLayaHttpClassifier(layaConfig("/stall", "", 5000), { env: {} }).classify("x", QUESTIONS, {
+    signal: controller.signal,
+  });
+  controller.abort();
+  const aborted = await rejection(pending, "aborted");
+  assert.deepEqual([aborted.status, aborted.timing], [undefined, undefined]);
 });
