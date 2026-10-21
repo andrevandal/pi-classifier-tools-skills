@@ -26,6 +26,7 @@ import {
   armDecision,
   clearRetry,
   createUsageTracker,
+  deliverMessage,
   dropArmed,
   endContext,
   endRun,
@@ -37,6 +38,7 @@ import {
 } from "../src/usage.ts";
 import {
   CANARY,
+  INVENTED_TOOL_NAMES,
   ompTurnEnd,
   ompUsage,
   piTurnEnd,
@@ -72,11 +74,13 @@ const KEYS = [
 const NO_TOKENS = { input: null, output: null, cacheRead: null, cacheWrite: null, reasoning: null };
 /** The tokens of the default `ompUsage()`. */
 const DEFAULT_TOKENS = { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, reasoning: null };
+/** The tools this host has registered. Any other name in a tool call is model output, not a tool. */
+const REGISTERED: ReadonlySet<string> = new Set(["read", "bash", "edit", "task"]);
 
 /** One model turn the way the host runs it: `turn_start`, then `turn_end`. */
 function turn(tracker: UsageTracker, spec?: TurnSpec): UsageObservationV1 {
   openTurn(tracker);
-  const observation = observeTurn(tracker, SESSION, ompTurnEnd(spec));
+  const observation = observeTurn(tracker, SESSION, ompTurnEnd(spec), REGISTERED);
   assert.ok(observation, "an assistant turn is observed");
   return observation;
 }
@@ -144,7 +148,7 @@ test("usage: a decision armed inside an open run applies from the next turn only
   // Armed while a model call is in flight: that turn stays on d2, the next one is d3.
   openTurn(tracker);
   armDecision(tracker, d3);
-  const inFlight = observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 3 }));
+  const inFlight = observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 3 }), REGISTERED);
   assert.equal(inFlight?.decisionId, d2);
   assert.equal(turn(tracker, { turnIndex: 4 }).decisionId, d3);
 });
@@ -204,12 +208,12 @@ test("usage: context boundaries end the run; compaction keeps a pending decision
 
 test("usage: a turn seen without agent_start or turn_start still gets a run and no decision", () => {
   const tracker = createUsageTracker();
-  const first = observeTurn(tracker, SESSION, ompTurnEnd());
+  const first = observeTurn(tracker, SESSION, ompTurnEnd(), REGISTERED);
   assert.ok(first);
   assert.match(first.runId, ID_PATTERN);
   assert.equal(first.decisionId, null);
 
-  const second = observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 1 }));
+  const second = observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 1 }), REGISTERED);
   assert.equal(second?.runId, first.runId);
 
   // A turn start with no run opens one, and it claims the decision armed before it.
@@ -217,7 +221,7 @@ test("usage: a turn seen without agent_start or turn_start still gets a run and 
   const d1 = newId();
   armDecision(fresh, d1);
   openTurn(fresh);
-  const claimed = observeTurn(fresh, SESSION, ompTurnEnd());
+  const claimed = observeTurn(fresh, SESSION, ompTurnEnd(), REGISTERED);
   assert.equal(claimed?.decisionId, d1);
   assert.match(claimed?.runId ?? "", ID_PATTERN);
 });
@@ -231,6 +235,7 @@ test("usage: omp and pi turn_end payloads map to one schema with unsupported fie
       calls: ["read"],
       results: [toolResult()],
     }),
+    REGISTERED,
   );
   assert.ok(omp);
   assert.equal(omp.host, "omp");
@@ -250,6 +255,7 @@ test("usage: omp and pi turn_end payloads map to one schema with unsupported fie
       calls: ["read"],
       results: [toolResult()],
     }),
+    REGISTERED,
   );
   assert.ok(pi);
   assert.equal(pi.host, "pi");
@@ -259,9 +265,12 @@ test("usage: omp and pi turn_end payloads map to one schema with unsupported fie
   assert.equal(pi.errorStatus, null);
   assert.equal(pi.retryAttempt, null);
 
-  assert.equal(observeTurn(createUsageTracker(), SESSION, ompTurnEnd())?.tokens.reasoning, null);
-  assert.equal(observeTurn(createUsageTracker(), SESSION, piTurnEnd())?.tokens.reasoning, null);
-  assert.equal(observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ errorStatus: 503 }))?.errorStatus, 503);
+  assert.equal(observeTurn(createUsageTracker(), SESSION, ompTurnEnd(), REGISTERED)?.tokens.reasoning, null);
+  assert.equal(observeTurn(createUsageTracker(), SESSION, piTurnEnd(), REGISTERED)?.tokens.reasoning, null);
+  assert.equal(
+    observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ errorStatus: 503 }), REGISTERED)?.errorStatus,
+    503,
+  );
   for (const observation of [omp, pi]) assert.deepEqual(Object.keys(observation).sort(), KEYS);
 });
 
@@ -334,7 +343,7 @@ test("usage: error, aborted and missing-usage turns stay unknown instead of beco
     },
   ];
   for (const { name, spec, tokens, costTotal, stopReason, errorStatus } of cases) {
-    const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd(spec));
+    const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd(spec), REGISTERED);
     assert.ok(observation, name);
     assert.deepEqual(observation.tokens, tokens, name);
     assert.equal(observation.costTotal, costTotal, name);
@@ -343,7 +352,7 @@ test("usage: error, aborted and missing-usage turns stay unknown instead of beco
   }
 
   for (const stopReason of ["pending", "weird CANARY"]) {
-    const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ stopReason }));
+    const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ stopReason }), REGISTERED);
     assert.equal(observation?.stopReason, "other", stopReason);
   }
 });
@@ -367,8 +376,8 @@ test("usage: a host retry announcement marks only the next observation", () => {
 test("usage: a replayed turn_end counts once and only assistant messages are observed", () => {
   const tracker = createUsageTracker();
   const event = ompTurnEnd();
-  assert.ok(observeTurn(tracker, SESSION, event));
-  assert.equal(observeTurn(tracker, SESSION, event), null);
+  assert.ok(observeTurn(tracker, SESSION, event, REGISTERED));
+  assert.equal(observeTurn(tracker, SESSION, event, REGISTERED), null);
   assert.equal(tracker.observed, 1);
 
   const assistant = ompTurnEnd().message;
@@ -385,14 +394,14 @@ test("usage: a replayed turn_end counts once and only assistant messages are obs
     "turn_end",
     [event],
   ];
-  for (const value of ignored) assert.equal(observeTurn(tracker, SESSION, value), null);
+  for (const value of ignored) assert.equal(observeTurn(tracker, SESSION, value, REGISTERED), null);
   assert.equal(tracker.observed, 1);
 });
 
 test("usage: tool counts and errors come from this message and this turn's results only", () => {
   const calls = ["read", "read", "bash", "bash; CANARY", "__proto__", { type: "toolCall", id: "call_9", name: 42 }];
   const results = [toolResult("read", true), toolResult("read", false), { isError: "yes" }, null];
-  const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results }));
+  const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results }), REGISTERED);
   assert.ok(observation);
   assert.deepEqual(observation.toolCalls, { read: 2, bash: 1 });
   assert.equal(observation.toolErrors, 1);
@@ -400,23 +409,144 @@ test("usage: tool counts and errors come from this message and this turn's resul
   assert.deepEqual(observation.tokens, DEFAULT_TOKENS);
   assert.equal(observation.costTotal, 0.0005);
 
-  assert.equal(observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results: undefined }))?.toolErrors, null);
-  assert.equal(observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results: [] }))?.toolErrors, 0);
+  assert.equal(
+    observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results: undefined }), REGISTERED)?.toolErrors,
+    null,
+  );
+  assert.equal(
+    observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls, results: [] }), REGISTERED)?.toolErrors,
+    0,
+  );
+});
+
+test("usage: only names of registered tools are stored, so a name the model made up never reaches a record", () => {
+  const calls = ["read", ...INVENTED_TOOL_NAMES, "bash", "read"];
+  // Guard: the made-up names are in the event, and the record schema accepts the spelling of each one. When the host
+  // did register them they are counted, so the registry decides, not the spelling.
+  for (const name of INVENTED_TOOL_NAMES) assert.ok(JSON.stringify(ompTurnEnd({ calls })).includes(name), name);
+  const registeredToo = new Set([...REGISTERED, ...INVENTED_TOOL_NAMES]);
+  const counted = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls }), registeredToo);
+  assert.deepEqual(counted?.toolCalls, {
+    read: 2,
+    bash: 1,
+    ...Object.fromEntries(INVENTED_TOOL_NAMES.map((name) => [name, 1])),
+  });
+
+  const observation = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls }), REGISTERED);
+  assert.deepEqual(observation?.toolCalls, { read: 2, bash: 1 });
+  assert.doesNotMatch(JSON.stringify(observation), /CANARY|secret|example\.com|sk-live/);
+
+  // A registry that could not be read counts no names, and the rest of the record is intact.
+  const unreadable = observeTurn(createUsageTracker(), SESSION, ompTurnEnd({ calls }), new Set());
+  assert.deepEqual(unreadable?.toolCalls, {});
+  assert.deepEqual(unreadable?.tokens, DEFAULT_TOKENS);
+  assert.equal(unreadable?.stopReason, "stop");
 });
 
 test("usage: the record is rebuilt from an allowlist", () => {
   const event = {
-    ...piTurnEnd({ stopReason: "error", calls: ["read"], results: [toolResult("read", true)] }),
+    ...piTurnEnd({ stopReason: "error", calls: ["read", CANARY.tool], results: [toolResult("read", true)] }),
     entries: [{ type: "custom", customType: "x", data: CANARY.extra }],
   };
   // Guard: every canary is in the event, so a clean record is not a clean input.
   for (const canary of Object.values(CANARY)) assert.ok(JSON.stringify(event).includes(canary), canary);
 
-  const observation = observeTurn(createUsageTracker(), SESSION, event);
+  const observation = observeTurn(createUsageTracker(), SESSION, event, REGISTERED);
   assert.ok(observation);
   assert.doesNotMatch(JSON.stringify(observation), /CANARY/);
   assert.deepEqual(Object.keys(observation).sort(), KEYS);
   assert.deepEqual(observation.toolCalls, { read: 1 });
+});
+
+/** The host's `message_start` for a message with this role. */
+const messageStart = (role: unknown) => ({ type: "message_start", message: { role, content: CANARY.text } });
+
+test("usage: a user message that no decision hook claimed leaves the rest of the run unassigned", () => {
+  const tracker = createUsageTracker();
+  const [d1, d2] = [newId(), newId()];
+  armDecision(tracker, d1);
+  startRun(tracker);
+  // The prompt the hook classified arrives with the run's first turn.
+  openTurn(tracker);
+  deliverMessage(tracker, messageStart("user"));
+  const first = observeTurn(tracker, SESSION, ompTurnEnd(), REGISTERED);
+  assert.equal(first?.decisionId, d1);
+
+  // A queued follow-up or steer on pi: no hook ran, so only the host's turn start and its user message arrive.
+  openTurn(tracker);
+  deliverMessage(tracker, messageStart("user"));
+  const second = observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 1 }), REGISTERED);
+  assert.equal(second?.decisionId, null);
+  assert.equal(second?.runId, first?.runId);
+  // The turns that follow in the run stay unassigned.
+  assert.equal(turn(tracker, { turnIndex: 2 }).decisionId, null);
+
+  // The next hook starts a new run under its own decision.
+  armDecision(tracker, d2);
+  startRun(tracker);
+  openTurn(tracker);
+  deliverMessage(tracker, messageStart("user"));
+  const third = observeTurn(tracker, SESSION, ompTurnEnd(), REGISTERED);
+  assert.equal(third?.decisionId, d2);
+  assert.notEqual(third?.runId, first?.runId);
+
+  // A hook that built no decision (null) does not leave the previous decision on its message either.
+  armDecision(tracker, null);
+  openTurn(tracker);
+  deliverMessage(tracker, messageStart("user"));
+  assert.equal(observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 1 }), REGISTERED)?.decisionId, null);
+});
+
+test("usage: a user message that a hook claimed keeps its decision", () => {
+  const tracker = createUsageTracker();
+  const [d1, d2] = [newId(), newId()];
+  armDecision(tracker, d1);
+  startRun(tracker);
+  // Two user messages before the run's first model call (one queued before the first turn) are one turn of d1.
+  openTurn(tracker);
+  deliverMessage(tracker, messageStart("user"));
+  deliverMessage(tracker, messageStart("user"));
+  assert.equal(observeTurn(tracker, SESSION, ompTurnEnd(), REGISTERED)?.decisionId, d1);
+
+  // omp runs the hook for a queued follow-up: it is claimed at the turn start, before the user message.
+  armDecision(tracker, d2);
+  openTurn(tracker);
+  deliverMessage(tracker, messageStart("user"));
+  assert.equal(observeTurn(tracker, SESSION, ompTurnEnd({ turnIndex: 1 }), REGISTERED)?.decisionId, d2);
+  assert.equal(turn(tracker, { turnIndex: 2 }).decisionId, d2);
+});
+
+test("usage: only a user message changes the run, and anything else changes nothing", () => {
+  const tracker = createUsageTracker();
+  const d1 = newId();
+  armDecision(tracker, d1);
+  startRun(tracker);
+  // The first turn used the claim: from here on, a user message would unassign the run.
+  assert.equal(turn(tracker).decisionId, d1);
+
+  const roles = ["assistant", "toolResult", "custom", "developer", "bashExecution", 7, null, undefined];
+  const ignored: unknown[] = [
+    null,
+    undefined,
+    7,
+    "x",
+    [],
+    {},
+    { message: null },
+    { message: 7 },
+    { message: [] },
+    { message: {} },
+    { message: { role: ["user"] } },
+    { message: { role: "User" } },
+    ...roles.map(messageStart),
+  ];
+  for (const event of ignored) deliverMessage(tracker, event);
+  assert.equal(turn(tracker, { turnIndex: 1 }).decisionId, d1);
+
+  // Without a run there is nothing to unassign, and none is made up.
+  const empty = createUsageTracker();
+  deliverMessage(empty, messageStart("user"));
+  assert.equal(empty.run, null);
 });
 
 // Real pi sessions: the plugin loaded as an extension of an in-process AgentSession on pi's faux provider.
@@ -594,6 +724,95 @@ test("pi session: machine telemetry off writes nothing while the turns complete"
       0,
     );
     assert.equal(entries.filter((entry) => entry.type === "message" && entry.message.role === "assistant").length, 2);
+  } finally {
+    dispose();
+  }
+});
+
+const userMessageCount = (session: AgentSession) =>
+  session.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message.role === "user")
+    .length;
+
+test("pi session: a follow-up queued during a run is delivered without a decision hook and is unassigned", async () => {
+  const { session, faux, dispose } = await piSession({ enabled: false, notify: false });
+  try {
+    faux.setResponses([
+      // The follow-up is queued while the first model call is in flight, like a user typing during the reply.
+      async () => {
+        await session.followUp("Reply once more.");
+        return fauxAssistantMessage("first done");
+      },
+      fauxAssistantMessage("second done"),
+    ]);
+    await session.prompt("Reply once.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    // Guard: the follow-up ran inside this run as a second user message, and pi ran no second hook for it.
+    assert.equal(userMessageCount(session), 2);
+    const decisions = decisionEntries(session);
+    assert.equal(decisions.length, 1);
+    const usages = usageEntries(session);
+    assert.equal(usages.length, 2);
+    const [first, second] = usages;
+    assert.ok(first && second);
+    assert.equal(first.decisionId, decisions[0]?.decisionId);
+    assert.equal(second.decisionId, null);
+    assert.equal(second.runId, first.runId);
+    assert.deepEqual([first.turnIndex, second.turnIndex], [0, 1]);
+  } finally {
+    dispose();
+  }
+});
+
+test("pi session: a steer queued during a tool turn is delivered without a decision hook and is unassigned", async () => {
+  const { session, faux, dispose } = await piSession({ enabled: false, notify: false });
+  try {
+    faux.setResponses([
+      async () => {
+        await session.steer("Skip the rest.");
+        return fauxAssistantMessage([fauxToolCall("read", { path: "notes.txt" })], { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("steered"),
+    ]);
+    await session.prompt("Read notes.txt.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    assert.equal(userMessageCount(session), 2);
+    const decisions = decisionEntries(session);
+    assert.equal(decisions.length, 1);
+    const usages = usageEntries(session);
+    assert.equal(usages.length, 2);
+    const [first, second] = usages;
+    assert.ok(first && second);
+    assert.equal(first.stopReason, "toolUse");
+    assert.equal(first.decisionId, decisions[0]?.decisionId);
+    assert.equal(second.decisionId, null);
+    assert.equal(second.runId, first.runId);
+    assert.deepEqual([first.turnIndex, second.turnIndex], [0, 1]);
+  } finally {
+    dispose();
+  }
+});
+
+test("pi session: a tool name the model made up is not stored, a registered one is", async () => {
+  const { session, faux, dispose } = await piSession({ enabled: false, notify: false });
+  try {
+    const calls = [
+      fauxToolCall("read", { path: "notes.txt" }, { id: "call_1" }),
+      ...INVENTED_TOOL_NAMES.map((name, index) => fauxToolCall(name, {}, { id: `call_${index + 2}` })),
+    ];
+    faux.setResponses([fauxAssistantMessage(calls, { stopReason: "toolUse" }), fauxAssistantMessage("DONE")]);
+    await session.prompt("Read notes.txt.");
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    const [first] = usageEntries(session);
+    assert.ok(first);
+    // Guard: pi stored the made-up calls in the assistant message and flagged each one as a failed tool result.
+    const content = JSON.stringify(assistantMessageOf(session, first.hostEntryId).content);
+    for (const name of INVENTED_TOOL_NAMES) assert.ok(content.includes(name), name);
+    assert.equal(first.toolErrors, INVENTED_TOOL_NAMES.length);
+    assert.deepEqual(first.toolCalls, { read: 1 });
+    assert.doesNotMatch(JSON.stringify(usageEntries(session)), /CANARY|secret|example\.com|sk-live/);
   } finally {
     dispose();
   }

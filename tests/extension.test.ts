@@ -15,10 +15,19 @@ import { defaultConfig } from "../src/config.ts";
 import loadout from "../src/index.ts";
 import { type DecisionRecordV3, ID_PATTERN, normalizeDecision, type UsageObservationV1 } from "../src/telemetry.ts";
 import type { Answers } from "../src/types.ts";
-import { CANARY, ompTurnEnd, piTurnEnd, toolResult, type TurnSpec } from "./fixtures/usage-events.ts";
+import {
+  CANARY,
+  INVENTED_TOOL_NAMES,
+  ompTurnEnd,
+  piTurnEnd,
+  toolResult,
+  type TurnSpec,
+} from "./fixtures/usage-events.ts";
 
 const TOKEN_VAR = "LOADOUT_TEST_TOKEN";
 const BASELINE = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+/** Every tool the fake host has registered: the active baseline and one that is registered but not active. */
+const REGISTRY = [...BASELINE, "task"];
 const SKILLS = [
   { name: "pdf", description: "read and write PDF files" },
   { name: "deploy", description: "deploy the app" },
@@ -90,6 +99,8 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 interface HostOptions {
   skills?: typeof SKILLS;
   sessionIdThrows?: boolean;
+  /** Make `getAllTools` throw, as a host whose tool registry is not ready does. */
+  getAllToolsThrows?: boolean;
   /** Called before each append; returning an error makes it throw without storing the entry. */
   onAppend?: (call: number) => Error | undefined;
   /** Called before each setActiveTools; `mutate` applies the tools first, then the call fails. */
@@ -114,6 +125,10 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
       commands.set(name, command),
     getActiveTools: () => [...active],
+    getAllTools: () => {
+      if (options.getAllToolsThrows) throw new Error("tool registry not ready");
+      return REGISTRY.map((name) => ({ name, description: `the ${name} tool` }));
+    },
     setActiveTools: (tools: string[]) => {
       calls.push("set");
       const fault = options.onSet?.(++setCalls);
@@ -191,6 +206,18 @@ const decisionsOf = (host: Host) =>
 /** One model turn as the host reports it: `turn_start`, then `turn_end`. Returns the `turn_end` handler's result. */
 const turn = (host: Host, kind: "pi" | "omp", spec?: TurnSpec) => {
   host.fire("turn_start", { type: "turn_start", turnIndex: spec?.turnIndex ?? 0 });
+  return host.fire("turn_end", (kind === "pi" ? piTurnEnd : ompTurnEnd)(spec));
+};
+/** One user message as the host announces it: `message_start` with a user message. */
+const userMessage = (host: Host) =>
+  host.fire("message_start", {
+    type: "message_start",
+    message: { role: "user", content: [{ type: "text", text: CANARY.text }], timestamp: 1_760_000_000_000 },
+  });
+/** A turn that begins with a user message: `turn_start`, the user's `message_start`, then `turn_end`. */
+const userTurn = (host: Host, kind: "pi" | "omp", spec?: TurnSpec) => {
+  host.fire("turn_start", { type: "turn_start", turnIndex: spec?.turnIndex ?? 0 });
+  userMessage(host);
   return host.fire("turn_end", (kind === "pi" ? piTurnEnd : ompTurnEnd)(spec));
 };
 
@@ -1036,7 +1063,7 @@ test("usage: canaries in messages, arguments, results and errors never reach a r
     host.fire("agent_start");
     const build = kind === "pi" ? piTurnEnd : ompTurnEnd;
     const events = [
-      build({ stopReason: "error", calls: ["read"] }),
+      build({ stopReason: "error", calls: ["read", ...INVENTED_TOOL_NAMES] }),
       build({ turnIndex: 1, calls: ["read"], results: [toolResult("read", true)] }),
     ];
     // Guard: every canary is really in the events, so a clean record is not a clean input.
@@ -1154,5 +1181,143 @@ test("usage: a config reload inside a run does not split the run", async () => {
   assert.ok(first && second);
   assert.equal(second.runId, first.runId);
   assert.deepEqual([first.decisionId, second.decisionId], [d1, d2]);
+  host.shutdown();
+});
+
+test("usage: pi runs no hook for a queued follow-up or steer, so the rest of the run is unassigned", async () => {
+  // A follow-up arrives after the run would have stopped; a steer arrives after a tool turn. Neither has a hook.
+  for (const queued of ["follow-up", "steer"]) {
+    const host = fakeHost("pi");
+    await host.prompt("explain this");
+    host.fire("agent_start");
+    if (queued === "steer") {
+      userTurn(host, "pi", { stopReason: "toolUse", calls: ["read"] });
+      turn(host, "pi", { turnIndex: 1 });
+    } else {
+      userTurn(host, "pi");
+    }
+    // Only the host's turn_start and the message's own message_start arrive: no before_agent_start.
+    userTurn(host, "pi", { turnIndex: queued === "steer" ? 2 : 1 });
+    turn(host, "pi", { turnIndex: queued === "steer" ? 3 : 2 });
+
+    const records = usageOf(host);
+    const [d1] = decisionsOf(host).map((decision) => decision.decisionId);
+    const before = queued === "steer" ? 2 : 1;
+    assert.equal(decisionsOf(host).length, 1, queued);
+    assert.deepEqual(
+      records.map((r) => r.decisionId),
+      [...Array(before).fill(d1), null, null],
+      queued,
+    );
+    assert.equal(new Set(records.map((r) => r.runId)).size, 1, queued);
+
+    // The next prompt runs the hook again: a new run under its own decision.
+    await host.prompt("and now");
+    host.fire("agent_start");
+    userTurn(host, "pi");
+    const last = usageOf(host).at(-1);
+    assert.equal(last?.decisionId, decisionsOf(host)[1]?.decisionId, queued);
+    assert.notEqual(last?.runId, records[0]?.runId, queued);
+    host.shutdown();
+  }
+});
+
+test("usage: omp runs the hook for a queued message, so its decision applies from its own turn", async () => {
+  const host = fakeHost("omp");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  userTurn(host, "omp", { stopReason: "toolUse", calls: ["read"] });
+  turn(host, "omp", { turnIndex: 1 });
+  // A follow-up: the hook runs between turn_end and turn_start, and the host's user message follows turn_start.
+  await host.prompt("and this");
+  userTurn(host, "omp", { turnIndex: 2 });
+  // A steer queued while turn 3 is in flight: its hook runs before that turn ends, and applies from the next one.
+  host.fire("turn_start", { type: "turn_start", turnIndex: 3 });
+  await host.prompt("and that");
+  host.fire("turn_end", ompTurnEnd({ turnIndex: 3 }));
+  userTurn(host, "omp", { turnIndex: 4 });
+
+  const [d1, d2, d3] = decisionsOf(host).map((decision) => decision.decisionId);
+  assert.deepEqual(
+    usageOf(host).map((r) => r.decisionId),
+    [d1, d1, d2, d2, d3],
+  );
+  assert.equal(new Set(usageOf(host).map((r) => r.runId)).size, 1);
+  host.shutdown();
+});
+
+test("usage: user message events that are not a delivered user message never change the run", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  userTurn(host, "pi");
+  const notes = host.notes.length;
+
+  const throwing = {
+    type: "message_start",
+    get message(): unknown {
+      throw new Error("CANARY_THROWN_TEXT");
+    },
+  };
+  const roles = ["assistant", "toolResult", "custom", "developer", "bashExecution", 7, null, undefined];
+  const hostile: unknown[] = [
+    null,
+    undefined,
+    7,
+    "x",
+    [],
+    {},
+    { message: null },
+    { message: 7 },
+    { message: [] },
+    { message: { role: ["user"] } },
+    { message: { role: "User" } },
+    throwing,
+    ...roles.map((role) => ({ type: "message_start", message: { role, content: CANARY.text } })),
+  ];
+  for (const event of hostile) assert.equal(host.fire("message_start", event), undefined);
+  assert.equal(host.notes.length, notes);
+  assert.doesNotMatch(host.notes.join("\n"), /CANARY/);
+
+  // The run still belongs to the decision the hook made.
+  turn(host, "pi", { turnIndex: 1 });
+  const [first, second] = usageOf(host);
+  assert.ok(first && second);
+  assert.equal(second.decisionId, decisionsOf(host)[0]?.decisionId);
+  assert.equal(second.runId, first.runId);
+  host.shutdown();
+});
+
+for (const kind of ["omp", "pi"] as const) {
+  test(`usage: only names of tools the host registered are stored (${kind})`, async () => {
+    const host = fakeHost(kind);
+    await host.prompt("explain this");
+    host.fire("agent_start");
+    const calls = ["read", ...INVENTED_TOOL_NAMES, "task", "read"];
+    // Guard: the event holds the made-up names.
+    for (const name of INVENTED_TOOL_NAMES) assert.ok(JSON.stringify(ompTurnEnd({ calls })).includes(name), name);
+    turn(host, kind, { calls });
+
+    const [observation] = usageOf(host);
+    assert.deepEqual(observation?.toolCalls, { read: 2, task: 1 });
+    assert.doesNotMatch(JSON.stringify(host.entries), /CANARY|secret|example\.com|sk-live/);
+    host.shutdown();
+  });
+}
+
+test("usage: a tool registry that cannot be read leaves the record without tool names and is not a failure", async () => {
+  const host = fakeHost("pi", { getAllToolsThrows: true });
+  await host.prompt("explain this");
+  host.fire("agent_start");
+  turn(host, "pi", { calls: ["read", "task"], results: [toolResult("read", true)] });
+
+  const [observation] = usageOf(host);
+  assert.ok(observation);
+  assert.deepEqual(observation.toolCalls, {});
+  assert.equal(observation.toolErrors, 1);
+  assert.deepEqual(observation.tokens, { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, reasoning: null });
+  assert.doesNotMatch(host.notes.join("\n"), /telemetry record not stored/);
+  await host.command("status");
+  assert.match(host.notes.join("\n"), /failed 0/);
   host.shutdown();
 });

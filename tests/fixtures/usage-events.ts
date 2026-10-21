@@ -13,7 +13,14 @@ export const CANARY = {
   error: "CANARY_ERROR_E4",
   detail: "CANARY_DETAIL_D5",
   extra: "CANARY_EXTRA_X6",
+  tool: "CANARY_TOOL_N7",
 } as const;
+
+/**
+ * Tool names a model can write into a tool call that no host registered. Each passes the identifier check of the
+ * record schema, so only the host's tool registry keeps them out of a record.
+ */
+export const INVENTED_TOOL_NAMES = [CANARY.tool, "src/secret.ts", "user@example.com", "sk-live-0123456789abcdef"];
 
 interface Counters {
   input?: number;

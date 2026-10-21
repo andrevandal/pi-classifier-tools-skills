@@ -60,6 +60,7 @@ import {
   armDecision,
   clearRetry,
   createUsageTracker,
+  deliverMessage,
   dropArmed,
   endContext,
   endRun,
@@ -658,12 +659,28 @@ function track(ctx: ExtensionContext, update: (usage: UsageTracker) => void): vo
   }
 }
 
+/**
+ * The names of the tools the host has registered. A tool name in a model message is model output, so only these may
+ * reach a record. A registry that cannot be read counts as empty: the record is still written, without tool names.
+ */
+function registeredToolNames(pi: ExtensionAPI): ReadonlySet<string> {
+  const names = new Set<string>();
+  try {
+    for (const tool of pi.getAllTools() as ReadonlyArray<{ name?: unknown } | null>) {
+      if (typeof tool?.name === "string") names.add(tool.name);
+    }
+  } catch {
+    return new Set();
+  }
+  return names;
+}
+
 /** One `loadout.usage` per assistant model turn. Returns nothing: pi reads a `turn_end` result as boundary entries. */
 function onTurnEnd(pi: ExtensionAPI, event: unknown, ctx: ExtensionContext): void {
   const state = sessions.get(sessionKey(ctx));
   if (!state) return;
   try {
-    const record = observeTurn(state.usage, hostSessionId(ctx), event);
+    const record = observeTurn(state.usage, hostSessionId(ctx), event, registeredToolNames(pi));
     if (!record) return;
     const append = (type: string, data: unknown) => pi.appendEntry(type, data);
     countRecord(ctx, state, persistRecord(append, state.telemetry, USAGE_ENTRY, record));
@@ -703,6 +720,7 @@ export default function loadout(pi: ExtensionAPI): void {
   // Usage observation. Handlers are best effort and return nothing.
   pi.on("agent_start", (_event, ctx) => track(ctx, startRun));
   pi.on("turn_start", (_event, ctx) => track(ctx, openTurn));
+  pi.on("message_start", (event, ctx) => track(ctx, (usage) => deliverMessage(usage, event)));
   pi.on("turn_end", (event, ctx) => onTurnEnd(pi, event, ctx));
   pi.on("agent_end", (_event, ctx) => track(ctx, dropArmed));
   pi.on("session_tree", (_event, ctx) => track(ctx, endContext));
