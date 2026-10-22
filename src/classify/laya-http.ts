@@ -7,9 +7,8 @@
  * deployment shape "one shared GPU host, thin TypeScript clients" needs no
  * local Laya install.
  *
- * The remote host owns checkpoint selection, so no `model` field is sent. Requests are correlated with the host: the
- * request id goes out in `X-Request-Id`, and the host's queue and inference times come back in `Server-Timing`. A
- * compatible host that sends neither just reports no timing.
+ * The remote host owns checkpoint selection, so no `model` field is sent. Requests carry `X-Request-Id` and the host's
+ * `Server-Timing` is read back; a host that sends neither reports no timing.
  */
 
 import type { Classifier, LayaBackendConfig } from "../types.ts";

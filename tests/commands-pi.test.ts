@@ -1,8 +1,4 @@
-/**
- * `/loadout status`, `explain` and `stats` inside a real in-process pi session. Commands go through pi's own command
- * path (`session.prompt`); the model is pi's faux provider and the classifier is a stub System-One server on an
- * ephemeral port. No network, no credentials.
- */
+/** `/loadout status`, `explain` and `stats` in a real in-process pi session with a stub classifier; no network. */
 
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
@@ -36,7 +32,6 @@ const { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore, InMemoryMod
 );
 
 const TOKEN_VAR = "LOADOUT_COMMANDS_PI_TOKEN";
-/** The stub's answer to the tool-profile question: the read-only profile, with high confidence. */
 const TOOL_PROFILE = { type: "choice", choice: "answer", probabilities: { answer: 0.9 }, confidence: 0.9 };
 const COMMANDS = [
   ["/loadout status", "[loadout] status"],
@@ -89,7 +84,6 @@ after(() => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-/** A file-backed pi session with the plugin loaded; its notifications are collected from the UI context. */
 async function piSession() {
   fs.writeFileSync(
     path.join(home, ".omp", "loadout.json"),
@@ -144,7 +138,6 @@ async function piSession() {
   };
 }
 
-/** The one notification a step produced; any other count fails the test. */
 function single(notices: Notice[]): Notice {
   assert.equal(notices.length, 1, `expected one notification, got ${JSON.stringify(notices)}`);
   return notices[0]!;
@@ -153,20 +146,17 @@ function single(notices: Notice[]): Notice {
 test("real pi session: status, explain and stats work through pi's own command path", { timeout: 60000 }, async () => {
   const { session, faux, notices, dispose } = await piSession();
   try {
-    // Runs one line through pi's prompt path and returns the notifications it added.
     const said = async (line: string): Promise<Notice[]> => {
       const start = notices.length;
       await session.prompt(line);
       return notices.slice(start);
     };
 
-    // Before the first reply there is no session file, and `stats` says so in one notification.
     const early = single(await said("/loadout stats"));
     assert.match(early.message, /no session file yet/);
     assert.equal(early.type, "info");
     assert.equal(classifierCalls, 0);
 
-    // One normal prompt: the per-turn notice is one info line, and the first reply writes the session file.
     faux.setResponses([fauxAssistantMessage("DONE")]);
     const turn = single(await said("Reply DONE."));
     assert.equal(faux.getPendingResponseCount(), 0);
@@ -177,7 +167,6 @@ test("real pi session: status, explain and stats work through pi's own command p
     const sessionFile = session.sessionManager.getSessionFile()!;
     assert.ok(fs.existsSync(sessionFile), "the first reply writes the session file");
 
-    // Each command adds exactly one notification, and its first line starts with the command's title.
     for (const [line, title] of COMMANDS) {
       const notice = single(await said(line));
       assert.ok(notice.message.split("\n")[0]?.startsWith(title), `${line}: ${notice.message}`);
@@ -185,7 +174,6 @@ test("real pi session: status, explain and stats work through pi's own command p
     }
     assert.equal(classifierCalls, 1, "commands make no classifier call");
 
-    // The JSON view is the report library's summary of the same session file.
     const json = single(await said("/loadout stats --json"));
     assert.equal(json.type, "info");
     const expected = buildSummary({

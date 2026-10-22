@@ -1,8 +1,4 @@
-/**
- * The one text renderer over a `Summary`: `renderDecisions` for `scripts/decisions.ts`, and (with
- * `renderSummary`) `/loadout stats`. Pure functions; nothing here reads a file or a clock. It lives in `src/`
- * because `src/` ships in the npm package and `scripts/` does not.
- */
+/** Text renderers over a `Summary`. Lives in `src/` because `src/` ships in the npm package and `scripts/` does not. */
 
 import type { Count, Lead, Stats, Sum, Summary } from "./summary.ts";
 
@@ -58,10 +54,6 @@ export function renderDecisions(summary: Summary): string {
   return lines.join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Summary
-// ---------------------------------------------------------------------------
-
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 
@@ -76,14 +68,12 @@ function sumText(sum: Sum): string {
   return sum.unknown > 0 ? `${total} (+${sum.unknown} unknown)` : total;
 }
 
-/** `Stats` as `p50 <v> / p90 <v>`, or `unknown` when it covers no value. */
 function statsText(stats: unknown, format: (value: number) => string): string {
   if (!isObject(stats) || !finite(stats.n) || stats.n === 0 || !finite(stats.p50) || !finite(stats.p90))
     return "unknown";
   return `p50 ${format(stats.p50)} / p90 ${format(stats.p90)}`;
 }
 
-/** A count map as `<key> <n>, ...` in the order given. */
 function countsText(counts: unknown): string {
   if (!isObject(counts)) return "";
   return Object.entries(counts)
@@ -116,7 +106,6 @@ function evidenceText(lead: Lead): string | null {
   }
 }
 
-/** The whole `/loadout stats` report for one summary; `renderDecisions` is embedded unchanged. */
 export function renderSummary(summary: Summary): string {
   const { scope, coverage, classifier, usage, transcript, http } = summary;
   const { files } = coverage;

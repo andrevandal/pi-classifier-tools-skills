@@ -1,9 +1,8 @@
 /**
  * The real python/laya_http_server.py, run against the fake `laya` module so no
  * torch or checkpoints are needed. Covers the predict round trip, the bearer
- * token gate, the body-size cap, the refusal to bind a non-loopback host, and
- * the request telemetry: one `loadout.http` line per POST on stderr, the
- * `Server-Timing` header, and the per-request and server-wide opt-outs.
+ * token gate, the body-size cap, the non-loopback refusal and the request telemetry (`loadout.http` stderr line,
+ * `Server-Timing`, opt-outs).
  */
 
 import { test } from "node:test";
@@ -57,13 +56,11 @@ function freePort(): Promise<number> {
 interface Server {
   child: ChildProcess;
   port: number;
-  /** Everything the server has written to stdout so far. */
   out(): string;
-  /** Everything the server has written to stderr so far. */
   log(): string;
 }
 
-/** Start the server and resolve once it logs that it is listening. `closeStderr` starts it with fd 2 closed. */
+/** `closeStderr` starts the server with fd 2 closed. */
 async function start(
   port: number,
   env: Record<string, string | undefined>,
@@ -160,8 +157,6 @@ if (probe.error || probe.status !== 0) {
     assert.match(result.stderr, /--allow-remote requires LAYA_SERVER_TOKEN/);
   });
 
-  // --- request telemetry -------------------------------------------------------------------------------------------
-
   interface Reply {
     status: number;
     headers: Record<string, string>;
@@ -170,7 +165,6 @@ if (probe.error || probe.status !== 0) {
 
   type Line = Record<string, unknown>;
 
-  /** A server on a free port that is killed when the test ends. */
   async function started(
     t: TestContext,
     env: Record<string, string | undefined> = baseEnv(),
@@ -182,7 +176,7 @@ if (probe.error || probe.status !== 0) {
     return server;
   }
 
-  /** Stop the server and wait for its stderr to close: afterwards `log()` is complete. */
+  /** Waits for stderr to close, so `log()` is complete afterwards. */
   async function stop(server: Server): Promise<void> {
     server.child.kill();
     await once(server.child, "close");
@@ -192,10 +186,7 @@ if (probe.error || probe.status !== 0) {
     return ["POST / HTTP/1.1", "Host: x", `Content-Length: ${length}`, ...extra, "", body].join("\r\n");
   }
 
-  /**
-   * POST over a raw socket and resolve once the server has closed it. The server closes only after its handler (and so
-   * its telemetry line, if any) has finished, so awaiting this orders the line before whatever the test does next.
-   */
+  /** Resolves when the server closes the socket, which happens after its handler and telemetry line finished. */
   function rawPost(
     port: number,
     body: string,
@@ -218,10 +209,7 @@ if (probe.error || probe.status !== 0) {
     return promise;
   }
 
-  /**
-   * Send a request, then drop the connection `afterMs` later, with an RST or a plain FIN. The delay is real time on
-   * purpose: the point is to disconnect while the server process is inside inference.
-   */
+  /** Disconnects `afterMs` later (RST or FIN), in real time, so the server is inside inference. */
   async function abandon(port: number, body: string, extra: string[], afterMs: number, how: "reset" | "close") {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     const socket = net.connect(port, "127.0.0.1", () => {
@@ -236,7 +224,6 @@ if (probe.error || probe.status !== 0) {
     await promise;
   }
 
-  /** The `answers` object of a 200 reply. */
   function answers(reply: Reply): Record<string, unknown> {
     const parsed = JSON.parse(reply.text) as { answers: Record<string, unknown> };
     return parsed.answers;
@@ -256,7 +243,7 @@ if (probe.error || probe.status !== 0) {
       });
   }
 
-  /** Poll for the line of a request id: a disconnect is only noticed after inference, so it may not exist yet. */
+  /** A disconnect is only noticed after inference, so the line may not exist yet. */
   async function lineFor(server: Server, requestId: string, timeoutMs = 5000): Promise<Line> {
     const deadline = performance.now() + timeoutMs;
     for (;;) {
@@ -298,7 +285,6 @@ if (probe.error || probe.status !== 0) {
     );
     const [queueMs, inferenceMs, totalMs] = [num(line["queueMs"]), num(line["inferenceMs"]), num(line["totalMs"])];
     assert.ok(totalMs >= queueMs + inferenceMs, "total covers the queue wait and the inference");
-    // The client holds the same measurements the server logged.
     assert.deepEqual(result.timing, { queueMs, inferenceMs });
     assert.equal(lines(server).length, 1);
   });
@@ -404,7 +390,7 @@ if (probe.error || probe.status !== 0) {
 
   test("an untrusted request id is logged as invalid and never copied", async (t) => {
     const server = await started(t);
-    const valid = "6f1c2a9e-3b4d-4c5e-8f60-7a8b9c0d1e2f"; // fixed, so the lookalikes below are always lookalikes
+    const valid = "6f1c2a9e-3b4d-4c5e-8f60-7a8b9c0d1e2f";
     const table: Array<{ extra: string[]; requestId: string | null; idStatus: string }> = [
       { extra: [], requestId: null, idStatus: "absent" },
       { extra: [`X-Request-Id: ${valid}`], requestId: valid, idStatus: "valid" },
@@ -503,8 +489,7 @@ if (probe.error || probe.status !== 0) {
   });
 
   test("an unwritable log stream never fails a request nor adds error output", async (t) => {
-    // With fd 2 closed the server's stderr is None, so writing the line raises. An exception that escaped the handler
-    // would be printed by the stdlib's error handler, which falls back to stdout.
+    // With fd 2 closed the server's stderr is None and writing the line raises; an exception escaping the handler would reach stdout.
     const server = await started(t, baseEnv(), [], true);
     for (let attempt = 0; attempt < 2; attempt++) {
       const reply = await rawPost(server.port, BODY, [`X-Request-Id: ${randomUUID()}`]);

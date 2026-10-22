@@ -8,10 +8,8 @@
  * primitives below, and the readers apply the same primitives again, so a
  * hostile or corrupted record cannot smuggle text into a report.
  *
- * Record types: `loadout.decision` v3 and `loadout.usage` v1 are session
- * entries the extension writes (`src/index.ts`, `src/usage.ts`).
- * `loadout.http` v1 is a line `python/laya_http_server.py` writes to its log;
- * it is only read here.
+ * Record types: `loadout.decision` v3 and `loadout.usage` v1 are session entries the extension writes;
+ * `loadout.http` v1 is a log line `python/laya_http_server.py` writes, only read here.
  */
 
 import { randomUUID } from "node:crypto";
@@ -216,7 +214,7 @@ export interface DecisionRecordV3 {
   application: ApplicationRecord;
 }
 
-/** One assistant message's usage; written by the extension (`src/usage.ts`), one per observed model turn. */
+/** One assistant message's usage; one per observed model turn. */
 export interface UsageObservationV1 {
   v: 1;
   eventId: string;
@@ -241,7 +239,7 @@ export interface UsageObservationV1 {
   retryAttempt: number | null;
 }
 
-/** One Laya HTTP server request: a log line written by `python/laya_http_server.py`, read and normalized here. */
+/** One Laya HTTP server request, read from the server's log line. */
 export interface HttpServerRecordV1 {
   type: "loadout.http";
   v: 1;

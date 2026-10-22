@@ -1,7 +1,5 @@
 /**
- * The decision report as text: how often each profile was picked, how much risk the classifier left, which skills
- * it selected and what it cost in latency. It reads through `src/report/`, so its scope rules are the CLI's: it takes
- * the `loadout-report summary` flags (see `loadout-report --help`) plus `--json`, which prints the same JSON.
+ * The decision report as text, read through `src/report/`: takes the `loadout-report summary` flags plus `--json`.
  *
  *   node scripts/decisions.ts --since <ISO> --until <ISO> (--project <path> | --all-projects) [--sessions-dir <dir>]
  *   node scripts/decisions.ts --session <file>

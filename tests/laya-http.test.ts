@@ -316,8 +316,6 @@ test("createClassifier still uses the python sidecar for the python transport", 
   assert.equal(spawnCalls.length, 1);
 });
 
-// --- request correlation and server timing ---------------------------------------------------------------------------
-
 const REQUEST_ID = "6f1c2a9e-3b4d-4c5e-8f60-7a8b9c0d1e2f";
 
 test("laya http sends the request id and reads the server's queue and inference time", async () => {

@@ -1,8 +1,4 @@
-/**
- * The words the plugin uses for what it did: the per-turn notice and the `status`, `explain` and `stats` texts.
- * Pure: records and counters in, text out. Records are built from the report fixtures; expectations name the facts
- * a reader needs (counts, thresholds, the profile that was kept), not every character of the line.
- */
+/** Notice, `status`, `explain` and `stats` texts; pure, so records and counters go in and text comes out. */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -82,7 +78,6 @@ const failed = (failure: DecisionRecordV3["failure"], over: Partial<DecisionReco
     ...over,
   });
 
-/** One record per row of the headline table. */
 function rows(): Map<string, DecisionRecordV3> {
   const live = (over: Partial<DecisionRecordV3>) => decisionV3(over);
   const entries: Array<[string, DecisionRecordV3]> = [
@@ -298,7 +293,7 @@ test("headline: low confidence, skill overflow, dry run, ratchet rejection, appl
   assert.ok(text("skills-would-select").includes("would select 1"));
   assert.ok(text("skip-command").includes("slash command"));
 
-  // I1: the word `applied` belongs to an applied change and to nothing else.
+  // `applied` belongs to an applied change and nothing else.
   for (const [label, record] of ROWS) {
     assert.equal(
       /\bapplied\b/i.test(text(label)),

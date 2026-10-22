@@ -73,7 +73,6 @@ function stamped(file: string): string {
   return file;
 }
 
-/** A history root holding fixture M, stamped. */
 function history(): { root: string; file: string } {
   const root = tmp();
   const { file } = writeMixed(root);
@@ -378,7 +377,6 @@ test("cli: a session whose parent or child location is a loop is still read", ()
   assert.equal(summary.scope.childFilesNotRead, 0);
   assert.equal(summary.scope.nestedChildFiles, 0);
 
-  // The call /loadout stats makes: no CLI around it, and it must not throw either.
   const direct = buildSummary({ scope: { kind: "session", files: [file] }, filters: NO_FILTERS, serviceLogs: [] });
   assert.deepEqual(JSON.parse(JSON.stringify(direct)), summary);
 });
@@ -437,7 +435,6 @@ test("cli: a tool name the model wrote never reaches summary or export stdout", 
       assert.equal(result.stdout.includes(name), false, `${command} prints ${name}`);
     }
   }
-  // `read` is vouched by the usage record; the four invented names count under one label.
   assert.deepEqual(summaryOf(run(["summary", "--session", file])).transcript.toolCalls, {
     total: 5,
     byTool: { read: 1, "(redacted)": 4 },

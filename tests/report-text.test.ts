@@ -1,7 +1,4 @@
-/**
- * The text renderer behind `scripts/decisions.ts` and `/loadout stats`: pure functions over a `Summary`.
- * Every expectation derives from the `Summary` the report library built, never from a typed-in copy of its numbers.
- */
+/** Text renderer behind `scripts/decisions.ts` and `/loadout stats`; every expectation derives from the library's `Summary`. */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -51,7 +48,6 @@ const historicalSummary = (root: string, over: Partial<Extract<ScopeSpec, { kind
     serviceLogs: [],
   });
 
-/** The mixed decision history and the usage history side by side in one session scope. */
 function twoFileSummary(): Summary {
   const dir = tmp();
   return sessionSummary([writeMixed(dir).file, writeUsageHistory(dir).file]);
@@ -63,7 +59,6 @@ function lineStarting(text: string, prefix: string): string {
   return found;
 }
 
-/** The heading line and the indented lines under it. */
 function section(text: string, heading: string): string[] {
   const lines = text.split("\n");
   const at = lines.findIndex((line) => line.startsWith(heading));
@@ -84,7 +79,7 @@ const within = (lines: string[], prefix: string): string => {
 
 const numbers = (line: string): number[] => [...line.matchAll(/\d+(?:\.\d+)?/g)].map((match) => Number(match[0]));
 
-/** The contract for a `Sum` (plan D2.6): `unknown`, `0`, the sum, or the sum with how many values were unknown. */
+/** The contract for a `Sum`: `unknown`, `0`, the sum, or the sum with how many values were unknown. */
 function sumText(sum: Sum): string {
   if (sum.known === 0) return sum.unknown > 0 ? "unknown" : "0";
   return sum.unknown > 0 ? `${sum.sum} (+${sum.unknown} unknown)` : String(sum.sum);
@@ -237,7 +232,6 @@ test("renderSummary prints unknown as unknown", () => {
   assert.doesNotMatch(within(turns, "  tokens:") + within(turns, "  cost:"), /\b0\b/);
   assert.doesNotMatch(text, /NaN|undefined|null|\[object/);
 
-  // A sum that is known for some turns says how many were not.
   const partly = twoFileSummary();
   const { input, output } = partly.usage.tokens;
   assert.ok(input.known > 0 && input.unknown > 0, "the fixture has a turn without tokens");
@@ -318,7 +312,6 @@ test("renderSummary names what was not read or counted", () => {
   assert.ok(cov.includes(`v2 decisions without event id ${coverage.unidentifiable.decisions}`), cov);
   assert.doesNotMatch(cov, /removed by the window or filters/, "a scope that removes nothing prints no such clause");
 
-  // A historical window removes records, and a record whose host entry has no timestamp cannot be placed in it.
   const root = tmp();
   const w = writeSmokeTree(root);
   writeSession(path.join(root, "undated", "u.jsonl"), [
@@ -377,8 +370,6 @@ test("renderSummary shows the service join only when a log was given", () => {
   assert.ok(line.includes(`${joined.http.records} records in ${joined.http.files} files`), line);
   assert.ok(line.includes("not joinable (not HTTP) 0"), "a log was read and no attempt was off the HTTP transport");
 
-  // An attempt that carries a request id but went to a transport the server never sees is counted apart, so the
-  // joined and unjoined attempts can be added up.
   const jev = writeSession(path.join(dir, "jev.jsonl"), [
     header({ id: "sess-jev", cwd: "/p/one" }),
     ...chain([

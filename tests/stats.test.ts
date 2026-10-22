@@ -1,7 +1,4 @@
-/**
- * `/loadout stats` argument handling (`src/stats.ts`) over the shared reporter. Expectations are the report library's
- * own output for the same spec, or the CLI's own refusal message. Fixtures are synthetic.
- */
+/** `/loadout stats` argument handling (`src/stats.ts`); expectations are the report library's own output or the CLI's refusal. */
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -44,12 +41,10 @@ after(() => {
   else process.env.HOME = savedHome;
 });
 
-/** The default session scope, spelled out as the library's own spec. */
 function sessionSpec(file: string, filters: FilterSpec = NO_FILTERS, serviceLogs: string[] = []): ReportSpec {
   return { scope: { kind: "session", files: [file] }, filters, serviceLogs };
 }
 
-/** The summary result, or a failure that says what came back instead. */
 function summaryOf(result: StatsResult): Extract<StatsResult, { kind: "summary" }> {
   if (result.kind !== "summary") {
     assert.fail(`expected a summary, got ${result.kind === "refused" ? result.text : result.kind}`);
@@ -57,7 +52,6 @@ function summaryOf(result: StatsResult): Extract<StatsResult, { kind: "summary" 
   return result;
 }
 
-/** The refusal result, or a failure that says what came back instead. */
 function refusalOf(result: StatsResult): Extract<StatsResult, { kind: "refused" }> {
   if (result.kind !== "refused") assert.fail(`expected a refusal, got ${result.kind}`);
   return result;
@@ -81,10 +75,8 @@ test("stats: the current session's file is the default scope, and a missing file
   const result = summaryOf(runStats([], file));
   assert.deepEqual(result.summary, buildSummary(sessionSpec(file)));
   assert.equal(result.compare, true);
-  // The same file named as a scope is the user's choice, so the text view makes no comparison.
   assert.equal(summaryOf(runStats(["--session", file], undefined)).compare, false);
 
-  // No file, or a directory where the file should be: explained, with no summary.
   for (const sessionFile of [undefined, tmp(), path.join(tmp(), "not-yet.jsonl")]) {
     const explained = refusalOf(runStats([], sessionFile));
     assert.equal(explained.level, "info");
@@ -104,7 +96,6 @@ test("stats: --json and export are the report library's documents", () => {
   assert.deepEqual(runStats(["export"], file), { kind: "json", text: exportJson });
   assert.deepEqual(runStats(["--json", "export"], file), { kind: "json", text: exportJson });
 
-  // A filter takes the figures off the current session's default scope, so the text view stops comparing.
   assert.equal(summaryOf(runStats(["--branch", "active"], file)).compare, false);
 });
 
@@ -191,7 +182,6 @@ test("stats: filters and the service log pass through", () => {
 test("stats: help, version and unknown views", () => {
   const { file } = writeMixed(tmp());
 
-  // Help needs no scope: it answers with no session file at all.
   const help = refusalOf(runStats(["--help"], undefined));
   assert.equal(help.level, "info");
   const lines = help.text.split("\n");
@@ -236,7 +226,6 @@ test("stats: a bad argument is refused the same way before the first session fil
     for (const sessionFile of [file, ...unsaved]) assert.deepEqual(runStats(tokens, sessionFile), refusal, label);
   }
 
-  // Valid arguments before the first reply still get the explanation, and nothing is read.
   const log = serviceLog(path.join(tmp(), "server.log"));
   const valid = [
     [],

@@ -109,7 +109,6 @@ interface HostOptions {
   /** The host's session file: `sessionManager.getSessionFile` returns it, and `appendEntry` also writes to it. */
   sessionFile?: string;
   sessionIdThrows?: boolean;
-  /** Make `getAllTools` throw, as a host whose tool registry is not ready does. */
   getAllToolsThrows?: boolean;
   /** Called before each append; returning an error makes it throw without storing the entry. */
   onAppend?: (call: number) => Error | undefined;
@@ -215,7 +214,6 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
     command: (args: string) => commands.get("loadout")!.handler(args, ctx),
     shutdown: () => handlers.get("session_shutdown")!({}, ctx),
     compact: () => handlers.get("session_compact")!({}, ctx),
-    /** Fire one host event by name, without a default event; returns the handler's result. */
     fire: (name: string, event?: unknown) => handlers.get(name)?.(event, ctx),
     /** Move the host's working directory: the next hook reloads this session's config. */
     setCwd: (dir: string) => {
@@ -235,18 +233,15 @@ const usageOf = (host: Host) =>
   host.entries.filter((entry) => entry.type === "loadout.usage").map((entry) => entry.data as UsageObservationV1);
 const decisionsOf = (host: Host) =>
   host.entries.filter((entry) => entry.type === "loadout.decision").map((entry) => entry.data as DecisionRecordV3);
-/** One model turn as the host reports it: `turn_start`, then `turn_end`. Returns the `turn_end` handler's result. */
 const turn = (host: Host, kind: "pi" | "omp", spec?: TurnSpec) => {
   host.fire("turn_start", { type: "turn_start", turnIndex: spec?.turnIndex ?? 0 });
   return host.fire("turn_end", (kind === "pi" ? piTurnEnd : ompTurnEnd)(spec));
 };
-/** One user message as the host announces it: `message_start` with a user message. */
 const userMessage = (host: Host) =>
   host.fire("message_start", {
     type: "message_start",
     message: { role: "user", content: [{ type: "text", text: CANARY.text }], timestamp: 1_760_000_000_000 },
   });
-/** A turn that begins with a user message: `turn_start`, the user's `message_start`, then `turn_end`. */
 const userTurn = (host: Host, kind: "pi" | "omp", spec?: TurnSpec) => {
   host.fire("turn_start", { type: "turn_start", turnIndex: spec?.turnIndex ?? 0 });
   userMessage(host);
@@ -833,8 +828,6 @@ test("persist failure: the turn continues, tools are applied, and the failure is
   host.shutdown();
 });
 
-// loadout.usage: one record per assistant model turn, linked to a decision only through lifecycle events.
-
 const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
 const NO_TOKENS = { input: null, output: null, cacheRead: null, cacheWrite: null, reasoning: null };
 
@@ -957,7 +950,6 @@ test("usage: compaction, branch and tree boundaries leave later turns unassigned
     return host;
   };
 
-  // (a) compaction inside a run ends the run.
   const compacted = await started();
   compacted.fire("agent_start");
   turn(compacted, "omp");
@@ -970,7 +962,6 @@ test("usage: compaction, branch and tree boundaries leave later turns unassigned
   assert.equal(after.decisionId, null);
   compacted.shutdown();
 
-  // (b) compaction between the hook and the run keeps the decision pending.
   const early = await started();
   await early.compact();
   early.fire("agent_start");
@@ -978,7 +969,6 @@ test("usage: compaction, branch and tree boundaries leave later turns unassigned
   assert.equal(usageOf(early)[0]?.decisionId, decisionsOf(early)[0]?.decisionId);
   early.shutdown();
 
-  // (c) a tree move, branch or switch inside a run ends the run.
   for (const name of ["session_tree", "session_branch", "session_switch"]) {
     const host = await started();
     host.fire("agent_start");
@@ -992,7 +982,6 @@ test("usage: compaction, branch and tree boundaries leave later turns unassigned
     host.shutdown();
   }
 
-  // (d) a tree move before the run drops the pending decision.
   const moved = await started();
   moved.fire("session_tree");
   moved.fire("agent_start");
@@ -1000,7 +989,6 @@ test("usage: compaction, branch and tree boundaries leave later turns unassigned
   assert.equal(usageOf(moved)[0]?.decisionId, null);
   moved.shutdown();
 
-  // (e) agent_end drops a decision that no run claimed.
   const unclaimed = await started();
   unclaimed.fire("agent_end");
   unclaimed.fire("agent_start");
@@ -1019,7 +1007,6 @@ test("usage: sessions never mix, a tool result's own usage adds nothing, and a r
   turn(a, "omp", { stopReason: "toolUse", calls: ["task"], results: [toolResult("task")] });
   turn(b, "pi");
   turn(a, "omp", { turnIndex: 1 });
-  // The same event object arrives twice: one model call, one record.
   const replayed = piTurnEnd({ turnIndex: 1 });
   b.fire("turn_start");
   b.fire("turn_end", replayed);
@@ -1041,7 +1028,6 @@ test("usage: sessions never mix, a tool result's own usage adds nothing, and a r
   assert.equal(a0.runId, a1.runId);
   assert.equal(b0.runId, b1.runId);
   assert.notEqual(a0.runId, b0.runId);
-  // A tool result's own usage (and its details' usage) is not this turn's usage.
   assert.deepEqual(a0.tokens, { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, reasoning: null });
   assert.equal(a0.costTotal, 0.0005);
   assert.deepEqual([a0.toolCalls, a0.toolErrors], [{ task: 1 }, 0]);
@@ -1049,10 +1035,7 @@ test("usage: sessions never mix, a tool result's own usage adds nothing, and a r
   b.shutdown();
 });
 
-/**
- * The layers that turn telemetry off, each arranged on disk over a default config. A function, not a constant,
- * because `home` is assigned in the `before` hook: call it inside a test.
- */
+/** A function, not a constant: `home` is assigned in the `before` hook. */
 function optOutLayers(): Array<{ reason: string; arrange: () => void }> {
   const explicit = path.join(home, "explicit.json");
   return [
@@ -1241,7 +1224,6 @@ test("usage: pi runs no hook for a queued follow-up or steer, so the rest of the
     } else {
       userTurn(host, "pi");
     }
-    // Only the host's turn_start and the message's own message_start arrive: no before_agent_start.
     userTurn(host, "pi", { turnIndex: queued === "steer" ? 2 : 1 });
     turn(host, "pi", { turnIndex: queued === "steer" ? 3 : 2 });
 
@@ -1256,7 +1238,6 @@ test("usage: pi runs no hook for a queued follow-up or steer, so the rest of the
     );
     assert.equal(new Set(records.map((r) => r.runId)).size, 1, queued);
 
-    // The next prompt runs the hook again: a new run under its own decision.
     await host.prompt("and now");
     host.fire("agent_start");
     userTurn(host, "pi");
@@ -1324,7 +1305,6 @@ test("usage: user message events that are not a delivered user message never cha
   assert.equal(host.notes.length, notes);
   assert.doesNotMatch(host.notes.join("\n"), /CANARY/);
 
-  // The run still belongs to the decision the hook made.
   turn(host, "pi", { turnIndex: 1 });
   const [first, second] = usageOf(host);
   assert.ok(first && second);
@@ -1367,46 +1347,38 @@ test("usage: a tool registry that cannot be read leaves the record without tool 
   host.shutdown();
 });
 
-// Observability: `/loadout status`, `explain` and `stats`, and the per-turn notice.
-
 /** A fresh directory for one test's session file, so a history scan reads only that test's files. */
 function sessionDir(): string {
   return fs.mkdtempSync(path.join(home, "sessions-"));
 }
 
-/** The report scope `/loadout stats` reads for one session file, parsed the way the command parses it. */
 function sessionSpec(file: string): ReportSpec {
   const result = parseArgv(["summary", "--session", file]);
   if (!result.ok || result.parsed.kind !== "run") throw new Error(`no session scope for ${file}`);
   return result.parsed.spec;
 }
 
-/** Run one `/loadout` subcommand and return the notifications it sent. */
 async function runCommand(host: Host, args: string) {
   const from = host.notices.length;
   await host.command(args);
   return host.notices.slice(from);
 }
 
-/** The info notifications one prompt sent, in order: the per-turn notice, when the turn gets one. */
 async function promptInfo(host: Host, text: string) {
   const from = host.notices.length;
   await host.prompt(text);
   return host.notices.slice(from).filter((notice) => notice.level === "info");
 }
 
-/** The one notification in a list; fails unless there is exactly one. */
 function onlyNotice<T>(notices: T[]): T {
   assert.equal(notices.length, 1);
   return notices[0]!;
 }
 
-/** The text `/loadout explain` printed. */
 async function explainOf(host: Host): Promise<string> {
   return onlyNotice(await runCommand(host, "explain")).message;
 }
 
-/** A per-turn notice is one line of at most 160 characters, with no tool list and no probability list. */
 function assertCompact(text: string): void {
   assert.ok(text.length <= 160, text);
   assert.doesNotMatch(text, /\n/);
@@ -1459,7 +1431,6 @@ test("extension: explain traces the latest invocation of any outcome", async () 
 });
 
 test("extension: outcomes through the real hook read differently", async () => {
-  // Every outcome's headline is collected, so the check at the end can show that no two read the same.
   const headlines: string[] = [];
 
   // Low confidence: no narrower profile is within the risk ceiling, so every tool stays.
@@ -1491,7 +1462,6 @@ test("extension: outcomes through the real hook read differently", async () => {
   assert.match(overflowExplain, /^ {2}blocked: skills over the candidate limit$/m);
   host.shutdown();
 
-  // Dry run: the proposal is named, and the tools are the baseline.
   writeConfig({ dryRun: true });
   host = fakeHost("pi");
   const dry = onlyNotice(await promptInfo(host, "explain this")).message;
@@ -1501,7 +1471,6 @@ test("extension: outcomes through the real hook read differently", async () => {
   assert.match(await explainOf(host), /^ {2}blocked: dry run$/m);
   host.shutdown();
 
-  // Ratchet: after a widening to edit, a narrowing to answer is refused and the tools stay at edit.
   writeConfig({});
   host = fakeHost("pi");
   WIDEN_TO_EDIT();
@@ -1518,7 +1487,6 @@ test("extension: outcomes through the real hook read differently", async () => {
   assert.match(ratchetExplain, /^ {2}blocked: widen-only ratchet \(kept edit\)$/m);
   host.shutdown();
 
-  // Application: the narrowing is applied, and explain reads back the tools the host really has.
   host = fakeHost("pi");
   const applied = onlyNotice(await promptInfo(host, "explain this")).message;
   assert.equal(applied, "[loadout] applied answer (tools 4 of 7); skills: 1 selected");
@@ -1526,7 +1494,6 @@ test("extension: outcomes through the real hook read differently", async () => {
   assert.match(await explainOf(host), /^ {2}application: applied \| actual tools: read, grep, find, ls \(4\)$/m);
   host.shutdown();
 
-  // Already matching: the same widening twice, so the setter is not called the second time.
   host = fakeHost("pi");
   WIDEN_TO_EDIT();
   await host.prompt("run the tests");
@@ -1536,7 +1503,6 @@ test("extension: outcomes through the real hook read differently", async () => {
   headlines.push(matching);
   host.shutdown();
 
-  // Collection failure: the decision is applied but its record is not written. Explain says so; the warning is once.
   host = fakeHost("pi", {
     onAppend: () => errorWith("EACCES: permission denied, open '/home/x/secret-dir/s.jsonl'", "EACCES"),
   });
@@ -1571,7 +1537,6 @@ test("extension: outcomes through the real hook read differently", async () => {
   assert.ok(host.notes.some((note) => note.startsWith("[loadout] classification failed (timeout)")));
   host.shutdown();
 
-  // Eight outcomes, eight different headlines.
   assert.equal(headlines.length, 8);
   assert.equal(new Set(headlines).size, headlines.length, headlines.join("\n"));
 });
@@ -1692,7 +1657,6 @@ test("extension: a config reload keeps the latest observation and the counters",
 });
 
 test("extension: per-turn notice: one compact line after application, honors notify, never says applied for a dry run or a blocked proposal", async () => {
-  // A dry run proposes; it never says it applied anything.
   writeConfig({ dryRun: true });
   let host = fakeHost("pi");
   const dry = onlyNotice(await promptInfo(host, "explain this")).message;
@@ -1710,7 +1674,6 @@ test("extension: per-turn notice: one compact line after application, honors not
   assert.ok(applied.callsBefore > host.calls.indexOf("set"));
   host.shutdown();
 
-  // Ratchet block: the blocked profile is named; there is no arrow to a count.
   host = fakeHost("pi");
   WIDEN_TO_EDIT();
   await host.prompt("run the tests");
@@ -1722,7 +1685,6 @@ test("extension: per-turn notice: one compact line after application, honors not
   assert.doesNotMatch(blocked, /\bapplied\b/i);
   host.shutdown();
 
-  // Already matching: the identical widening again says so, and does not say applied.
   host = fakeHost("pi");
   WIDEN_TO_EDIT();
   await host.prompt("run the tests");
@@ -1733,7 +1695,6 @@ test("extension: per-turn notice: one compact line after application, honors not
   assert.doesNotMatch(matching, /\bapplied\b/i);
   host.shutdown();
 
-  // Low confidence: no narrower profile in reach, so nothing is applied.
   reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
   host = fakeHost("pi");
   const low = onlyNotice(await promptInfo(host, "explain this")).message;
@@ -1742,7 +1703,6 @@ test("extension: per-turn notice: one compact line after application, honors not
   assert.doesNotMatch(low, /\bapplied\b/i);
   host.shutdown();
 
-  // Candidate limit: the tools are applied and the skills part says none were asked.
   writeConfig({ skills: { enabled: true, maxCandidates: 1 } });
   reply.answers.tool_profile = answerReply({ answer: 0.9 });
   host = fakeHost("pi");
@@ -1751,14 +1711,12 @@ test("extension: per-turn notice: one compact line after application, honors not
   assert.equal(limited, "[loadout] applied answer (tools 4 of 7); skills: 2 candidates > limit 1, none asked");
   host.shutdown();
 
-  // A skip sends no notice at all.
   writeConfig({});
   host = fakeHost("pi");
   assert.deepEqual(await promptInfo(host, "/review"), []);
   assert.deepEqual(await promptInfo(host, "   "), []);
   host.shutdown();
 
-  // notify: false hides the info line; a classifier failure still warns and the commands still answer.
   writeConfig({ notify: false });
   host = fakeHost("pi");
   assert.deepEqual(await promptInfo(host, "explain this"), []);
@@ -1799,7 +1757,6 @@ test("extension: a dry run reports what the widen-only ratchet would keep, never
   assert.ok(!host.calls.includes("set"));
   host.shutdown();
 
-  // One low-confidence turn locks narrowing at the broadest profile, so a later confident answer is refused as well.
   reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
   host = fakeHost("pi");
   assert.equal(
@@ -1818,7 +1775,6 @@ test("extension: a dry run reports what the widen-only ratchet would keep, never
   );
   host.shutdown();
 
-  // The same two turns without a dry run: the ratchet refuses the narrowing and says so, so both modes agree on the fact.
   writeConfig({ skills: { enabled: false } });
   reply.answers.tool_profile = answerReply({ answer: 0.55, edit: 0.3, full: 0.15 });
   host = fakeHost("pi");
@@ -1921,7 +1877,6 @@ test("extension: stats refuses a partial history and reads only the named scope"
     assert.equal(notice.message, `[loadout] stats: ${reason}`, args);
   }
 
-  // A window around now, this project and the session's own directory: the session is read.
   const since = new Date(Date.now() - 3_600_000).toISOString();
   const until = new Date(Date.now() + 3_600_000).toISOString();
   const inWindow = onlyNotice(
@@ -1934,7 +1889,6 @@ test("extension: stats refuses a partial history and reads only the named scope"
   );
   assert.match(inWindow, /^ {2}classifier calls \(loadout\.decision attempts; not model turns\): 1$/m);
 
-  // Another project's path matches no file, so every count is zero.
   const elsewhere = path.join(path.dirname(project), "elsewhere");
   const other = onlyNotice(
     await runCommand(host, `stats --since ${since} --until ${until} --project ${elsewhere} --sessions-dir ${dir}`),
@@ -1949,7 +1903,6 @@ test("extension: stats before the first session file explains itself", async () 
   const absent = onlyNotice(await runCommand(none, "stats"));
   assert.equal(absent.level, "info");
   assert.match(absent.message, /^\[loadout\] stats: no session file yet\. /);
-  // A bad argument is a warning even before the session file exists, never the explanation of the missing file.
   const bad = onlyNotice(await runCommand(none, "stats --sumary"));
   assert.equal(bad.level, "warning");
   assert.match(bad.message, /^\[loadout\] stats: /);

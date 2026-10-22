@@ -1,10 +1,6 @@
 /**
- * Assemble a report from a scope and print it. `buildSummary` and `buildExport` are the library entry points (the
- * CLI and `/loadout stats` call them); `parseArgv` and `main` are the command line around them.
- *
- * The command line is strict and explicit: it needs a scope (named session files, or a time window plus a project
- * or all projects), says which flag is missing or in conflict, and never reads the default sessions directory
- * for an incomplete query. stdout carries only the JSON document; every diagnostic goes to stderr.
+ * Library entry points (`buildSummary`, `buildExport`) and the command line around them. stdout carries only the
+ * JSON document; every diagnostic goes to stderr.
  */
 
 import * as fs from "node:fs";
@@ -58,10 +54,6 @@ export function buildSummary(spec: ReportSpec): Summary {
 export function buildExport(spec: ReportSpec): ExportDoc {
   return exportDocument(gather(spec));
 }
-
-// ---------------------------------------------------------------------------
-// Arguments
-// ---------------------------------------------------------------------------
 
 const OUTCOMES: readonly string[] = [...DECISION_OUTCOMES, ...USAGE_OUTCOMES];
 
@@ -224,7 +216,6 @@ function isParseArgsError(error: unknown): error is Error {
   return error instanceof Error && "code" in error && String(error.code).startsWith("ERR_PARSE_ARGS");
 }
 
-/** Parse errors, then help, then version, then the subcommand, scope, filters and service logs. */
 export function parseArgv(argv: string[]): { ok: true; parsed: Parsed } | { ok: false; message: string } {
   try {
     const { values, positionals } = parseArgs({ args: argv, options: OPTIONS, allowPositionals: true, strict: true });

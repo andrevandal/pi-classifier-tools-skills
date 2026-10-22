@@ -1,7 +1,4 @@
-/**
- * Synthetic host `turn_end` events for the usage tests. Every event plants canary strings in the fields the plugin
- * must never copy, so a test can show that a record is rebuilt from an allowlist. Nothing here is real data.
- */
+/** Synthetic host `turn_end` events with canary strings planted in every field the plugin must never copy. */
 
 import type { TurnEndEvent } from "@earendil-works/pi-coding-agent";
 
@@ -16,10 +13,7 @@ export const CANARY = {
   tool: "CANARY_TOOL_N7",
 } as const;
 
-/**
- * Tool names a model can write into a tool call that no host registered. Each passes the identifier check of the
- * record schema, so only the host's tool registry keeps them out of a record.
- */
+/** Tool names a model can write that no host registered; each passes the record schema's identifier check. */
 export const INVENTED_TOOL_NAMES = [CANARY.tool, "src/secret.ts", "user@example.com", "sk-live-0123456789abcdef"];
 
 interface Counters {
@@ -42,14 +36,14 @@ function usageObject(o: Counters): Record<string, unknown> {
   };
 }
 
-/** OMP's `usage` on an assistant message; `reasoningTokens` is present only when given. */
+/** OMP calls the reasoning count `reasoningTokens`. */
 export function ompUsage(o: Counters & { reasoningTokens?: number } = {}): Record<string, unknown> {
   const usage = usageObject(o);
   if (o.reasoningTokens !== undefined) usage.reasoningTokens = o.reasoningTokens;
   return usage;
 }
 
-/** pi's `usage` on an assistant message; `reasoning` is present only when given. */
+/** pi calls the reasoning count `reasoning`. */
 export function piUsage(o: Counters & { reasoning?: number } = {}): Record<string, unknown> {
   const usage = usageObject(o);
   if (o.reasoning !== undefined) usage.reasoning = o.reasoning;
@@ -71,21 +65,15 @@ export function toolResult(name = "read", isError = false): Record<string, unkno
   };
 }
 
-/**
- * What one `turn_end` carries. A key present with the value `undefined` leaves that field out of the event, which is
- * how a test builds a message with no `usage` or a turn without `toolResults`.
- */
+/** A key present with the value `undefined` leaves that field out of the event (no `usage`, no `toolResults`). */
 export interface TurnSpec {
   turnIndex?: number;
   stopReason?: string;
-  /** The host's `usage` object; defaults to `ompUsage()` or `piUsage()`. */
   usage?: unknown;
-  /** Content blocks after the text block: a string becomes a `toolCall` block of that name, anything else is used as given. */
+  /** Content blocks after the text block: a string becomes a `toolCall` block of that name. */
   calls?: Array<string | Record<string, unknown>>;
-  /** Tool-result messages of this turn; default none. */
   results?: unknown[];
   errorStatus?: number;
-  /** pi's `messageEntryId`; default `"a1b2c3d4"`. */
   entryId?: string;
 }
 
@@ -121,7 +109,6 @@ function assistantMessage(spec: TurnSpec, defaultUsage: Record<string, unknown>)
   });
 }
 
-/** OMP's `turn_end`: `turnIndex`, `message` and `toolResults`, nothing else. */
 export function ompTurnEnd(spec: TurnSpec = {}): Record<string, unknown> {
   return defined({
     type: "turn_end",
@@ -131,7 +118,6 @@ export function ompTurnEnd(spec: TurnSpec = {}): Record<string, unknown> {
   });
 }
 
-/** pi's `turn_end`: OMP's fields plus the entry id of the message and pi's boundary state. */
 export function piTurnEnd(spec: TurnSpec = {}): Record<string, unknown> {
   const piFields = {
     type: "turn_end",

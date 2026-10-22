@@ -276,7 +276,6 @@ test("export: events keep provenance and carry no paths", () => {
   const text = JSON.stringify(doc);
   for (const secret of [dir, "s-b", "/p/cwd-marker", "a.jsonl", "b.jsonl"]) assert.ok(!text.includes(secret), secret);
 
-  // A header id that no record carries never leaves the process.
   const private_ = writeSession(path.join(dir, "c.jsonl"), [
     header({ id: "hdr-private", cwd: "/p/cwd-marker" }),
     ...chain([custom(DECISION_ENTRY, decisionV3({ eventId: uuid(2), sessionId: "recorded-id" }))]),

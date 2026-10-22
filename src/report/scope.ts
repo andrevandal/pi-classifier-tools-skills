@@ -1,9 +1,6 @@
 /**
- * Which session files a report reads, and which of their events it keeps.
- *
- * Scope is explicit: the current session (named files) or a history (a time window plus one project or all
- * projects). Selection prunes by file modification time and project before any file is parsed; filters then run
- * on the parsed events in a fixed order, and an event is counted once, under the first filter that removes it.
+ * Which session files a report reads and which of their events it keeps. Filters run in a fixed order and an event
+ * is counted once, under the first filter that removes it.
  */
 
 import * as fs from "node:fs";
@@ -26,18 +23,12 @@ export type ScopeSpec =
 
 export interface Selection {
   files: string[];
-  /**
-   * Unreadable directories met while listing, and listed `.jsonl` entries that are not regular files (a symlink
-   * loop, a dangling link, a pipe, a device). A named session file that cannot be read is found later, by the reader.
-   */
+  /** Unreadable directories while listing, and listed `.jsonl` entries that are not regular files (symlink loop, pipe, device). */
   unreadable: number;
   skippedByMtime: number;
   /** Session scope: `.jsonl` files found under the named files' child directories, none of them read. */
   childFilesNotRead: number;
-  /**
-   * Session scope: child directories that could not be listed or examined, so `childFilesNotRead` is a lower bound.
-   * Not part of `unreadable`: no in-scope file was lost.
-   */
+  /** Session scope: child directories that could not be listed, so `childFilesNotRead` is a lower bound. Not in `unreadable`. */
   childDirsUnreadable: number;
 }
 
@@ -84,10 +75,7 @@ function realOrNull(file: string): string | null {
   }
 }
 
-/**
- * The nested child sessions of a named session file sit in `<file minus .jsonl>/`. Null when there is no such
- * directory; a location that cannot be examined (a symlink loop, no permission) is reported and is null too.
- */
+/** Nested child sessions sit in `<file minus .jsonl>/`. Null when absent; a location that cannot be examined is reported and null too. */
 function childDirOf(file: string, onUnreadable: () => void): string | null {
   if (!file.endsWith(".jsonl")) return null;
   const dir = file.slice(0, -".jsonl".length);

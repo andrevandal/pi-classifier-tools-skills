@@ -179,7 +179,6 @@ test("reader: branch labels follow the host leaf rule", () => {
     { id: "x2", parentId: "a2" },
   ];
   assert.deepEqual(branchesOf(forked), ["active", "abandoned", "abandoned", "active", "active"]);
-  // A late entry that names the leaf keeps it; without the name the leaf moves to the late entry.
   assert.deepEqual(branchesOf([...forked, { id: "late", parentId: "x1", activeLeafId: "x2" }]), [
     "active",
     "abandoned",
@@ -225,7 +224,6 @@ test("reader: branch labels follow the host leaf rule", () => {
   );
   assert.deepEqual(branchesOf([{ id: "a" }, { id: "b", parentId: "a" }]), unknown, "a root without parentId null");
 
-  // A last entry that names a leaf the file does not hold falls back to the newest entry that selects itself.
   assert.deepEqual(
     branchesOf([
       { id: "a", parentId: null },
@@ -546,8 +544,7 @@ test("reader: a transcript tool name is a candidate only when it is identifier-s
       ),
     ),
   ]);
-  // The reader's gate is the shape alone: a model can write an identifier-shaped name that no host registered, so a
-  // report prints a candidate only when a plugin record vouches for it (see the summary test).
+  // The reader's gate is shape alone; a report prints a name only when a plugin record vouches for it.
   const turns = readSessions([file]).turns;
   assert.equal(turns.length, names.length);
   for (const [i, name] of names.entries()) {

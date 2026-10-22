@@ -11,9 +11,8 @@
  * composed with the caller's own signal so either side can abort, and the
  * timer is always cleared.
  *
- * Our own Laya server is correlated with (`correlation`): the call carries `X-Request-Id`, or `X-Loadout-Telemetry: off`
- * when the caller opted out, and the server's `Server-Timing` queue/infer metrics are read back. Every failure raised
- * after the body was read keeps that response's HTTP status, and those timings, on the `ClassifierError`.
+ * With `correlation` (our own Laya server only) the call sends `X-Request-Id`, or `X-Loadout-Telemetry: off` when the
+ * caller opted out, and reads `Server-Timing` back; failures after the body was read keep the HTTP status and timing.
  */
 
 import { ID_PATTERN } from "../telemetry.ts";
@@ -43,15 +42,10 @@ export interface HttpClassifierOptions {
   /** Env var holding the bearer token; when unset or empty, no Authorization header is sent. */
   apiKeyEnvVar: string;
   timeoutMs: number;
-  /**
-   * Correlate with our own Laya server: send `X-Request-Id` (or `X-Loadout-Telemetry: off` for an opted-out caller) and
-   * read the `queue`/`infer` metrics of the `Server-Timing` response header. Only that server understands them, so a
-   * third-party endpoint (Jev) never sees the headers and never has its timing read. Default false.
-   */
+  /** Own Laya server only: send the correlation headers and read `Server-Timing`. Jev never sees them. Default false. */
   correlation?: boolean;
 }
 
-/** An opted-out request carries the off signal and no id; otherwise only a well-formed id is sent. */
 function correlationHeaders(options: ClassifyOptions | undefined): Record<string, string> {
   if (options?.telemetryOff) return { "X-Loadout-Telemetry": "off" };
   const requestId = options?.requestId;
@@ -60,10 +54,7 @@ function correlationHeaders(options: ClassifyOptions | undefined): Record<string
 
 const DURATION = /^dur=(\d{1,9}(?:\.\d{1,6})?)$/;
 
-/**
- * The `queue` and `infer` metrics of a `Server-Timing` header, in ms. Other metrics and parameters are ignored. A metric
- * that is repeated or has no plain non-negative decimal `dur` stays unknown (absent), never zero.
- */
+/** `queue`/`infer` ms of a `Server-Timing` header; a repeated or non-plain-`dur` metric stays unknown, never zero. */
 function parseServerTiming(header: string | null): ServerTiming | undefined {
   if (header === null) return undefined;
   const found = new Map<string, number | null>();
@@ -146,7 +137,7 @@ export function createHttpClassifier(options: HttpClassifierOptions, deps: Class
           signal: controller.signal,
         });
 
-        // What the call saw of the server, kept on every failure raised after the body was read: unknown stays unknown.
+        // Kept on every failure after the body was read; unknown stays unknown.
         const seen = {
           status: response.status,
           timing: options.correlation ? parseServerTiming(response.headers.get("server-timing")) : undefined,

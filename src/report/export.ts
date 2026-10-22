@@ -1,14 +1,6 @@
 /**
- * The shareable export: one document of content-free events plus the same scope, filter and coverage header a
- * summary carries.
- *
- * Every event is rebuilt from a declared allowlist, so a field nobody listed cannot leave the process, whatever a
- * record, a transcript or a service log contained. The normalizers in `telemetry.ts` already validated each value
- * at the source; the allowlist is the second, independent gate. It exports identifier-shaped values from
- * identifier fields exactly as a record carries them: session, event, decision, run, request and host-entry ids,
- * model ids, profile, tool and skill names, and an HTTP error class. Nothing else leaves: no path, title, message,
- * tool argument or result, and no id of the transcript itself (the reporter never adds a session file's header id,
- * or the entry and parent ids it reads for branch labels).
+ * Shareable export: every event is rebuilt from a declared allowlist, so an unlisted field cannot leave the process.
+ * No path, title, message, tool argument or result, and no transcript header or branch entry id.
  */
 
 import { type Branch, isObject, IDENTIFIER, parseInstant, type Provenance } from "./read.ts";
@@ -32,7 +24,6 @@ export interface ExportEvent {
   /** Null for a service record: it belongs to no transcript. */
   branch: Branch | null;
   provenance: Provenance | null;
-  /** Duplicate instances of the record that were discarded. */
   copies: number | null;
   record: Record<string, unknown>;
 }

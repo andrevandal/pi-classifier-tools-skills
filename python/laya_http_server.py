@@ -13,15 +13,10 @@ LAYA_SERVER_TOKEN. A token set in LAYA_SERVER_TOKEN is enforced on any host:
 every POST must then carry `Authorization: Bearer <token>`. Bodies over 1 MiB
 are refused with 413 before they are read.
 
-Request telemetry (schema: docs/telemetry.md, `loadout.http`). Every POST writes one
-content-free JSON line to stderr, the service log (the journal under systemd): the
-client's request id, the outcome, the HTTP status, and the queue wait, inference and
-total times in milliseconds. A phase that was not measured is null. The queue and
-inference times also come back in a `Server-Timing` header. The client's `X-Request-Id`
-(a lowercase UUIDv4) is the correlation id; anything else is logged as invalid, never
-copied. `X-Loadout-Telemetry: off` opts one request out of all of this and
-`--no-telemetry` opts out every request; any value other than `on` counts as off. A
-client that disconnects is only noticed when the answer is written, after inference has run.
+Every POST writes one content-free `loadout.http` JSON line to stderr (schema: docs/telemetry.md) and returns
+`Server-Timing`. `X-Request-Id` must be a lowercase UUIDv4, else it is logged as invalid, never copied.
+`X-Loadout-Telemetry` other than `on`, or `--no-telemetry`, opts out. A client disconnect is only noticed when
+the answer is written, after inference has run.
 """
 
 from __future__ import annotations
@@ -59,8 +54,6 @@ def class_name(exc: BaseException) -> str:
 
 
 class Trace:
-    """What one POST may report about itself: id, phases and outcome, never content."""
-
     def __init__(self, headers) -> None:
         self.start = time.monotonic()
         # Fail closed: "on" is the only value that keeps telemetry, so a garbled opt-out still opts out.
@@ -71,7 +64,7 @@ class Trace:
         self.id_status = "valid" if self.request_id else "invalid" if ids else "absent"
         self.queue_ms: float | None = None  # waiting for LOCK
         self.infer_ms: float | None = None  # holding LOCK, up to the answer or the exception
-        self.status: int | None = None  # the status the server chose to send; a disconnect may mean it never arrived
+        self.status: int | None = None  # as sent; after a disconnect it may never have arrived
         self.error: str | None = None  # class of the exception that made the answer a 500
         self.gone: str | None = None  # class of the disconnect raised while writing the answer
 
@@ -82,7 +75,7 @@ class Trace:
         return ", ".join(f"{name};dur={value:.3f}" for name, value in phases if value is not None)
 
     def emit(self) -> None:
-        """Write the `loadout.http` v1 line. Never raises: telemetry must not fail a request."""
+        """Never raises: telemetry must not fail a request."""
         if not self.enabled:
             return
         with contextlib.suppress(Exception):
@@ -123,7 +116,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _reply(self, trace: Trace, status: int, payload: dict) -> None:
-        """Answer a POST, noting the status and whether the client was already gone when it was written."""
         if not trace.gone:  # the 500 retried after a failed write must not replace the status that failed
             trace.status = status
         timing = trace.timing_header()

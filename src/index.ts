@@ -103,9 +103,9 @@ interface SessionState {
   allowNarrow: boolean;
   /** Latest non-skipped record; a skip never replaces it. */
   lastRecord: DecisionRecordV3 | null;
-  /** The latest hook call of any outcome, skips included. Memory only: what `/loadout explain` and `status` read. */
+  /** The latest hook call of any outcome, skips included; memory only. */
   latest: Observation | null;
-  /** Records built by this process, by outcome. Memory only; a config reload keeps it. */
+  /** Records built by this process, by outcome; memory only. */
   seen: Record<DecisionOutcome, number>;
   /** The latest record built, skips included; null when building it threw. */
   lastDecisionId: string | null;
@@ -512,7 +512,6 @@ function recordDecision(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionS
   }
 }
 
-/** The per-turn notice, sent once the tools are applied and the record is built. Best effort, like `track`. */
 function announce(ctx: ExtensionContext, state: SessionState): void {
   try {
     const record = state.latest?.record;
@@ -563,7 +562,6 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     }
   }
   recordDecision(pi, ctx, state, trace);
-  // The next run, or the next turn of an open one, belongs to this decision (null when none was built).
   if (state) {
     armDecision(state.usage, state.lastDecisionId);
     announce(ctx, state);
@@ -638,7 +636,7 @@ function renderView(
   };
 }
 
-/** `status`, `explain` and `stats`: one notification each. A failure becomes one warning and never reaches the host. */
+/** One notification each; a failure becomes one warning and never reaches the host. */
 function showView(ctx: ExtensionContext, state: SessionState, view: View, args: string): void {
   try {
     const { text, level } = renderView(ctx, state, view, args);
@@ -648,7 +646,6 @@ function showView(ctx: ExtensionContext, state: SessionState, view: View, args: 
   }
 }
 
-/** Usage bookkeeping for one lifecycle event: best effort, never throws into the host. */
 function track(ctx: ExtensionContext, update: (usage: UsageTracker) => void): void {
   try {
     const state = sessions.get(sessionKey(ctx));
@@ -658,10 +655,7 @@ function track(ctx: ExtensionContext, update: (usage: UsageTracker) => void): vo
   }
 }
 
-/**
- * The names of the tools the host has registered. A tool name in a model message is model output, so only these may
- * reach a record. A registry that cannot be read counts as empty: the record is still written, without tool names.
- */
+/** Registered tool names only: any other name in a model message is model output and must not reach a record. */
 function registeredToolNames(pi: ExtensionAPI): ReadonlySet<string> {
   const names = new Set<string>();
   try {
@@ -716,7 +710,6 @@ export default function loadout(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event, ctx) => onBeforeAgentStart(pi, event as PromptEvent, ctx));
 
-  // Usage observation. Handlers are best effort and return nothing.
   pi.on("agent_start", (_event, ctx) => track(ctx, startRun));
   pi.on("turn_start", (_event, ctx) => track(ctx, openTurn));
   pi.on("message_start", (event, ctx) => track(ctx, (usage) => deliverMessage(usage, event)));

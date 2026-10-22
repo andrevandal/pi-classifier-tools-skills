@@ -1,11 +1,6 @@
 /**
- * The plugin's words for what it did, in one place: the per-turn notice and the text of `/loadout status`, `explain`
- * and `stats`. Pure: a record and a few counters in, text out. Nothing here reads a file, the environment or a
- * clock, and nothing counts anything from disk (`/loadout stats` prints what `src/report/` counted).
- *
- * One vocabulary everywhere. The word `applied` belongs to a change that was applied and to nothing else: a dry run,
- * a ratchet block and a low-confidence answer say what was proposed and why nothing changed. An unknown value reads
- * `unknown` or `not reported`, never `0`. Nothing here advises; it describes.
+ * Text of the per-turn notice and of `/loadout status`, `explain` and `stats`; pure, reads no file, env or clock.
+ * `applied` names a change that was applied and nothing else; an unknown value reads `unknown` or `not reported`, never `0`.
  */
 
 import { renderSummary } from "./report/text.ts";
@@ -15,7 +10,6 @@ import type { LoadoutConfig, TelemetryReason, TelemetryState } from "./types.ts"
 
 /** What the plugin kept of the latest hook call. Memory only. */
 export interface Observation {
-  /** Null when the hook ran but no record could be built. */
   record: DecisionRecordV3 | null;
   /** Failure text of that call; never persisted. */
   message: string | null;
@@ -68,17 +62,11 @@ const names = (list: readonly string[]): string => (list.length === 0 ? "none" :
 const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 const phase = (value: number | null): string => (value === null ? "not reported" : `${millis(value)} ms`);
 
-// ---------------------------------------------------------------------------
-// Headline
-// ---------------------------------------------------------------------------
-
-/** The smallest known risk among the narrower profiles, or null when none is known. */
 function closestRisk(tools: ToolsRecord): number | null {
   const known = (tools.risks ?? []).flatMap(({ risk }) => (risk === null ? [] : [risk]));
   return known.length === 0 ? null : Math.min(...known);
 }
 
-/** Why the tools stayed as they were when no narrower profile was proposed. */
 function keepText(tools: ToolsRecord): string {
   switch (tools.reason) {
     case "low-confidence": {
@@ -135,7 +123,6 @@ function classifiedHeadline(record: DecisionRecordV3, baselineSize: number | und
   return `proposed ${tools.profile ?? "nothing"} (application ${application.status})`;
 }
 
-/** What happened to the skills, appended to a classified headline; empty when there is nothing to add. */
 function skillsSuffix(record: DecisionRecordV3): string {
   const { skills } = record;
   switch (skills?.reason) {
@@ -188,26 +175,18 @@ function failedHeadline(record: DecisionRecordV3): string {
   return `classification failed: ${record.failure ?? "error"}${status}${after}`;
 }
 
-/** One line saying what the invocation came to, with no prefix. `baselineSize` is the caller's, when it has one. */
 export function headline(record: DecisionRecordV3, baselineSize?: number): string {
   if (record.outcome === "skipped") return skippedHeadline(record);
   if (record.outcome === "failed") return failedHeadline(record);
   return `${classifiedHeadline(record, baselineSize)}${skillsSuffix(record)}`;
 }
 
-/**
- * The per-turn notice: the headline of a classified turn whose application did not fail, cut to one short line.
- * A skip gets none, and a failed classification or application keeps its own warning.
- */
+/** Per-turn notice: classified turns only; a skip gets none and a failure keeps its own warning. */
 export function noticeText(record: DecisionRecordV3, baselineSize?: number): string | null {
   if (record.outcome !== "classified" || record.application.status === "failed") return null;
   const text = headline(record, baselineSize);
   return text.length > NOTICE_MAX ? `${text.slice(0, NOTICE_MAX - 1)}…` : text;
 }
-
-// ---------------------------------------------------------------------------
-// Status
-// ---------------------------------------------------------------------------
 
 function backendText(config: LoadoutConfig): string {
   return config.backend === "laya" ? `laya (${config.laya.transport})` : "jev";
@@ -228,10 +207,7 @@ function provenance(reason: TelemetryReason, scope: StatusInput["scope"]): strin
   }
 }
 
-/**
- * The settings in force and what this process has seen. Prints no endpoint, variable name, Python path or question
- * text. The `config:` line is the config file's path as the loader resolved it, an absolute path.
- */
+/** Prints no endpoint, variable name, Python path or question text. */
 export function statusText(input: StatusInput): string {
   const { config, telemetry, collection, latest, lastRecord, seen } = input;
   const size = input.baseline?.length;
@@ -273,10 +249,6 @@ export function statusText(input: StatusInput): string {
   return lines.join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Explain
-// ---------------------------------------------------------------------------
-
 function storedText(latest: Observation, telemetry: TelemetryState): string {
   const { stored } = latest;
   if (latest.record === null)
@@ -299,7 +271,7 @@ function toolsLine(tools: ToolsRecord): string {
   }
 }
 
-/** One row per narrower profile, narrowest first, then the broadest: the baseline, which carries no risk of its own. */
+/** Narrower profiles narrowest first, then the baseline, which has no risk of its own. */
 function profileRows(tools: ToolsRecord): string[] {
   if (tools.risks === null) return ["    risks: unknown (no probability in the answer)"];
   const rows = tools.risks.map(({ profile, risk }) => {
@@ -315,7 +287,6 @@ function profileRows(tools: ToolsRecord): string[] {
   return rows;
 }
 
-/** What kept the proposal from changing the tools, in a fixed order. */
 function blockers(record: DecisionRecordV3, tools: ToolsRecord): string[] {
   const { application, skills } = record;
   const found = [
@@ -354,7 +325,6 @@ function skillsLine(skills: NonNullable<DecisionRecordV3["skills"]>): string {
   }
 }
 
-/** The classifier call: what was asked, what it cost in time, and what the server reported. */
 function classifierLines(record: DecisionRecordV3): string[] {
   const evidence = record.classifier;
   if (evidence === null) return record.outcome === "failed" ? ["  classifier: no call recorded"] : [];
@@ -402,7 +372,7 @@ function settingsLine(record: DecisionRecordV3): string {
   return `  settings then: dry run ${settings.dryRun ? "on" : "off"} | max risk ${two(settings.tools.maxRisk)} | ${backend} | skills ${settings.skills.enabled ? settings.skills.mode : "off"} | config ${settings.configScope}`;
 }
 
-/** The latest invocation of any outcome, from memory. Says where the record went, and never claims more than that. */
+/** From memory only; says where the record went and never claims more. */
 export function explainText(input: ExplainInput): string {
   const { latest, lastRecord, baselineSize, telemetry } = input;
   if (latest === null) return "[loadout] explain: nothing observed yet in this process";
@@ -440,11 +410,6 @@ export function explainText(input: ExplainInput): string {
   return lines.join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
-
-/** The report of `src/report/` as one block, headed by what this process itself handed to the host. */
 export function statsText(input: StatsInput): string {
   const { summary, compare, telemetry, collection } = input;
   const lines = [`[loadout] stats: ${summary.scope.kind === "session" ? "session files" : "history"}`];

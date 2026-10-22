@@ -336,8 +336,6 @@ test("summary: a transcript tool name is printed only when the plugin's own reco
   ]);
   const bare = writeSession(path.join(dir, "bare.jsonl"), [header({ id: "sess-B" }), ...chain([toolCallTurn("read")])]);
 
-  // `read` and `edit` are vouched by a usage record, `bash` by a decision's actual tools. Every other name,
-  // whatever it looks like, is the model's own text: it counts, under one label, and is never printed.
   const summary = summarize(reportInput([file]));
   assert.deepEqual(summary.transcript.toolCalls, {
     total: 11,
@@ -348,10 +346,8 @@ test("summary: a transcript tool name is printed only when the plugin's own reco
     assert.equal(JSON.stringify(summary).includes(name), false, name);
   }
 
-  // A session with no plugin record vouches for nothing: the counts stay, the names go.
   assert.deepEqual(summarize(reportInput([bare])).transcript.toolCalls, { total: 1, byTool: { "(redacted)": 1 } });
 
-  // A caller that passes no set (the benchmark) gets the reader's names.
   const read = readSessions([file]);
   assert.equal(transcriptTotals(read.turns, read.toolResults).toolCalls.byTool.CANARY_TOOL_N7, 2);
   assert.deepEqual(transcriptTotals(read.turns, read.toolResults, false, new Set(["read"])).toolCalls.byTool, {

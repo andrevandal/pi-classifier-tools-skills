@@ -1,10 +1,7 @@
 /**
- * Read session transcripts and service logs into normalized, content-free events.
- *
- * The reader never writes and keeps no text from a transcript: message content, titles, tool arguments, error
- * text and every key it does not name are never read. Plugin records go through the frozen normalizers of
- * `../telemetry.ts`, so a hostile record cannot carry free text into a report. A damaged line, file or
- * directory is counted and skipped; a transcript being written while we read it must not abort a report.
+ * Read session transcripts and service logs into normalized, content-free events. Plugin records go through the
+ * frozen normalizers of `../telemetry.ts`; a damaged line, file or directory is counted and skipped, since a
+ * transcript may be mid-write.
  */
 
 import * as fs from "node:fs";
@@ -69,7 +66,6 @@ export interface UsageEvent {
   identity: Identity;
 }
 
-/** One assistant message of the host transcript. Never any text. */
 export interface TurnEvent {
   kind: "turn";
   where: Where;
@@ -124,16 +120,11 @@ const TURN_OUTCOMES: readonly string[] = ["stop", "length", "toolUse", "error", 
 export const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-// ---------------------------------------------------------------------------
-// Time
-// ---------------------------------------------------------------------------
-
 const INSTANT = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2}))?$/;
 
 /**
- * An ISO date (UTC midnight) or an ISO date-time with `Z` or `+-HH:MM`, to epoch milliseconds; null for anything
- * else. `Date.parse` is not used: it reads a zone-less time as local time, accepts prose and rolls impossible
- * dates over.
+ * An ISO date (UTC midnight) or date-time with `Z` or `+-HH:MM`, to epoch ms; else null. Not `Date.parse`: it reads
+ * a zone-less time as local, accepts prose and rolls impossible dates over.
  */
 export function parseInstant(text: string): number | null {
   const m = INSTANT.exec(text);
@@ -155,15 +146,10 @@ export function parseInstant(text: string): number | null {
   return Date.UTC(year, month - 1, day, hour, minute, second, ms) - offset * 60_000;
 }
 
-// ---------------------------------------------------------------------------
-// Discovery and headers
-// ---------------------------------------------------------------------------
-
 export function defaultSessionsDir(): string {
   return path.join(os.homedir(), ".omp", "agent", "sessions");
 }
 
-/** The resolved path of a file, or `path.resolve` when it cannot be resolved (it does not exist). */
 export function canonical(file: string): string {
   try {
     return fs.realpathSync(file);
@@ -172,7 +158,6 @@ export function canonical(file: string): string {
   }
 }
 
-/** `fs.statSync`, or null when the path cannot be examined: missing, a symlink loop, no permission. */
 export function statOrNull(file: string): fs.Stats | null {
   try {
     return fs.statSync(file);
@@ -191,10 +176,7 @@ function readRegularText(file: string): string | null {
   }
 }
 
-/**
- * Every `.jsonl` file under `root`, recursive and sorted by plain comparison. A missing root yields none; an
- * unreadable directory calls `onUnreadable` and is skipped.
- */
+/** Every `.jsonl` file under `root`, sorted. A missing root yields none; an unreadable directory calls `onUnreadable`. */
 export function listSessionFiles(root: string, onUnreadable?: () => void): string[] {
   const files: string[] = [];
   const walk = (dir: string): void => {
@@ -241,10 +223,7 @@ function findHeader(lines: readonly string[]): { index: number; id: string | nul
   return null;
 }
 
-/**
- * A bounded peek at a session's header: at most the first 64 KiB, under the same first-four-non-blank-lines
- * rule as a full read. Null when the file has no header, is not a regular file or cannot be read.
- */
+/** Peek at the first 64 KiB for the header, under the same first-four-non-blank-lines rule as a full read. */
 export function readHeader(file: string): { id: string | null; cwd: string | null } | null {
   if (statOrNull(file)?.isFile() !== true) return null;
   let text: string;
@@ -266,15 +245,10 @@ export function readHeader(file: string): { id: string | null; cwd: string | nul
   return header === null ? null : { id: header.id, cwd: header.cwd };
 }
 
-// ---------------------------------------------------------------------------
-// Branch labels
-// ---------------------------------------------------------------------------
-
 /**
- * Active means on the root path of the active leaf, by the host's own rule (OMP `resolveSessionLeafId`; pi's
- * leaf is the last entry, which the same rule yields because pi entries carry no `activeLeafId`). A file with no
- * ids, no leaf, a dangling parent, a cycle or a root that is not `parentId === null` is all `unknown`. Append
- * order is never used to guess.
+ * Active means on the root path of the active leaf, by the host's own rule (OMP `resolveSessionLeafId`; pi's leaf is
+ * the last entry, which the same rule yields). No ids, no leaf, a dangling parent, a cycle or a root that is not
+ * `parentId === null` is `unknown`; append order is never used to guess.
  */
 function labelBranches(entries: Record<string, unknown>[]): Branch[] {
   const unknown = (): Branch[] => entries.map(() => "unknown");
@@ -304,11 +278,6 @@ function labelBranches(entries: Record<string, unknown>[]): Branch[] {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Scan
-// ---------------------------------------------------------------------------
-
-/** A finite number >= 0, else null: a message's cost. */
 function measure(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
@@ -413,7 +382,6 @@ function scanFile(file: string, fileIndex: number): Scanned {
   return out;
 }
 
-/** `(at, file, line)` with an unplaced event last. */
 function byWhere(a: { where: Where }, b: { where: Where }): number {
   const x = a.where.at ?? Number.POSITIVE_INFINITY;
   const y = b.where.at ?? Number.POSITIVE_INFINITY;
@@ -422,8 +390,8 @@ function byWhere(a: { where: Where }, b: { where: Where }): number {
 }
 
 /**
- * Keep one instance per `eventId`: the first whose file header id equals the record's `sessionId`, else the first
- * in canonical order. A record with no `eventId` (a v2 decision) cannot be deduplicated and is kept as read.
+ * Keep one instance per `eventId`: the first whose file header id equals the record's `sessionId`, else the first in
+ * canonical order. A record with no `eventId` (a v2 decision) is kept as read.
  */
 function dedupe<T extends { where: Where; identity: Identity }>(
   events: readonly T[],
@@ -460,10 +428,7 @@ function dedupe<T extends { where: Where; identity: Identity }>(
   return { events: kept.sort(byWhere), removed };
 }
 
-/**
- * Read session files into events. Files are deduplicated by resolved path and sorted, so the result never depends
- * on argument order. Never throws: an unreadable file is marked and skipped.
- */
+/** Read session files, deduplicated by resolved path and sorted so the result never depends on argument order. Never throws. */
 export function readSessions(files: readonly string[]): SessionRead {
   const paths = [...new Set(files.map(canonical))].sort();
   const scanned = paths.map((file, index) => scanFile(file, index));
@@ -489,14 +454,7 @@ export function readSessions(files: readonly string[]): SessionRead {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Service logs
-// ---------------------------------------------------------------------------
-
-/**
- * One line of a service log. The text from the first `{` is parsed, so plain stderr, a journald prefix
- * (`journalctl -o short`) and `journalctl -o cat` all work.
- */
+/** One service-log line, parsed from the first `{`, so plain stderr and journald (`-o short`, `-o cat`) prefixes work. */
 export function parseServiceLine(line: string): "blank" | "other" | "unsupported" | HttpServerRecordV1 {
   if (line.trim() === "") return "blank";
   const start = line.indexOf("{");

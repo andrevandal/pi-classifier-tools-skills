@@ -1,10 +1,7 @@
 /**
- * Aggregate decisions, model-turn usage, host-transcript turns and service evidence into one summary.
- *
- * Unknown stays unknown: a missing measurement is `null` or counted as unknown, never zero, and a `Stats` over
- * no values is all null. Closed vocabularies are zero-filled; open maps list only observed keys. Nothing here
- * reads a clock or a path, so the output is deterministic, and nothing names a cause, a remedy or a saving.
- * Model-turn usage (`loadout.usage`) and host-transcript turns are separate sources and are never added.
+ * Aggregate decisions, model-turn usage, host-transcript turns and service evidence into one summary. Unknown stays
+ * unknown: a missing measurement is `null` or counted as unknown, never zero. Nothing here reads a clock or a path,
+ * and nothing names a cause, a remedy or a saving. Usage records and transcript turns are never added together.
  */
 
 import type { DecisionView, HttpServerRecordV1 } from "../telemetry.ts";
@@ -45,10 +42,6 @@ export const DISCLOSURES = [
   "observed-usage-is-not-billing",
   "absent-records-are-not-evidence-of-no-activity",
 ] as const;
-
-// ---------------------------------------------------------------------------
-// Summary types
-// ---------------------------------------------------------------------------
 
 export interface ScopeInfo {
   kind: "session" | "historical";
@@ -185,7 +178,7 @@ export const LEAD_IDS = [
 ] as const;
 export type LeadId = (typeof LEAD_IDS)[number];
 
-/** A recorded count with the population it is out of. Names no remedy and makes no claim about causes or savings. */
+/** A recorded count with the population it is out of. */
 export interface Lead {
   id: LeadId;
   count: number;
@@ -216,27 +209,19 @@ export interface ReportInput {
   service: ServiceRead | null;
 }
 
-// ---------------------------------------------------------------------------
-// Numbers
-// ---------------------------------------------------------------------------
-
 const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 function ranked(counts: ReadonlyMap<string, number>): Count {
   return Object.fromEntries([...counts].sort(([a, x], [b, y]) => y - x || byText(a, b)));
 }
 
-/** Count by key, most frequent first, then by key. */
 export function tally(keys: Iterable<string>): Count {
   const counts = new Map<string, number>();
   for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
   return ranked(counts);
 }
 
-/**
- * The sum of the known values. A value that would push the total past what a number can hold (only a corrupt or
- * hostile record has one) is counted unknown, never added as Infinity.
- */
+/** The sum of the known values; a value that would overflow to Infinity (only a corrupt record has one) counts unknown. */
 export function sumOf(values: Array<number | null>): Sum {
   let sum = 0;
   let known = 0;
@@ -262,7 +247,6 @@ function meanOf(values: number[]): number {
   return Number.isFinite(total) ? total / values.length : values.reduce((a, b) => a + b / values.length, 0);
 }
 
-/** Statistics over the known values only; every field is null when there are none. */
 export function statsOf(values: number[]): Stats {
   if (values.length === 0) return { n: 0, mean: null, p10: null, p50: null, p90: null, max: null };
   return {
@@ -275,7 +259,6 @@ export function statsOf(values: number[]): Stats {
   };
 }
 
-/** The known entries of a list that may hold nulls. */
 const known = (values: Array<number | null>): number[] => values.filter((value): value is number => value !== null);
 
 const sortedDistinct = (values: Array<number | null>): number[] => [...new Set(known(values))].sort((a, b) => a - b);
@@ -323,14 +306,10 @@ function toolCalls(
   return { total, byTool: ranked(byTool) };
 }
 
-// ---------------------------------------------------------------------------
-// Transcript and usage
-// ---------------------------------------------------------------------------
-
 /**
  * Totals over host-transcript turns. Not deduplicated; `toolResults` and `toolErrors` are null when `usageFiltered`.
- * A transcript's tool names are the model's own text, so a report passes `vouched` (see `vouchedToolNames`) and a name
- * outside it counts under `(redacted)`. The benchmark passes none and keeps the reader's names.
+ * Transcript tool names are the model's own text, so a report passes `vouched` (see `vouchedToolNames`) and a name
+ * outside it counts under `(redacted)`.
  */
 export function transcriptTotals(
   turns: readonly TurnEvent[],
@@ -422,17 +401,10 @@ function summarizeUsage(events: readonly UsageEvent[]): UsageSummary {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Service join
-// ---------------------------------------------------------------------------
-
 /**
  * Join attempts to service records by request id. Only a joinable attempt takes part: it has a request id and used
- * the Laya HTTP transport, the only one that sends the id to a server. An attempt of any other transport has an id
- * and can never have a server record, so its id is no evidence of a missing one. When one id has two or more
- * different records the id is a conflict: none of its records joins and the attempts that name it are ambiguous.
- * The time range never filters service records. `joined` holds each joined record once; `pairs` maps an attempt to
- * the record it joined.
+ * the Laya HTTP transport, the only one that sends the id. An id with two or more different records is a conflict:
+ * none of its records joins and the attempts that name it are ambiguous. The time range never filters service records.
  */
 export function joinService(
   attempts: readonly DecisionEvent[],
@@ -512,11 +484,6 @@ export function joinService(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Leads
-// ---------------------------------------------------------------------------
-
-/** The smallest known risk among an attempt's narrower profiles, or null when it recorded none. */
 function closestRisk(attempt: DecisionEvent): number | null {
   const risks = known((attempt.view.tools?.risks ?? []).map((entry) => entry.risk));
   return risks.length === 0 ? null : risks.reduce((a, b) => (b < a ? b : a));
@@ -596,13 +563,8 @@ function leadCandidates(
   ];
 }
 
-// ---------------------------------------------------------------------------
-// Decisions and classifier
-// ---------------------------------------------------------------------------
-
 type SelectionRow = "none" | "narrow" | "keep-baseline";
 
-/** Where a proposal sits in the cross-tab of what was proposed against what happened. */
 const rowOf = (view: DecisionView): SelectionRow =>
   view.tools === null ? "none" : view.tools.active !== null ? "narrow" : "keep-baseline";
 
@@ -701,10 +663,6 @@ function summarizeClassifier(attempts: readonly DecisionEvent[]): ClassifierSumm
     ),
   };
 }
-
-// ---------------------------------------------------------------------------
-// Header and summary
-// ---------------------------------------------------------------------------
 
 /** The part of a summary and of an export that describes what was read: scope, filters and coverage. */
 export function buildHeader(input: ReportInput): { scope: ScopeInfo; filters: FilterInfo; coverage: Coverage } {

@@ -1,11 +1,6 @@
 /**
- * Synthetic session, record and service-log builders for the report tests.
- * Everything here is invented data: no real transcript text. Tests import this
- * module; it never imports `node:test`, so a smoke script can use it too.
- *
- * `tmp()` registers the directories it creates and removes them when the
- * process exits. The `write*` builders write under a path the caller passes in
- * and never register it, so a smoke script's tree survives the script.
+ * Synthetic session, record and service-log builders for the report tests; invented data only. Never imports
+ * `node:test`, so a smoke script can use it. `tmp()` directories are removed at exit; `write*` targets are not.
  */
 
 import * as fs from "node:fs";
@@ -31,7 +26,6 @@ import {
 
 export const T0 = "2026-10-10T00:00:00.000Z";
 
-/** A uuid that matches `ID_PATTERN`. */
 export const uuid = (n: number): string => `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
 
 /** The request ids of fixture M's two attempts that carry one. */
@@ -154,7 +148,6 @@ export const decisionV3 = (over: Partial<DecisionRecordV3> = {}): DecisionRecord
   ...over,
 });
 
-/** A stored v2 payload. */
 export const decisionV2 = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   v: 2,
   failure: null,
@@ -208,7 +201,6 @@ export const httpRecord = (over: Partial<HttpServerRecordV1> = {}): HttpServerRe
   ...over,
 });
 
-/** A plugin record as the host stores it. */
 export const custom = (customType: string, data: unknown): Record<string, unknown> => ({
   type: "custom",
   customType,
@@ -242,7 +234,6 @@ export const toolResultMessage = (isError = false): Record<string, unknown> => (
   },
 });
 
-/** An assistant turn that calls each named tool once. */
 export const toolCallTurn = (...names: string[]): Record<string, unknown> =>
   assistantMessage({
     content: names.map((name, i) => ({ type: "toolCall", id: `call-${i}`, name, arguments: {} })),
@@ -484,7 +475,6 @@ export function writeBranches(dir: string): { file: string } {
   return { file };
 }
 
-/** What the summary and export take: select, read and filter as `buildSummary` does, without the CLI. */
 export function reportInput(
   files: string[],
   opts: { filters?: FilterSpec; serviceLogs?: string[]; scope?: ScopeSpec } = {},

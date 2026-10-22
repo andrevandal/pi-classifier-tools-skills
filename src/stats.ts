@@ -1,8 +1,4 @@
-/**
- * `/loadout stats`: argument handling over the shared report library. `splitArgs` splits the command text and
- * `runStats` turns the tokens after `stats` into one result. `parseArgv` is the only validator and the library reads
- * every session file; this module's one filesystem call is `statSync` on the host's current session file.
- */
+/** `/loadout stats`: argument handling over the shared report library, which does the parsing and reading. */
 
 import * as fs from "node:fs";
 
@@ -24,19 +20,13 @@ const STATS_USAGE = `[loadout] stats [summary|export] [--json] [scope] [filters]
 
 const NO_SESSION_FILE = `${PREFIX}no session file yet. The host writes it with the first assistant message (an unsaved session never writes one); ask again after the first reply, or name a scope (see /loadout stats --help)`;
 
-// A history scope that names nothing on disk. Parsing it reads nothing, so it lets every other argument be validated
-// before the session file exists.
+// Names nothing on disk, so every other argument can be validated before the session file exists.
 const PROBE_SCOPE = ["--since", "1970-01-01", "--until", "1970-01-02", "--all-projects"];
 
-// A scope or filter flag, bare or as `--flag=value`.
 const SCOPE_FLAG = /^--(session|since|until|project|all-projects|sessions-dir)(=|$)/;
 const FILTER_FLAG = /^--(branch|outcome|service-log)(=|$)/;
 
-/**
- * Split command text into tokens. Whitespace separates tokens; `"..."` and `'...'` group text (no escapes, and the
- * other quote is literal inside) and join the text they touch, so `--project="a b"` is one token. Null when a quote
- * is unterminated.
- */
+/** Split command text into tokens; `"..."` and `'...'` group text (no escapes). Null when a quote is unterminated. */
 export function splitArgs(args: string): string[] | null {
   const tokens: string[] = [];
   let token = "";
@@ -63,7 +53,6 @@ export function splitArgs(args: string): string[] | null {
   return tokens;
 }
 
-/** A regular file on disk. The only filesystem call in this module. */
 function isRegularFile(file: string): boolean {
   try {
     return fs.statSync(file).isFile();
@@ -72,10 +61,7 @@ function isRegularFile(file: string): boolean {
   }
 }
 
-/**
- * Run the tokens after `stats`. `sessionFile` is the host's current session file, undefined until the first assistant
- * message; it is the scope only when no scope flag is given.
- */
+/** `sessionFile` is the host's current session file, undefined until the first assistant message. */
 export function runStats(tokens: string[], sessionFile: string | undefined): StatsResult {
   const json = tokens.includes("--json");
   const args = tokens.filter((token) => token !== "--json");
@@ -89,10 +75,8 @@ export function runStats(tokens: string[], sessionFile: string | undefined): Sta
 
   let result = parseArgv([view, ...rest]);
   let compare = false;
-  // Without a scope flag the scope is this session's file. Help and version parse without one, so they win here.
   if (!result.ok && !rest.some((token) => SCOPE_FLAG.test(token))) {
-    // The other arguments are checked first, so a bad flag is refused the same way before the session file exists as
-    // after it, and only a valid command is answered with the missing file.
+    // Checked first so a bad flag is refused the same way before and after the session file exists.
     const probe = parseArgv([view, ...PROBE_SCOPE, ...rest]);
     if (!probe.ok) return { kind: "refused", level: "warning", text: `${PREFIX}${probe.message}` };
     if (sessionFile === undefined || !isRegularFile(sessionFile)) {
