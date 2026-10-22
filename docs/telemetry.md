@@ -408,7 +408,7 @@ The last column says when each counter is computed: before parsing, at file leve
 | `usage.tokens.input`, `.output`, `.cacheRead`, `.cacheWrite`, `.reasoning` | `Sum` of each token counter |
 | `usage.cost` | `Sum` of `costTotal` |
 | `usage.toolCalls` | object with `total` and `byTool` (below) |
-| `usage.toolCalls.total` | tool calls summed over the records |
+| `usage.toolCalls.total` | tool calls summed over the records. A record counts only the tool names the host had registered when its turn ended (section 8), so the total can be less than the calls the model made |
 | `usage.toolCalls.byTool` | tool calls by name; open map; a name that is not an identifier was already dropped by the normalizer |
 | `usage.toolErrors` | `Sum` of tool errors |
 | `usage.errorStatus` | records by HTTP error status; records with no status are not counted |
@@ -636,7 +636,7 @@ It prints no endpoint, environment variable name, python path or question text. 
 - `skills:` the skill reason with its counts and, when skills were selected, the best scores.
 - `classifier:` questions asked, prompt and sent characters (`clipped` or `not clipped`), the model, and the tokens or `tokens not reported`.
 - `timing:` elapsed time, budget, timeout, whether the guard fired, and the HTTP status when there is one.
-- `server:` the queue and inference times the server reported, or `not reported`, and the request id, or `none`.
+- `server:` the queue and inference times the server reported, or `not reported`, and the request id, or `none`. An id that the record's transport never sends (Jev and the Laya `python` transport; section 6) is followed by `(not sent)`: no server saw it.
 - `settings then:` the settings in force when the record was built.
 - `failure text (memory only, never stored):` the failure text of that call, on one line, at most 200 characters, when one exists.
 - `previous decision:` the latest non-skipped headline, when the latest call was a skip or built no record.
@@ -682,7 +682,7 @@ Before the first assistant reply the host may report a path, but the file is wri
 
 ### Examples
 
-Captured from OMP 18.12.5 with synthetic stubs: the classifier and the model answer scripted replies. The config path is shown as `~/.omp/loadout.json`.
+Captured from OMP 18.12.5 with synthetic stubs: the classifier and the model answer scripted replies. `status` prints the config path as the plugin resolved it, an absolute path; the examples show it shortened to `~/.omp/loadout.json`.
 
 Explain for one record with a dry run, a low-confidence answer and skills over the candidate limit:
 
@@ -803,3 +803,4 @@ Failed (abridged): `"outcome":"failed","failure":"unavailable","tools":null`, a 
 - The text view's `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records (section 11b).
 - A config reload (a cwd or project-trust change) can change the telemetry setting in the middle of a session, while the latest observation and the counters carry over. Afterwards `explain` names the reason in force now for a record built earlier (it can read `record not stored: telemetry off (default)` for a record that was suppressed before the reload), and `stats` can say that nothing from this process was stored although the process handed records to the host before the reload.
 - A tarball packed from a development checkout also holds that checkout's git-ignored Python bytecode (for example `python/__pycache__/*.pyc`): `files` in `package.json` names the whole `python` directory, and a root `.gitignore` does not narrow it. The local activation runs the plugin and the service from the checkout, so no tarball is published.
+- A failed HTTP call carries the start of the response body into the failure message. `src/classify/http.ts` keeps up to 200 characters of a non-2xx body, and the Laya HTTP server's 500 body is its exception text (`{"error": "<type>: <text>"}`), which is not filtered and can carry content from the request it was handling. The server never logs that text (section 8), but its response carries it. The failure warning (shown even with `notify: false`) shows the message, and `/loadout explain` shows its first 200 characters as `failure text (memory only, never stored)`. No `loadout.decision` record holds it (a record keeps the failure code and the HTTP status), no export carries it, and a `loadout.http` line keeps only the error class.

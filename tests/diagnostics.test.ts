@@ -392,6 +392,26 @@ test("explain: shows each profile's probability and risk against the threshold, 
   assert.ok(filtered.includes("delivery filter (3 hidden)"), filtered);
 });
 
+test("explain: a request id that the transport never sent is marked not sent", () => {
+  const id = uuid(7);
+  const requestLine = (over: Parameters<typeof settings>[0], requestId: string | null = id): string =>
+    lineOf(
+      explain(observation(decisionV3({ settings: settings(over), classifier: classifier({ requestId }) }))),
+      "server:",
+    );
+
+  assert.ok(requestLine({ transport: "http" }).endsWith(`| request ${id}`), "the Laya HTTP transport sends it");
+  assert.ok(
+    requestLine({ transport: "python" }).endsWith(`| request ${id} (not sent)`),
+    "the local sidecar never sends it",
+  );
+  assert.ok(
+    requestLine({ backend: "jev", transport: null }).endsWith(`| request ${id} (not sent)`),
+    "Jev never sends it",
+  );
+  assert.ok(requestLine({ transport: "python" }, null).endsWith("| request none"), "no id: nothing to mark");
+});
+
 test("explain: unknown stays unknown", () => {
   const record = decisionV3({
     tools: tools({ risks: null }),

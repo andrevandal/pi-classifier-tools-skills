@@ -228,7 +228,10 @@ function provenance(reason: TelemetryReason, scope: StatusInput["scope"]): strin
   }
 }
 
-/** The settings in force and what this process has seen. Prints no endpoint, variable name, path or question text. */
+/**
+ * The settings in force and what this process has seen. Prints no endpoint, variable name, Python path or question
+ * text. The `config:` line is the config file's path as the loader resolved it, an absolute path.
+ */
 export function statusText(input: StatusInput): string {
   const { config, telemetry, collection, latest, lastRecord, seen } = input;
   const size = input.baseline?.length;
@@ -368,10 +371,17 @@ function classifierLines(record: DecisionRecordV3): string[] {
       ? "server: not reported"
       : `server: queue ${phase(evidence.server.queueMs)}, inference ${phase(evidence.server.inferenceMs)}`;
   const http = evidence.status === null ? "" : ` | HTTP ${evidence.status}`;
+  // Only the Laya HTTP transport puts the id on the wire; for any other transport it is a label no server ever saw.
+  const request =
+    evidence.requestId === null
+      ? "none"
+      : record.settings.transport === "http"
+        ? evidence.requestId
+        : `${evidence.requestId} (not sent)`;
   return [
     `  classifier: ${questions} question${questions === 1 ? "" : "s"} (tools ${Math.max(0, questions - asked)}, skills ${asked}) | prompt ${evidence.promptChars} chars, sent ${evidence.sentChars} (${clipped}) | model ${evidence.model ?? "unknown"} | ${tokens}`,
     `  timing: ${millis(evidence.elapsedMs)} ms of ${millis(evidence.budgetMs)} ms budget (timeout ${millis(evidence.timeoutMs)} ms), guard ${evidence.guardFired ? "fired" : "not fired"}${http}`,
-    `  ${server} | request ${evidence.requestId ?? "none"}`,
+    `  ${server} | request ${request}`,
   ];
 }
 
