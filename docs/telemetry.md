@@ -7,10 +7,12 @@ Source of truth: [`src/telemetry.ts`](../src/telemetry.ts). This page is in the 
 | entry (`customType`) | version | producer |
 | --- | --- | --- |
 | `loadout.decision` | 3 (2 is still read) | the extension, once per prompt it sees |
-| `loadout.usage` | 1 | defined here, no producer yet (slice #4) |
-| `loadout.http` | 1 | defined here, no producer yet (slice #5) |
+| `loadout.usage` | 1 | the extension, once per assistant model turn (slice #5) |
+| `loadout.http` | 1 | the Laya HTTP server (`python/laya_http_server.py`), one line per `POST` on its stderr (slice #4); not a session entry |
 
-All three are session entries the host stores next to the conversation. The plugin only ever appends them; it never reads them back during a session.
+`loadout.decision` and `loadout.usage` are session entries the host stores next to the conversation. `loadout.http` is not one: it is a line in the Laya server's log (section 8). The plugin only appends the session entries. Apart from `/loadout stats`, which reads the session files, it never reads them back.
+
+Retention is not managed here. Session entries stay in the host's session file for as long as the host keeps that file, and `loadout.http` lines stay in the server's log for as long as its receiver keeps them (the journal under systemd). The plugin and the server delete, rotate, expire and copy nothing, and an opt-out deletes nothing already written.
 
 ## 2. Privacy
 
@@ -34,7 +36,7 @@ Truncation happens only in the plugin: `classifier.promptChars` > `classifier.se
 
 A machine file with `telemetry: true` or no `telemetry` key behaves the same: it is a ceiling, not a switch.
 
-The decision is made when a session loads its config (session start, or a cwd or project-trust change), so **restart the session after editing** the setting. Opt-out stops every record the plugin appends. It does not stop the host's own conversation logging, nor the `loadout.skills` hint message (selection behavior, which the host may store). `/loadout explain` and `/loadout status` keep working from memory.
+The decision is made when a session loads its config (session start, or a cwd or project-trust change), so **restart the session after editing** the setting. Opt-out stops every record the plugin appends. It does not stop the host's own conversation logging, nor the `loadout.skills` hint message (selection behavior, which the host may store). `/loadout explain` and `/loadout status` keep working from memory, and `/loadout stats` keeps reading the session files, because reading is not collection.
 
 ## 4. `loadout.decision` v3
 
@@ -79,11 +81,11 @@ Durations are milliseconds. Lengths are characters (JS string length). Counts ar
 ## 6. IDs
 
 - `eventId`: unique per record; the dedup key when a host forks a session and copies its entries.
-- `decisionId`: identifies one decision. In memory, `lastDecisionId` is set for every record built, skips included, and is `null` when building failed. A later slice uses it to link usage to a decision.
-- `requestId`: a UUIDv4 *offered to the transport*, generated only when persisting and a request is actually issued. A record carries it even when the transport failed before sending (for example an unset Jev token). Only the Laya HTTP transport may forward it, and none does until #4.
+- `decisionId`: identifies one decision. In memory, `lastDecisionId` is set for every record built, skips included, and is `null` when building failed. `loadout.usage` records carry it, linking each model turn to its decision (section 8).
+- `requestId`: a UUIDv4 *offered to the transport*, generated only when persisting and a request is actually issued. A record carries it even when the transport failed before sending (for example an unset Jev token). Only the Laya HTTP transport forwards it, as the `X-Request-Id` header (section 8); the Jev transport and the Laya `python` transport do not.
 - `sessionId`: the host's id, or null.
 
-`classifier.status` is the HTTP status of a failed call; null on success and for non-HTTP transports. `classifier.server` and `status` stay null until #4 fills them.
+`classifier.status` is the HTTP status of a failed call: the Laya and Jev HTTP transports keep it, and the Laya transport keeps the server's timing, for any response whose body was read, including a 200 whose body was unusable. It is null on success, when no response arrived or its body could not be read (timeout, abort, transport failure), and for non-HTTP transports. `classifier.server` holds the `queue` and `infer` times, in ms, that the Laya HTTP server reported in its `Server-Timing` header (section 8). It is null for every other transport, when no response arrived or its body could not be read, and whenever the server sent none (an older server, an opted-out request, a rejected or unparsable request). Inside `server`, a phase the server did not report is null, never 0.
 
 ## 7. Durability
 
@@ -93,34 +95,68 @@ Durations are milliseconds. Lengths are characters (JS string length). Counts ar
 - OMP swallows disk errors; the plugin cannot see them.
 - Both defer writes until the first assistant message.
 
-The plugin counts per session `{handedOff, suppressed, failed, lastFailure}`, shown by `/loadout status`, and shows one `warning` notice (code only) on the first failure. A persistence failure never aborts the turn. An unserializable payload is refused before the host sees it (code `serialize`).
+The plugin counts per session `{handedOff, suppressed, failed, lastFailure}`, for decision and usage records together, shown by `/loadout status` and `/loadout stats`, and shows one `warning` notice (code only) on the first failure. A persistence failure never aborts the turn. An unserializable payload is refused before the host sees it (code `serialize`).
 
 ## 8. `loadout.usage` v1 and `loadout.http` v1
 
-Defined here, with normalizers (`normalizeUsage`, `normalizeHttp`); nothing produces them yet. Completeness is per field: `null` means not observed or not reported by this host, `decisionId: null` means unassigned. There is no separate completeness flag. A producer builds a candidate and appends `normalizeUsage(candidate)`; a null result is not appended.
+Defined here, with normalizers (`normalizeUsage`, `normalizeHttp`). The extension produces `loadout.usage`, and the Laya HTTP server produces `loadout.http`. Completeness is per field: `null` means not observed or not reported by this host, `decisionId: null` means unassigned. There is no separate completeness flag. The extension builds each candidate, normalizes it with `normalizeUsage` and appends the result; a null result is not appended.
 
-`loadout.usage` v1, one per assistant message:
+`loadout.usage` v1, one per assistant model turn the host reports through `turn_end` (OMP and pi). This plugin produces it: one record per observed turn, appended with the session's other records through the same persistence path and opt-out as `loadout.decision`.
 
 | field | meaning |
 | --- | --- |
-| `v`, `eventId`, `sessionId`, `runId`, `decisionId`, `turnIndex` | identity; `eventId` and `runId` are UUIDv4 |
-| `host` | `omp` or `pi` |
-| `hostEntryId` | pi's entry id when given; null on OMP |
-| `stopReason` | `stop` `length` `toolUse` `error` `aborted` `other`, or null |
-| `tokens` | `input`, `output`, `cacheRead`, `cacheWrite`, `reasoning`, each a number or null. A synthetic failure's zero usage is unknown, so null |
-| `costTotal`, `toolCalls` (name to count), `toolErrors`, `errorStatus` | totals for the message |
-| `retryAttempt` | informational only |
+| `v`, `eventId`, `sessionId`, `runId`, `decisionId`, `turnIndex` | identity; `eventId` and `runId` are UUIDv4. `eventId` is new for every observation and is the dedup key when a host copies entries into a fork or branch. `runId` groups the turns of one run. `turnIndex` is the host's counter: informational, it restarts at 0 with each host run (`agent_start`), so it keeps counting when the plugin starts a new `runId` at a compaction or boundary, and it is never a join key |
+| `host` | `omp` or `pi`, told apart by the shape of the event (pi's `turn_end` carries `messageEntryId`) |
+| `hostEntryId` | pi's id of the assistant message entry; null on OMP, whose `turn_end` has none |
+| `stopReason` | `stop` `length` `toolUse` `error` `aborted`; any other host value (pi also has `pending` and `deferred`) is `other`; null when the host gives none |
+| `tokens` | `input`, `output`, `cacheRead`, `cacheWrite`, `reasoning`: each the host's count or null. The buckets are the host's own (OMP's `input` excludes cache reads, and `reasoning` is part of `output`); nothing is summed or reconciled. `reasoning` is OMP's `reasoningTokens` or pi's `reasoning`, null when the provider does not report it. A host shows "no usage reported" as zero counters, and a model turn always consumes tokens, so when none of the four counters is above zero all five token fields and `costTotal` are null. This covers failed and interrupted attempts and providers that report nothing. On an `error` or `aborted` turn the counters can be partial: a zero next to a positive counter may only mean the stream stopped before the host received that count. A stop message the host writes itself without calling a model, such as OMP's stop before a model call (`aborted`, no counters), is counted as a turn with null tokens |
+| `costTotal` | the host's `usage.cost.total`, which the host computes from its configured prices. It is not a bill: `0` can mean free or unpriced. Null when unknown |
+| `toolCalls`, `toolErrors` | `toolCalls` counts the tool calls in this message by name, for the tools the host has registered when the turn ends. A tool name in a model message is model output, and a made-up or injected one can carry a path or a secret, so any other name is dropped: the counts can sum to less than the calls, and are `{}` when the host's tool list cannot be read. `toolErrors` is how many of this turn's tool results the host flagged as errors: 0 for an empty list of results, which includes calls that never ran, and null only when the host sent no list. A tool result's own usage or details are never read |
+| `errorStatus` | OMP's HTTP status of a failed request; null on pi, which has none, and for failures that carry no status, such as a dropped stream |
+| `retryAttempt` | OMP: the attempt number from the host's `auto_retry_start`, on the first observation after it. pi: always null, because its extension API has no retry event. Informational only: null does not prove a first attempt |
 
-`loadout.http` v1, one per Laya HTTP server request:
+Attribution. A record links to a decision only through lifecycle events the plugin saw, never by time, content or transcript order:
+
+- A decision (a skip included) is pending once its `before_agent_start` hook finishes. The run that starts next takes it. OMP runs the hook again for a follow-up or steer queued inside an open run, so that decision applies from the first turn after the hook, and earlier turns keep the previous one. pi runs no hook for a queued follow-up or steer, so no decision was made for that message: from the turn that delivers it the rest of the run is unassigned. The plugin tells these apart from the host's `message_start` event: a user message that arrives after an observed turn used the run's decision, and that no hook claimed, ends the link. A message delivered together with the run's first turn, such as a steer queued before the first model call, counts with that turn's decision.
+- `agent_start` opens a run with a new `runId`. A run that starts without a decision hook (a retry, a compaction continuation, a wake-up) is unassigned: `decisionId` is null. So is the retry of a failed attempt.
+- Compaction ends the run; the next turn is a new, unassigned run. A pending decision stays pending, because OMP may compact between the hook and the run. A tree move, branch or switch ends the run and drops a pending decision. `agent_end` drops a pending decision too.
+- A decision whose prompt the host cancelled before any run began stays pending until the next decision, `agent_end` or boundary, so an unrelated run that starts in between could be linked to it.
+
+Coverage. These records do not claim complete billing or complete coverage:
+
+- One record per assistant message that reaches `turn_end`: failed and interrupted ones, and a stop message the host writes itself without a model call, are included. Classifier calls are not model turns and are never in these records.
+- Not observed: model calls the host makes without telling extensions (session titles, memory consolidation, compaction summaries), transport retries the host performs inside one model call (no message exists, so nothing is reported), usage fields the schema has no slot for (OMP's orchestration, server-tool and credit counters), and anything before the plugin loaded or after it was disabled. A pi turn whose message entry id cannot be resolved is not delivered by pi, so it is not observed.
+- Subagent and child sessions are never added to the parent's records. Each session's plugin instance writes its own records, and the producer never adds other sessions' records to its own. `/loadout stats` and `loadout-report` read another session only when a scope names it (`--session <file>` or a history scope), and deduplicate by `eventId` (the collab guest below is the exception).
+- An OMP collab guest that runs `/loadout` while joined mirrors the host's turns into its own replica session, and the plugin there can record them again with new `eventId`s. Those copies cannot be told apart by `eventId`, so usage summed over the host's and that guest's session files counts those turns twice.
+- A replayed `turn_end` for the same message object (OMP can replay one when it resumes unpaired tool calls) counts once. The same usage arriving as a different object cannot be told apart and counts again.
+- With telemetry off nothing is written. The plugin still counts the records in memory, and `/loadout status` shows them as suppressed.
+
+`loadout.http` v1, one per `POST` to the Laya HTTP server (`python/laya_http_server.py`), written as one JSON line on the server's stderr. That is the server's existing log (the journal under systemd), not a new file or datastore. `GET` health checks write no line.
 
 | field | meaning |
 | --- | --- |
 | `type`, `v` | `loadout.http`, `1` |
-| `requestId`, `idStatus` | the `X-Request-Id`; `idStatus` is `valid`, `absent` or `invalid`, and is derived from the id on read |
-| `at` | UTC ISO timestamp |
-| `outcome` | `ok` `client-gone` `error` `rejected`. `ok` means the write did not raise, not that it was delivered. Never infer a timeout from EPIPE |
-| `status`, `queueMs`, `inferenceMs`, `totalMs` | from the response and `Server-Timing` (`queue`, `infer`); Laya only |
-| `errorClass` | `^[A-Za-z][A-Za-z0-9_]{0,63}$` or null |
+| `requestId`, `idStatus` | `requestId` is the `X-Request-Id` header when the request carried exactly one and it is a lowercase UUIDv4 (`idStatus` `valid`). Otherwise it is null and `idStatus` is `absent` (no header) or `invalid` (anything else, including a repeated header); an invalid value is never copied. `idStatus` is derived from the id on read |
+| `at` | UTC ISO timestamp with milliseconds: when the line was written, after the answer write was attempted |
+| `outcome` | `ok`: a 2xx answer was written and the write did not raise. `rejected`: the server refused the request itself (`401` unauthorized, `413` body over 1 MiB). `error`: the answer was a 5xx, an exception while reading, parsing or predicting. `client-gone`: writing the answer raised a connection error. `ok` is not delivery: a peer that closed cleanly often still accepts the write, so an abandoned request can read `ok`. Never infer a timeout from the outcome |
+| `status` | the HTTP status the server chose to send; for `client-gone` it may never have arrived |
+| `queueMs` | milliseconds waiting for the server's single prediction lock; null when the request never reached it |
+| `inferenceMs` | milliseconds holding that lock, until the model answered or raised (a failed inference still reports it); null when the request never reached it |
+| `totalMs` | milliseconds from the start of handling (request line and headers already read) to the end of the write attempt; always present |
+| `errorClass` | a class name matching `^[A-Za-z][A-Za-z0-9_]{0,63}$`, never its text: the exception behind an `error`, the connection error behind a `client-gone`; null otherwise |
+
+Durations come from `time.monotonic()` and carry three decimals. A phase that was not measured is null, never 0. Lines appear in the order handlers finish, not the order requests arrived.
+
+Headers (Laya HTTP transport only; Jev and the python sidecar neither send nor read them):
+
+- `X-Request-Id` (request): the plugin's `classifier.requestId`, which it generates only when it persists records.
+- `Server-Timing` (response): `queue;dur=<ms>, infer;dur=<ms>`, only for the phases that were measured. A 5xx after a failed inference carries both; a rejection or an early failure (bad JSON, bad length) carries none. The plugin keeps `queue` and `infer`, ignores any other metric, and treats a repeated or malformed one as unknown (`classifier.server`, section 6).
+
+Opt-out. A plugin that does not persist records (any reason in section 3) sends `X-Loadout-Telemetry: off` and no `X-Request-Id`. The server also takes `--no-telemetry`. In both cases the request gets no line and no `Server-Timing` header. The server fails closed: any `X-Loadout-Telemetry` value other than `on` counts as off. A request without the header (another client, `npm run eval`, or a plugin session started before this version) is recorded; only `--no-telemetry` silences those. Opting out never touches the server's ordinary error output, and nothing already written is deleted.
+
+Reading the evidence. A client timeout is recorded by the client (`failure`, `elapsedMs`, `budgetMs`, `guardFired`); the server line joins it through `requestId`, and `queueMs` shows whether the request spent its time waiting behind another. The server has no deadline and notices a disconnect only when it writes the answer, so an abandoned request still runs its inference and its line says `ok` or `client-gone`; neither says why the client left. Under systemd: `journalctl --user -u laya-server -o cat | grep '"type":"loadout.http"'`.
+
+Never logged: bodies, prompts, answers, tokens, headers other than the two named, URLs, and exception text.
 
 ## 9. Versioning
 
@@ -142,8 +178,587 @@ v2 `probabilities` and `scores` keys are only shape-checked against the identifi
 ## 11. Reading records
 
 - `normalizeDecision(data)` returns a `DecisionView` for v2 and v3, or null.
-- `npm run decisions` summarizes non-skipped records and reports `skipped` (by reason) and `unsupported` separately.
-- `npm run bench` refuses to run when the machine opts out or the setting is unreadable, and sets `telemetry: true` in each arm's config. A YAML machine file read under Node has no parser, so use a JSON machine file or run under Bun. Bench `activeToolNames` and `applied` reflect the host's real tools when a v3 record provides them.
+- `loadout-report` and the `npm run decisions` text view read all three record families (`loadout.decision`, `loadout.usage`, `loadout.http`) through `src/report/`. `/loadout stats` (section 11b) reads through the same library. Skipped and unsupported records are counted apart from the decision figures; see section 11a.
+- `npm run bench` refuses to run when the machine opts out or the setting is unreadable, and sets `telemetry: true` in each arm's config. A YAML machine file read under Node has no parser, so use a JSON machine file or run under Bun. Bench `activeToolNames` and `applied` reflect the host's real tools when a v3 record provides them. Its sessions are read through the same reader as `loadout-report`.
+
+## 11a. Reporting and export (loadout-report)
+
+Source: [`src/report/`](../src/report/). `loadout-report summary` and `loadout-report export` read session transcripts and explicit service logs. `npm run decisions` prints a text view of the same summary, and `npm run report -- <args>` runs the CLI from a checkout under Node. That text view is `renderDecisions` in [`src/report/text.ts`](../src/report/text.ts); `/loadout stats` prints `renderSummary` from the same file (section 11b). Reading never writes, and no output carries transcript text.
+
+### CLI
+
+`loadout-report <summary|export> [flags]`. Flags are parsed strictly: an unknown flag, or a flag without its value, is a usage error.
+
+| flag | meaning |
+| --- | --- |
+| `--session <file>` (repeatable) | current-session scope; each must exist and be a file |
+| `--since <ISO>`, `--until <ISO>` | historical window `[since, until)`; both required, `since` before `until` |
+| `--project <path>` (repeatable), `--all-projects` | historical project scope; exactly one of the two |
+| `--sessions-dir <dir>` (repeatable) | historical roots; default `~/.omp/agent/sessions`, for pi `~/.pi/agent/sessions`; an explicit root must be a directory |
+| `--service-log <file>` (repeatable) | service log for the request-id join; must be a file |
+| `--branch <value>` | `all` (default) or one branch, see [Branch labels](#branch-labels) |
+| `--outcome <value>` (repeatable) | one decision or model-turn outcome, see [Filters](#filters) |
+| `--help`, `-h`; `--version`, `-v` | help text, or the package version, on stdout; exit 0 |
+
+| exit | meaning |
+| --- | --- |
+| 0 | success. A scope that matches no session files still exits 0: a warning on stderr and every count zero |
+| 1 | unexpected error: the message only, on stderr |
+| 2 | usage error: stdout is empty and stderr names the flag or flags at fault |
+
+Stdout carries only the JSON document: two-space indent, one trailing newline. Every diagnostic goes to stderr. `--help` and `--version` are answered before the subcommand, scope and filters are checked.
+
+Scope errors, all exit 2: no scope; `--session` with a historical flag or with `--sessions-dir`; a historical scope missing `--since`, missing `--until`, or missing `--project` or `--all-projects` (every missing piece is named); `--project` with `--all-projects`; an empty `--project` value, which would silently mean the current directory; `--since` not before `--until`; an instant the rules in the next subsection reject; an unknown `--branch` or `--outcome` value; a `--session`, `--service-log` or explicit `--sessions-dir` path that is missing or of the wrong kind.
+
+### Scope and boundaries
+
+- **Session scope** (`--session`) reads exactly the named files and has no time window. Child sessions of a named file are not read; `scope.childFilesNotRead` counts them. A child directory that cannot be listed or examined (no permission, a symlink loop) is counted in `scope.childDirsUnreadable` and makes `childFilesNotRead` a lower bound. It is not part of `coverage.files.unreadable`, because no in-scope file was lost.
+- **Historical scope** reads every `.jsonl` file under each root, recursively, and keeps events with `since <= at < until` (half-open). A date means UTC midnight; a date-time needs `Z` or a `+HH:MM` or `-HH:MM` offset. Zone-less times, relative values such as `7d` and impossible dates are rejected.
+- **Unplaced events:** an event whose entry has no parsable timestamp is removed from a historical scope and counted as `unplaced`. A session scope has no window and keeps such events.
+- **mtime shortcut:** before a file is parsed, a file last modified before `since` is skipped and counted in `coverage.files.skippedByMtime`. Only `since` is compared with the modification time, so a restore or copy tool that resets mtimes can hide old files. A file modified after `until` is read, and its events after the window are removed.
+- **Exact project:** with `--project`, a file is selected when its header `cwd` equals a project path after `path.resolve` (trailing slashes and `..` are normalized), or after `realpath` when both exist, so a symlinked project path matches its target. A parent directory is not the project. A file with no header matches no project.
+- **Nested children:** a child session sits in `<parent>/` beside `<parent>.jsonl`. A historical scope reads each child as its own session and counts it in `scope.nestedChildFiles`. Nothing is rolled up into the parent.
+- **Roots:** several roots are merged, a root given twice lists each file once, and selected files are sorted. Unreadable directories are counted in `coverage.files.unreadable`. So is a listed `.jsonl` entry that does not resolve to a regular file (a pipe, a device, a symlink loop or a dangling link): it is counted and never opened.
+- **pi:** pass `--sessions-dir ~/.pi/agent/sessions`. A pi file has no active-leaf field, so its last entry is the leaf (see [Branch labels](#branch-labels)).
+
+### Filters
+
+Filters run after selection, in this order: the time window (historical scope), then `--branch`, then `--outcome`. An event removed by one filter is counted once, under the first filter that removes it, in `coverage.removedByFilters`.
+
+- `--branch active` or `--branch abandoned` keeps one branch. Entries labelled `unknown` are removed by either; `all` keeps every entry.
+- `--outcome` takes decision outcomes (`DecisionOutcome`: `classified`, `failed`, `skipped`) and model-turn outcomes (`TurnOutcome`: `stop`, `length`, `toolUse`, `error`, `aborted`, `other`, `unknown`). A decision value filters decision records only. A model-turn value filters `loadout.usage` records and transcript turns only.
+- A model-turn filter sets `transcript.toolResults` and `transcript.toolErrors` to `null`: a tool result has no turn outcome, so it cannot be attributed to one.
+- An unsupported record follows the window and branch filters, never the outcome filter.
+- `filters` echoes what was applied. A list is `null` when no value of its kind was given.
+
+### Branch labels
+
+Each entry takes a `Branch` from its own session file:
+
+- `active`: on the root path of the active leaf. The last entry with an id names the leaf through its `activeLeafId`; when that field is absent the entry itself is the leaf. If the named leaf is not in the file, the newest entry that is its own leaf is used.
+- `abandoned`: any other entry with an id.
+- `unknown`: an entry with no string id.
+
+If the leaf is `null`, the chain from the leaf to a root is broken (a dangling parent, a cycle, or a `parentId` that is neither an id nor `null`), or the file has no ids, every entry of that file is `unknown`. Append order is never used to guess.
+
+### Provenance and dedupe
+
+Decision records (v3) and usage records carry an event id. The report keeps one instance per id and counts the discarded ones in `copies`. It keeps the instance from the file whose header id equals the record's `sessionId`. `Provenance` says where that instance came from:
+
+- `origin`: kept from the session file that wrote it.
+- `inherited`: no instance matches its own file, and the kept file's header id and the record's `sessionId` are both known and differ. This is a copied or forked history.
+- `unknown`: the kept file has no header id, or the record has no `sessionId`.
+
+Without a matching file, the first instance in sorted path order is kept. Files are read in sorted resolved-path order, so argument order never changes a result.
+
+The v2 limit: a v2 decision has no event id, so it cannot be deduplicated. A forked session repeats its v2 decisions. Each one is counted in `coverage.unidentifiable.decisions` and has provenance `unknown` and `copies` 0.
+
+Transcript turns have no identity, so they are never deduplicated: a copied history counts twice in `transcript`, and `transcript.deduplicated` is always `false`. The deduplicated figures are `decisions` and `usage`.
+
+### Unknown versus zero
+
+- A missing measurement is `null`, never `0`. A `Sum` (`{sum, known, unknown}`) adds only the known values and counts the unknown ones. A `known` of 0 is not a measured zero. A value that would push the total past what a number can hold is counted unknown as well, so no `Sum` or `Stats` ever holds `Infinity` or `NaN`.
+- A `Stats` (`{n, mean, p10, p50, p90, max}`) covers known values only; every field is `null` when `n` is 0. Percentiles are nearest-rank over the in-scope sample.
+- Closed vocabularies (the `Branch`, `TurnOutcome` and `Provenance` counts, `decisions.outcomes` and `decisions.blockers`) are zero-filled. Open maps (`decisions.skips`, `decisions.failures`, `classifier.models`, `usage.toolCalls.byTool` and the other open maps below) list only the keys seen.
+- A boolean count is three-way: `yes`, `no` and `unknown`.
+- A transcript turn's token counts are accepted only as safe integers of 0 or more, the check `normalizeUsage` applies to the counters of a `loadout.usage` record; any other value is `null`. A turn with no valid counter above 0 has every token count and its cost `null`. A turn with some counter above 0 keeps its zeros as zeros, and its missing counters stay `null`. The reader applies the same rule as the `loadout.usage` producer (section 8).
+
+### Summary
+
+`loadout-report summary` prints one `Summary` with `schema` `loadout-report.summary/1`. Every figure is after the scope and filters. An **attempt** is a decision whose outcome is not `skipped`. The `decisions` figures cover attempts, except `total`, `outcomes`, `versions` and `branch`, which cover every kept decision record, and `skips`, which counts only the skipped records.
+
+| key | meaning |
+| --- | --- |
+| `schema` | `loadout-report.summary/1` |
+| `scope` | what was selected (table below) |
+| `filters` | what was applied (table below) |
+| `coverage` | what was read, skipped or removed (table below) |
+| `decisions` | `loadout.decision` records (table below) |
+| `classifier` | classifier evidence of attempts (table below) |
+| `usage` | `loadout.usage` records (table below) |
+| `transcript` | host-transcript assistant turns (table below) |
+| `http` | service-log join (table below); `null` without `--service-log` |
+| `leads` | counted leads (see Leads) |
+| `disclosures` | disclosure ids (see Disclosures) |
+
+#### `scope`
+
+| key | meaning |
+| --- | --- |
+| `scope.kind` | `session` or `historical` |
+| `scope.files` | files selected, read or not |
+| `scope.nestedChildFiles` | selected files that are child sessions: their `<name>/` directory has a parent `<name>.jsonl` |
+| `scope.childFilesNotRead` | session scope only: `.jsonl` files under the named files' `<name>/` directories, not read; always 0 in a historical scope |
+| `scope.childDirsUnreadable` | session scope only: child directories that could not be listed or examined, so `scope.childFilesNotRead` is a lower bound; not part of `coverage.files.unreadable`; always 0 in a historical scope |
+| `scope.since`, `scope.until` | ISO UTC instants, `since` inclusive and `until` exclusive; `null` in a session scope |
+| `scope.projects` | `exact` for `--project`, `all-projects`, or `null` in a session scope |
+
+#### `filters`
+
+| key | meaning |
+| --- | --- |
+| `filters.branch` | the `--branch` value: `all`, `active` or `abandoned` |
+| `filters.outcome` | object with the two lists below |
+| `filters.outcome.decision` | the decision outcome values applied, or `null` |
+| `filters.outcome.usage` | the model-turn outcome values applied, or `null` |
+
+#### `coverage`
+
+The last column says when each counter is computed: before parsing, at file level, while reading, or after filters.
+
+| key | meaning | computed |
+| --- | --- | --- |
+| `coverage.files` | object with the four file counts below | |
+| `coverage.files.read` | selected files that were read | file level, before filters |
+| `coverage.files.unreadable` | files that could not be read, `.jsonl` entries that do not resolve to a regular file (a pipe, a device, a symlink loop, a dangling link), and unreadable directories met while listing a root | file level, before filters |
+| `coverage.files.withoutHeader` | read files with no session header among their first four non-blank lines | file level, before filters |
+| `coverage.files.skippedByMtime` | files skipped because they were last modified before `since` | before parsing |
+| `coverage.malformedLines` | non-blank session-file lines that are not a JSON object | file level, before filters |
+| `coverage.duplicatesRemoved` | object with `decisions` and `usage` | while reading, before filters |
+| `coverage.duplicatesRemoved.decisions` | instances of decision records discarded as duplicates | while reading, before filters |
+| `coverage.duplicatesRemoved.usage` | instances of usage records discarded as duplicates | while reading, before filters |
+| `coverage.unidentifiable` | object with `decisions` | after filters |
+| `coverage.unidentifiable.decisions` | kept v2 decisions, which have no event id | after filters |
+| `coverage.unsupported` | object with `decisions` and `usage` | after filters |
+| `coverage.unsupported.decisions` | kept decision records of an unknown version or shape | after filters |
+| `coverage.unsupported.usage` | kept usage records of an unknown version or shape | after filters |
+| `coverage.provenance` | object with the three counts below | after filters |
+| `coverage.provenance.origin` | kept identifiable decisions (v3) and usage records with `origin` provenance | after filters |
+| `coverage.provenance.inherited` | the same, with `inherited` provenance | after filters |
+| `coverage.provenance.unknown` | the same, with `unknown` provenance | after filters |
+| `coverage.removedByFilters` | object with `decisions`, `usage` and `transcript`: counters of what the window and filters removed | after filters |
+| `coverage.removedByFilters.decisions` | decision records and unsupported decision records removed | after filters |
+| `coverage.removedByFilters.usage` | usage records and unsupported usage records removed | after filters |
+| `coverage.removedByFilters.transcript` | transcript turns and tool results removed, counted together | after filters |
+| `coverage.removedByFilters.<family>.outsideRange` | removed for lying outside `[since, until)` | after filters |
+| `coverage.removedByFilters.<family>.unplaced` | removed for having no parsable timestamp (historical scope only) | after filters |
+| `coverage.removedByFilters.<family>.branch` | removed by `--branch` | after filters |
+| `coverage.removedByFilters.<family>.outcome` | removed by `--outcome`; unsupported records never are | after filters |
+
+#### `decisions`
+
+| key | meaning |
+| --- | --- |
+| `decisions.total` | kept decision records, skipped included |
+| `decisions.outcomes` | object with `classified`, `failed` and `skipped` (below) |
+| `decisions.outcomes.classified`, `.failed`, `.skipped` | kept records by outcome |
+| `decisions.versions` | object with `v2` and `v3` (below) |
+| `decisions.versions.v2`, `.v3` | kept records by version (v2 has no event id) |
+| `decisions.branch` | kept records by `Branch` |
+| `decisions.skips` | skipped records by skip reason (values in section 4); open map, `unknown` when no reason is recorded |
+| `decisions.sessions` | session files holding at least one attempt |
+| `decisions.dryRun` | object with `yes`, `no` and `unknown` (below) |
+| `decisions.dryRun.yes`, `.no`, `.unknown` | attempts by dry run (the `settings.dryRun` flag; v2 has its own flag) |
+| `decisions.failures` | failed attempts by failure reason (values in section 4); open map, `unknown` when none is recorded |
+| `decisions.latencyMs` | `Stats` of the classifier's elapsed milliseconds (v2: its recorded `latencyMs`) |
+| `decisions.proposals` | object with the keys below; a proposal is what the classifier asked for |
+| `decisions.proposals.tools` | attempts with a tools record |
+| `decisions.proposals.none` | attempts with no tools record |
+| `decisions.proposals.narrowing` | proposals that name an active set (`tools.active` is not `null`) |
+| `decisions.proposals.keepBaseline` | proposals that keep the baseline (`tools.active` is `null`) |
+| `decisions.proposals.profiles` | proposals by profile; `(none)` when no profile is recorded |
+| `decisions.proposals.reasons` | proposals by tools reason (values in section 4); `failed` for an attempt with no tools record |
+| `decisions.proposals.proposedTools` | `Stats` of the tool count of each narrowing proposal |
+| `decisions.proposals.risk` | `Stats` of the risk of each proposal |
+| `decisions.application` | object with `statuses` and `actualTools` (below) |
+| `decisions.application.statuses` | attempts by application status (values in section 4); `unknown` when there is no application record |
+| `decisions.application.actualTools` | `Stats` of the tools the host reported after applying or restoring |
+| `decisions.selection` | object with `narrow`, `keep-baseline` and `none` (below) |
+| `decisions.selection.narrow` | application statuses of narrowing proposals; open map |
+| `decisions.selection.keep-baseline` | application statuses of baseline-keeping proposals; open map |
+| `decisions.selection.none` | application statuses of attempts with no tools record; open map |
+| `decisions.ratchet` | object with `blocked`, `admitted` and `unknown` (below) |
+| `decisions.ratchet.blocked`, `.admitted`, `.unknown` | attempts the widen-only ratchet refused, admitted, or could not say |
+| `decisions.skills` | object with the four keys below |
+| `decisions.skills.reasons` | attempts by skill reason (values in section 4); `failed` when there is no skills record |
+| `decisions.skills.selected` | count per selected skill name, over attempts; `(none)` for an empty selection |
+| `decisions.skills.candidateLimit` | attempts whose skill reason is `too-many-candidates` |
+| `decisions.skills.delivery` | attempts by skill delivery (values in section 4); `unknown` when none is recorded |
+| `decisions.blockers` | count per lead id, zero-filled; each equals that lead's `count`, or 0 when the lead is absent |
+
+#### `classifier`
+
+| key | meaning |
+| --- | --- |
+| `classifier.attempts` | attempts |
+| `classifier.evidence` | attempts with a classifier record |
+| `classifier.guardFired` | object with `yes`, `no` and `unknown` (below) |
+| `classifier.guardFired.yes`, `.no`, `.unknown` | the time-budget guard fired: the request was aborted at its budget |
+| `classifier.tokens` | object with `input` and `output` (below) |
+| `classifier.tokens.input`, `.output` | `Sum` of the backend's reported input and output tokens (`classifier.usage`) |
+| `classifier.server` | object with the four keys below |
+| `classifier.server.reported`, `.unreported` | attempts whose classifier record carries server timing, and the rest (see section 13) |
+| `classifier.server.queueMs`, `.inferenceMs` | `Stats` of the server's queue and inference milliseconds |
+| `classifier.models` | attempts by model id; open map, `unknown` when none is recorded |
+| `classifier.requestIds` | object with `present` and `absent` (below) |
+| `classifier.requestIds.present`, `.absent` | attempts with and without a request id |
+| `classifier.promptClipped` | object with `yes`, `no` and `unknown` (below) |
+| `classifier.promptClipped.yes`, `.no`, `.unknown` | `yes` when the prompt was longer than what was sent (`promptChars` above `sentChars`); `unknown` when either is missing |
+
+#### `usage`
+
+| key | meaning |
+| --- | --- |
+| `usage.turns` | kept `loadout.usage` records, deduplicated by event id |
+| `usage.runs` | distinct `runId` values |
+| `usage.hosts` | records by host (`omp` or `pi`); open map |
+| `usage.outcomes` | records by `TurnOutcome`; a `null` stop reason counts as `unknown` |
+| `usage.branch` | records by `Branch` |
+| `usage.tokens` | object with the five token counters (below) |
+| `usage.tokens.input`, `.output`, `.cacheRead`, `.cacheWrite`, `.reasoning` | `Sum` of each token counter |
+| `usage.cost` | `Sum` of `costTotal` |
+| `usage.toolCalls` | object with `total` and `byTool` (below) |
+| `usage.toolCalls.total` | tool calls summed over the records. A record counts only the tool names the host had registered when its turn ended (section 8), so the total can be less than the calls the model made |
+| `usage.toolCalls.byTool` | tool calls by name; open map; a name that is not an identifier was already dropped by the normalizer |
+| `usage.toolErrors` | `Sum` of tool errors |
+| `usage.errorStatus` | records by HTTP error status; records with no status are not counted |
+| `usage.retries` | object with the four keys below |
+| `usage.retries.reported`, `.unreported` | records with and without `retryAttempt` |
+| `usage.retries.maxAttempt` | the largest reported `retryAttempt`; `null` when none is reported |
+| `usage.retries.byAttempt` | records by `retryAttempt` value; the report gives the value no meaning |
+| `usage.assignment` | object with `assigned` and `unassigned` (below) |
+| `usage.assignment.assigned`, `.unassigned` | records with and without a `decisionId` |
+
+#### `transcript`
+
+| key | meaning |
+| --- | --- |
+| `transcript.turns` | kept assistant messages; not deduplicated |
+| `transcript.outcomes` | turns by `TurnOutcome` |
+| `transcript.branch` | turns by `Branch` |
+| `transcript.tokens` | object with the four token counters (below) |
+| `transcript.tokens.input`, `.output`, `.cacheRead`, `.cacheWrite` | `Sum` of each counter in the turns' usage blocks |
+| `transcript.cost` | `Sum` of each turn's `usage.cost.total` |
+| `transcript.toolCalls` | object with `total` and `byTool` (below) |
+| `transcript.toolCalls.total` | tool calls in the kept turns |
+| `transcript.toolCalls.byTool` | tool calls by name. A transcript's tool names are the model's own text, so a name is printed only when a `loadout.usage` record's `toolCalls` or a decision's `application.actualTools`, in the same scope and filters, names that tool. Every other name, identifier-shaped or not, counts as `(redacted)`, and `total` does not change. A session with no plugin record prints only `(redacted)` |
+| `transcript.toolResults` | kept tool-result messages; `null` under a model-turn filter |
+| `transcript.toolErrors` | kept tool results with `isError`; `null` under a model-turn filter |
+| `transcript.deduplicated` | always `false` |
+
+#### `http`
+
+`null` without `--service-log`. Otherwise (see [Service-log join](#service-log-join)):
+
+| key | meaning |
+| --- | --- |
+| `http.files` | distinct service-log files |
+| `http.unreadable` | service-log files that could not be read |
+| `http.lines` | object with the four counters below |
+| `http.lines.total` | non-blank lines read |
+| `http.lines.records` | lines that parsed as `loadout.http` records, before identical repeats are removed |
+| `http.lines.unsupported` | `loadout.http` lines of an unknown version or an invalid shape |
+| `http.lines.other` | every other non-blank line |
+| `http.records` | records kept after identical repeats are removed; every record of a conflicting id is kept |
+| `http.duplicates` | identical repeats removed |
+| `http.conflicts` | request ids with two or more different records |
+| `http.joined` | joinable attempts whose id has exactly one record |
+| `http.unmatched` | object with the five counters below |
+| `http.unmatched.clientWithoutRecord` | joinable attempts whose id has no record |
+| `http.unmatched.notJoinable` | attempts with a request id that cannot join |
+| `http.unmatched.ambiguous` | joinable attempts whose id has two or more different records |
+| `http.unmatched.recordsNotInScope` | records whose id no joinable in-scope attempt names |
+| `http.unmatched.recordsWithoutRequestId` | records with no valid request id |
+| `http.outcomes` | joined records by outcome; open map |
+| `http.phases` | object with `queueMs`, `inferenceMs` and `totalMs` (below) |
+| `http.phases.queueMs`, `.inferenceMs`, `.totalMs` | `Stats` over the joined records |
+| `http.timeouts` | object with the five keys below |
+| `http.timeouts.clientTimeouts` | joinable attempts that failed with `timeout` |
+| `http.timeouts.joined` | those attempts that joined a record |
+| `http.timeouts.outcomes` | outcomes of the records joined to them; open map |
+| `http.timeouts.queueMs`, `.inferenceMs` | `Stats` over those records |
+
+### Leads
+
+| key | meaning |
+| --- | --- |
+| `leads` | counted leads, only those with `count` above 0, highest count first, then by id |
+| `leads[].id` | a lead id from the table below |
+| `leads[].count` | attempts in the population that match |
+| `leads[].of` | size of the population |
+| `leads[].evidence` | detail for the lead, see the table below |
+
+A lead is a count with the population it is out of. Leads name no remedy and make no claim about causes or savings.
+
+| lead id | counts | population (`of`) | `evidence` keys |
+| --- | --- | --- | --- |
+| `classifier-failed` | failed attempts | attempts | `failures` (per failure reason); `guardFired` (failed attempts whose budget guard fired); `serverEvidence`: `null` without a service log, else `joined` (the failed attempts' joined records) and their `outcomes` |
+| `low-confidence` | attempts whose tools reason is `low-confidence` | attempts with a tools record | `closestNarrowerRisk` (`Stats` of each attempt's smallest known risk among narrower profiles); `riskUnknown` (attempts with no known narrower risk); `maxRisk` (distinct values, sorted) |
+| `ratchet-refused` | narrowing proposals whose `ratchet.admitted` is false, whatever the application status (`not-admitted` live, `dry-run` in a dry run) | narrowing proposals with an application record | `dryRun` (how many of the counted refusals have application status `dry-run`; the text view prints `dry run: <n>` only when `n` > 0) |
+| `candidate-limit` | attempts whose skill reason is `too-many-candidates` | attempts with a skills record | `eligible` (`Stats`); `maxCandidates` (distinct values, sorted) |
+| `application-failed` | attempts whose application status is `failed` | attempts with an application record | `errors` (per error code, `unknown` when none); `restoration` (per restoration value, `none` when none) |
+
+### Service-log join
+
+Only with `--service-log`. Without one, `http` is `null` and every join figure is unknown, not zero. The reader takes each line from its first `{` and parses a `loadout.http` record from there, so a journald prefix or `journalctl -o cat` output both parse. A record's `outcome` is one of `ok`, `client-gone`, `error` or `rejected`. A disconnect (`client-gone`) is not a cause: it is counted as an outcome, and the report never treats it as the reason an attempt failed.
+
+- **Joinable attempt:** a non-skipped decision with a request id whose settings name the `http` transport. The request id is the only join key, and the time range never filters service records.
+- **Not joinable:** any other attempt with a request id is `unmatched.notJoinable`. It cannot have a server record, so its id is no evidence that a record is missing.
+- **Absent evidence is unknown:** a joinable attempt whose id has no record is `unmatched.clientWithoutRecord`. That means the record is not in the log, not that the server did no work.
+- **Conflicts:** records that differ for one request id join nothing. All of them stay counted in `records`, the id counts once in `conflicts`, and each attempt that names it is `unmatched.ambiguous`. An identical repeat counts once, in `duplicates`.
+- **No id:** a record without a valid request id is never deduplicated or joined. It is counted in `unmatched.recordsWithoutRequestId`. `unmatched.recordsNotInScope` counts records whose id no joinable in-scope attempt names.
+- **Invariant:** `http.joined`, `unmatched.clientWithoutRecord`, `unmatched.ambiguous` and `unmatched.notJoinable` add up to `classifier.requestIds.present`.
+- **Lines:** a line of `loadout.http` type with an unknown version or an invalid shape is `lines.unsupported`. Any other non-blank line is `lines.other`.
+
+### Export
+
+`loadout-report export` prints one `ExportDoc` with `schema` `loadout-report.export/1`, the same `scope`, `filters` and `coverage` as the summary, and:
+
+| key | meaning |
+| --- | --- |
+| `http` | `null` without a service log; otherwise an object with `records` and `exported` |
+| `http.records` | records the log held, after identical repeats were removed |
+| `http.exported` | joined service records written to `events` |
+| `disclosures` | disclosure ids (see Disclosures) |
+| `events` | one `ExportEvent` per record: decisions (skipped included), then usage, then joined service records; each group in time order, unplaced entries last |
+
+Each `ExportEvent`:
+
+| key | meaning |
+| --- | --- |
+| `type` | `decision`, `usage` or `http` |
+| `at` | ISO UTC: the entry's timestamp, or the service record's own `at`; `null` when unplaced |
+| `branch` | the entry's `Branch`; `null` for `http` |
+| `provenance` | the record's `Provenance`; `null` for `http` |
+| `copies` | discarded duplicate instances; `null` for `http` |
+| `record` | the allowlisted fields of the record |
+
+`record` is rebuilt from a declared allowlist: `DECISION`, `USAGE` and `HTTP` in [`src/report/export.ts`](../src/report/export.ts). A field that is not on its list is dropped, whatever the record carried. A new view field stays out of exports until it is added to the list on purpose; the test suite fails when a view field is missing from a list. No free-text field is on any list. Identifier-shaped values in identifier fields are exported (see the disclosure `identifiers-are-local-metadata-not-anonymous`). An export never includes a path, a title, a message, a tool argument or result, or a working directory, and the reporter never adds a session file's own header id or the entry ids it reads to label branches. A record's own ids are exported as the plugin recorded them: `sessionId`, which usually equals that header id, and a usage record's `hostEntryId`, which is pi's entry id when the plugin recorded one.
+
+### Disclosures
+
+Every summary and export carries these ids in `disclosures`.
+
+- `identifiers-are-local-metadata-not-anonymous`: the ids a record carries (session, event, decision, run and request ids, and a usage record's host entry id) and the names it carries (model ids, profile, tool and skill names, and an HTTP `errorClass`) are exported as recorded when identifier-shaped; they are local metadata, not anonymous.
+- `proposals-are-not-applied-changes`: a tools or skills proposal is what the classifier asked for; `application` records what the host had afterwards, and no figure is a saving.
+- `unknown-is-not-zero`: a missing measurement is `null` or counted as unknown, never zero.
+- `usage-and-transcript-are-separate-sources`: `loadout.usage` records and transcript turns are reported in separate sections and are never added together.
+- `no-child-session-rollup`: nested child sessions are read and counted as their own sessions, and nothing is rolled up into a parent.
+- `observed-usage-is-not-billing`: token and cost figures are what the host reported for each turn; they are not a bill.
+- `absent-records-are-not-evidence-of-no-activity`: a missing decision, usage or service record means the activity is unknown, not that nothing happened.
+
+### Shortcuts
+
+- **Whole-file reads.** Each file is read whole, one at a time, so memory is bounded by the largest file plus the extracted events. A whole-machine scan reads every transcript byte; selection prunes before any file is parsed. A file larger than the JavaScript engine's string limit counts as unreadable. Upgrade to streaming if real transcripts approach that limit or scans become too slow.
+- **mtime pre-filter.** A restore or copy tool that resets modification times can hide old files from the pre-filter. `coverage.files.skippedByMtime` makes the count visible.
+- **One object per line.** Concatenated JSON objects on one line count as malformed; the host writes one object per line.
+- **Directory listing.** Unreadable directories are skipped and counted in `coverage.files.unreadable`. Symlinked directories are not followed. A listed `.jsonl` entry that does not resolve to a regular file (a pipe, a device, a symlink loop, a dangling link) is counted there too and never opened.
+- **Service-log framing.** A line is parsed from its first `{`. A prefix that itself contains `{` breaks that line, which then counts as `lines.other`.
+- **Completions.** No shell completions.
+- **Percentiles.** Nearest-rank over the in-scope sample, not estimates.
+
+## 11b. `/loadout` diagnostics
+
+Source: [`src/diagnostics.ts`](../src/diagnostics.ts) (the wording), [`src/stats.ts`](../src/stats.ts) (the `stats` arguments) and the command handler in [`src/index.ts`](../src/index.ts). `status` and `explain` read the plugin's memory. `stats` reads session files through [`src/report/`](../src/report/). None of the three appends a session entry or changes a tool.
+
+### Output channel
+
+- `status`, `explain` and `stats` each send their whole text in one `ctx.ui.notify` call. The first line is `[loadout] <title>`; the other lines are indented. `status` and `explain` are `info`. `stats` is `info`; an argument refusal and a failure are `warning` (`[loadout] stats: failed: <message>`); `--help` and a missing session file are `info`.
+- An unknown subcommand gets one `warning` with the usage line, `usage: /loadout [status|on|off|explain|stats]`.
+- `notify: false` hides only the per-turn notice. Command output, warnings and errors are shown.
+- Why one call: OMP 18.12.5 shows an `info` notice through `showStatus`, which replaces the status line before it when the two are consecutive. Separate calls would leave only the last line. One call keeps every line, and a long text is not cut (probed on OMP 18.12.5 and pi 0.87.1). Over RPC (`omp --mode rpc`) the same text arrives as one `extension_ui_request` event with `method` `notify` (probed on OMP 18.12.5).
+- `stats --json` and `stats export` print the JSON document only, with no prefix, so the notification parses.
+- The per-turn notice is one `info` line. It is sent after the tools were applied and built from the final record (`noticeText`). A skip gets none. A failed classification keeps its own notice (`warning`, or `error` when the failure is `error`), shown once per distinct text until a turn succeeds. An error in the hook, including a failed apply, keeps its own `error` (`selection error: ...`).
+
+### Outcome vocabulary
+
+The headlines of `status`, `explain` and the per-turn notice all come from `headline()` in [`src/diagnostics.ts`](../src/diagnostics.ts); the per-turn notice is `noticeText()`. The table lists each branch and the record fields it reads. Placeholders in angle brackets are filled from those fields.
+
+| headline | when | record fields read |
+| --- | --- | --- |
+| `skipped: selection is off` | `outcome` is `skipped` and `skip` is `disabled` | `outcome`, `skip` |
+| `skipped: empty prompt` | `skip` is `empty-prompt` | `skip` |
+| `skipped: slash command, not classified` | `skip` is `command` | `skip` |
+| `skipped: nothing to ask` | `skip` is `no-questions`; ` (<eligible> candidates > limit <max>)` follows when `skills.reason` is `too-many-candidates` | `skip`, `skills.reason`, `skills.eligible`, `skills.maxCandidates` |
+| `skipped` | any other `skip` value | `skip` |
+| `classifier still loading; full loadout kept` | `outcome` is `failed` and `failure` is `warming` | `failure` |
+| `classification failed: timeout` | `failure` is `timeout` and there is no `classifier` record | `failure`, `classifier` |
+| `classification failed: timeout after <ms> ms (budget <ms> ms[, guard fired])` | `failure` is `timeout` and a `classifier` record exists; `, guard fired` when the guard fired | `failure`, `classifier.elapsedMs`, `classifier.budgetMs`, `classifier.guardFired` |
+| `classification failed: <failure>[ (HTTP <status>)][ after <ms> ms]` | any other `failure` (`error` when none); `(HTTP <status>)` when `classifier.status` is set; `after <ms> ms` when a `classifier` record exists | `failure`, `classifier.status`, `classifier.elapsedMs` |
+| `proposed nothing (application <status>)` | `outcome` is `classified` and `tools` is null | `tools`, `application.status` |
+| `applied <profile> (tools <m> of <b>)` | `application.status` is `applied` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile`, `application.actualTools` |
+| `applied: baseline restored (<keep>)` | `application.status` is `applied` and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
+| `already matching <profile> (tools <m> of <b>)` | `application.status` is `unchanged` and `tools.active` is set | `application.status`, `tools.active`, `tools.profile`, `application.actualTools` |
+| `all tools kept: <keep>` | `application.status` is `unchanged`, `restored` or `not-attempted`, and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
+| `dry run: would keep all tools (<keep>)` | `application.status` is `dry-run` and `tools.active` is null | `application.status`, `tools.active`, and the `<keep>` fields |
+| `dry run: would use <profile> (tools <n>), nothing changed` | `application.status` is `dry-run`, `tools.active` is set and the ratchet admits the proposal (`ratchet.admitted` is not false) | `application.status`, `tools.active`, `tools.profile`, `ratchet.admitted` |
+| `dry run: widen-only would keep <before>, not <profile>; nothing changed` | `application.status` is `dry-run`, `tools.active` is set and `ratchet.admitted` is false: the ratchet runs in a dry run too, so this is a proposal it would refuse; `<before>` is `ratchet.before`, or `the current tools` when that is null | `application.status`, `tools.active`, `ratchet.admitted`, `ratchet.before`, `tools.profile` |
+| `kept <before>: widen-only blocked narrowing to <profile>` | `application.status` is `not-admitted`; `<before>` is `ratchet.before`, or `the current tools` when that is null | `application.status`, `ratchet.before`, `tools.profile` |
+| `could not apply <profile>: <error>[, baseline restored]` | `application.status` is `failed`; `<error>` is `application.error` or `error`; the suffix is `, baseline restored` or `, baseline restore failed` from `application.restoration` | `application.status`, `application.error`, `application.restoration`, `tools.active`, `tools.profile` |
+| `proposed <profile> (application <status>)` | any other combination, such as `restored` or `not-attempted` with `tools.active` set; `<profile>` is `nothing` when `tools.profile` is null | `application.status`, `tools.profile` |
+| `; skills: <eligible> candidates > limit <max>, none asked` | suffix of a classified headline when `skills.reason` is `too-many-candidates` | `skills.reason`, `skills.eligible`, `skills.maxCandidates` |
+| `; skills: <k> selected` | suffix when `skills.reason` is `selected`; `; skills: would select <k>` when `application.status` is `dry-run` | `skills.reason`, `skills.selected`, `application.status` |
+| `; skills: no answer` | suffix when `skills.reason` is `missing-answer` | `skills.reason` |
+| `noticeText`: the headline, at most 150 characters | `outcome` is `classified` and `application.status` is not `failed`; null otherwise | the fields of the headline |
+
+- `<profile>` is `tools.profile`, or `a narrower set` when that is null. In the `could not apply` row it is `tools.profile` when `tools.active` is set, and `tools` otherwise.
+- `<m>` is the length of `application.actualTools`, the host's read-back. When that is null the whole `(tools <m> of <b>)` part is left out. `<b>` is the baseline size the caller passes; it is not a record field, and `of <b>` is left out when no size is passed.
+- `<n>` is the length of `tools.active`, the proposal.
+- `<keep>` depends on `tools.reason`:
+
+| `tools.reason` | `<keep>` | fields read |
+| --- | --- | --- |
+| `low-confidence` | `low confidence (closest narrower risk <c> > max <max>)`, or `low confidence (no risk known)` when no narrower risk is known; risks and the max print with two decimals | `tools.risks` (the smallest known `risk`), `tools.maxRisk` |
+| `missing-answer` | `no answer to the tool question` | `tools.reason` |
+| `disabled` | `tool selection off` | `tools.reason` |
+| any other | `baseline` | `tools.reason` |
+
+A headline longer than 150 characters is cut to 149 characters and `…`. The delivered notice adds the `[loadout] ` prefix.
+
+### `status`
+
+`/loadout status` prints the settings in force and what this process has seen, from memory:
+
+- `selection:` enabled or disabled, dry run on or off, notices on or off.
+- `classifier:` the backend, with its transport for `laya`, and the timeout the turns use for that backend.
+- `config:` the config file the session loaded and its scope, or `built-in defaults`.
+- `tools:` the profiles and max risk, or `off`; `skills:` the skills mode, or `off`.
+- `baseline tools:` the captured baseline and its count, or `not captured yet`.
+- `last decision:` the headline of the latest non-skipped record, or `none yet`.
+- `latest invocation:` the headline of the latest hook call when that call was a skip, or `no record could be built (<code>)` when it built no record.
+- `telemetry:` `on` with the reason, the records handed to the host and the failures with the last code; or `off` with the reason and the records suppressed, plus a `provenance:` line that says why (section 3).
+- `this session:` prompts observed by outcome, model turns observed, and `memory only, this session in this process`.
+- `not included:` child and subagent sessions, which have their own plugin instance and records.
+
+It prints no endpoint, environment variable name, python path or question text. The `config:` line prints the source path, as before.
+
+### `explain`
+
+`/loadout explain` prints the latest hook call of any outcome, skips included, from memory. It works with telemetry off.
+
+- `source:` where the record went: `record handed to host` (the host's append did not throw; section 7), `record not stored: telemetry off (<reason>)`, `record not stored: <code>`, or `no record could be built (<code>)`. Explain never says `handed to host` unless the append happened.
+- `outcome:` the headline.
+- `tools:` the reason, then one row per narrower profile, narrowest first, with its probability and its risk against the max risk (`<=` or `>`). The chosen profile's row ends in `<- chosen`. The broadest profile has no risk and is the baseline. `risks: unknown` replaces the rows when the answer had no probabilities.
+- `proposal:` what the classifier asked for (section 4), or `keep all tools (baseline)`.
+- `ratchet:` before and after, admitted or blocked, and narrowing open or locked.
+- `application:` the status, the restoration, the error, and the tools the host reports after applying (`actual tools`).
+- `blocked:` what kept the proposal from changing the tools, in this order: dry run, widen-only ratchet, low confidence, no tool answer, skills over the candidate limit; `none` when there is none. The ratchet entry reads `widen-only ratchet (kept <before>)` for a turn the ratchet refused and `widen-only ratchet (would keep <before>)` for a dry-run proposal it would refuse (`<before>` is `ratchet.before`, or `the current tools` when that is null).
+- `skills:` the skill reason with its counts and, when skills were selected, the best scores.
+- `classifier:` questions asked, prompt and sent characters (`clipped` or `not clipped`), the model, and the tokens or `tokens not reported`.
+- `timing:` elapsed time, budget, timeout, whether the guard fired, and the HTTP status when there is one.
+- `server:` the queue and inference times the server reported, or `not reported`, and the request id, or `none`. An id that the record's transport never sends (Jev and the Laya `python` transport; section 6) is followed by `(not sent)`: no server saw it.
+- `settings then:` the settings in force when the record was built.
+- `failure text (memory only, never stored):` the failure text of that call, on one line, at most 200 characters, when one exists.
+- `previous decision:` the latest non-skipped headline, when the latest call was a skip or built no record.
+
+### `stats`
+
+`/loadout stats` reads session files through the report library that `loadout-report` uses. The text view is the title, the telemetry line, the `file:` line when it applies (below), then `renderSummary` in [`src/report/text.ts`](../src/report/text.ts): the scope line, the `npm run decisions` text (`renderDecisions`), and the blockers, classifier, model-turn, host-transcript, service-log and coverage sections.
+
+- `summary` (the default) or `export`. `--json` prints the summary document; `export` prints the export document. Both are the CLI's JSON, byte for byte, without the CLI's trailing newline.
+- Scope: without a scope flag, the host's current session file. `--session <file>` (repeatable) names files. A history needs `--since <ISO>` and `--until <ISO>` with `--project <path>` (an exact match) or `--all-projects`; `--sessions-dir <dir>` (repeatable) sets the roots. The default root is OMP's `~/.omp/agent/sessions` for either host, so a pi history needs `--sessions-dir` with the absolute path of pi's sessions directory.
+- Filters pass through to the library: `--branch all|active|abandoned`, `--outcome <value>` (repeatable; section 11a) and `--service-log <file>` (repeatable; the request-id join).
+- Quotes: `"..."` and `'...'` group a value with spaces. There are no escapes, an unterminated quote is refused, and `--flag=value` works.
+- Paths: the host does not expand `~` or `$VARIABLE` in a path, so give `--session`, `--sessions-dir`, `--project` and `--service-log` absolute paths. With a `~` path, `--session`, `--sessions-dir` and `--service-log` are refused (not a file or not a directory), and `--project ~/x` matches no file.
+- Refused at `warning`: a partial history, with the CLI's own message (see the examples), `--version`, and an unknown view word (`unknown view <word> (use summary or export)`). Any other argument the CLI refuses (an unknown flag, a bad `--branch` or `--outcome` value, a `--service-log` that is not a file) gets the CLI's message too, before the session file exists as after it. `--help` prints the usage text at `info`.
+- The `file:` line appears only for the default scope with no filter flag, and only with telemetry on. It compares what the file holds with what this process handed to the host. The two can differ: earlier history, or records the host has not written yet.
+- With telemetry off, the telemetry line says so and that nothing from this process was stored (`N suppressed`). The figures still cover the records in the files read, because reading is not collection.
+- The `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records.
+- `export` puts the whole export in one notification, so use `loadout-report` for large scopes.
+
+### Memory and files
+
+- `status` and `explain` read this process's memory: the latest hook call, the records built, the counters and the baseline. They read no session file, and they work with telemetry off.
+- The counters (`records handed to host`, `failed`, `records suppressed`) belong to the session in this process. A restart or a resume starts them at zero; the earlier records are only in the session file, which `stats` reads.
+- `stats` reads the files, not memory, and works with telemetry off, because reading is not collection.
+- `handed to host` means the host's append did not throw. It is not a disk write (section 7).
+
+### Blocking cost
+
+- A history scan in the host reads session files synchronously (`readFileSync`), so the host waits until the scan finishes. A historical scope reads every `.jsonl` under each root, after skipping files last modified before `since` (section 11a). A `--project` scope first peeks at up to 64 KiB of each candidate file's header to match the project.
+- The default scope reads the one current file.
+- Extension commands run immediately, even while a turn streams (OMP 18.12.5). So a history scan blocks the host until it finishes, and a prompt classified meanwhile can record a timeout.
+- The host's 30 s limit applies to event handlers only (OMP 18.12.5). A command is not cut off, so a long scan runs to its end.
+
+### Print mode
+
+In print mode (`omp -p`, `pi -p`) the host has no UI: `hasUI` is false and nothing is shown. No `/loadout` output and no per-turn notice appears there (probed on OMP 18.12.5 and pi 0.87.1).
+
+### `getSessionFile` before the first reply
+
+`stats` takes the host's current session file from `ctx.sessionManager.getSessionFile()`, guarded: a throw or an empty string counts as no file.
+
+Before the first assistant reply the host may report a path, but the file is written with that reply. Until then `stats` prints `[loadout] stats: no session file yet. The host writes it with the first assistant message (an unsaved session never writes one); ask again after the first reply, or name a scope (see /loadout stats --help)` at `info`, and reads nothing else. The same text is printed when the host reports no file, which is what a session that is never saved does. The arguments are checked first, so a bad flag is a `warning` with the CLI's message even before the file exists. After a reply, a `stats` run reads every record handed to the host before it (probed on OMP 18.12.5 and pi 0.87.1).
+
+### Examples
+
+Captured from OMP 18.12.5 with synthetic stubs: the classifier and the model answer scripted replies. `status` prints the config path as the plugin resolved it, an absolute path; the examples show it shortened to `~/.omp/loadout.json`.
+
+Explain for one record with a dry run, a low-confidence answer and skills over the candidate limit:
+
+```
+[loadout] explain: latest invocation
+  source: in memory | record handed to host
+  outcome: dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked
+  tools: low confidence, no profile within max risk 0.10
+    answer: p 0.55, risk 0.45 > 0.10
+    edit: p 0.30, risk 0.15 > 0.10
+    full: p 0.15 (broadest, the baseline)
+  proposal: keep all tools (baseline)
+  ratchet: - -> full (admitted, narrowing open)
+  application: dry-run | actual tools: read, bash, edit, eval, glob, grep, task, wait, todo, web_search, write, ast_edit, debug, lsp (14)
+  blocked: dry run, low confidence, skills over the candidate limit
+  skills: 3 eligible > limit 2 (discovered 3): none asked, all skills kept
+  classifier: 1 question (tools 1, skills 0) | prompt 30 chars, sent 30 (not clipped) | model smoke-stub-1 | tokens in 41, out 3
+  timing: 6 ms of 4250 ms budget (timeout 4000 ms), guard not fired
+  server: not reported | request 9ecd2f18-32eb-4ddd-86a9-9b2288244e93
+  settings then: dry run on | max risk 0.10 | laya (http) | skills auto | config global
+```
+
+Status after five prompts:
+
+```
+[loadout] status
+  selection: enabled | dry run off | notices on
+  classifier: laya (http) | timeout 4000 ms
+  config: ~/.omp/loadout.json (global)
+  tools: profiles answer, edit, full (max risk 0.10) | skills: off
+  baseline tools: read, bash, edit, eval, glob, grep, task, wait, todo, web_search, write, ast_edit, debug, lsp (14)
+  last decision: applied answer (tools 6 of 14)
+  telemetry: on (default) | records handed to host 10 | failed 0
+  this session: prompts observed 5 (classified 4, failed 0, skipped 1) | model turns observed 5 | memory only, this session in this process
+  not included: child and subagent sessions (each has its own plugin instance and records)
+```
+
+Stats, text view (cut):
+
+```
+[loadout] stats: session files
+  telemetry: on (default) | this process handed 10 records to the host, failed 0
+  file: 5 decisions and 5 model-turn records were read here; this process handed 10 to the host (earlier history, or records the host has not written yet, explain a difference)
+  scope: session files | files 1 (read 1, unreadable 0) | child sessions not read 0
+  loadout decisions: 4 in 1 sessions (0 dry run)
+  skipped: disabled 1
+...
+  classifier calls (loadout.decision attempts; not model turns): 4
+    tokens: in 164, out 12
+    server timing: reported 3, not reported 1 | queue p50 2.1 / p90 3.2 | inference p50 38 / p90 41.5
+    guard fired: 0 yes, 4 no, 0 unknown | prompt clipped: 0 yes, 4 no, 0 unknown | request ids: 4 present, 0 absent
+    models: smoke-stub-1 4
+...
+  coverage: files read 1, unreadable 0, without header 0 | malformed lines 0 | unsupported records: decisions 0, model turns 0 | duplicates removed: decisions 0, model turns 0 | v2 decisions without event id 0
+  read as: identifiers are local metadata; unknown is not zero; usage is observed, not billed; child sessions are not rolled up
+```
+
+A partial history is refused, and nothing is read:
+
+```
+[loadout] stats: incomplete historical scope: missing --until, --project <path> or --all-projects
+[loadout] stats: incomplete historical scope: missing --project <path> or --all-projects
+```
+
+One-line notices, one `info` line per classified turn:
+
+| case | notice |
+| --- | --- |
+| applied | `[loadout] applied edit (tools 9 of 14)` |
+| widen-only ratchet blocked a narrowing | `[loadout] kept edit: widen-only blocked narrowing to answer` |
+| already matching | `[loadout] already matching edit (tools 9 of 14)` |
+| applied after `/loadout on` | `[loadout] applied answer (tools 6 of 14)` |
+| dry run | `[loadout] dry run: would use answer (tools 6), nothing changed` |
+| dry run, widen-only ratchet would refuse a narrowing | `[loadout] dry run: widen-only would keep edit, not answer; nothing changed` |
+| low confidence | `[loadout] all tools kept: low confidence (closest narrower risk 0.15 > max 0.10)` |
+| dry run, low confidence and skill overflow | `[loadout] dry run: would keep all tools (low confidence (closest narrower risk 0.15 > max 0.10)); skills: 3 candidates > limit 2, none asked` |
 
 ## 12. Synthetic examples
 
@@ -176,7 +791,16 @@ Failed (abridged): `"outcome":"failed","failure":"unavailable","tools":null`, a 
 ## 13. Known limits
 
 - This page is not packaged with the npm release.
-- `classifier.status` and `classifier.server` are null until #4; `loadout.usage` and `loadout.http` have no producer until #4 and #5.
+- `classifier.server` is null except for the Laya HTTP transport when the server sent `Server-Timing` (section 6). `loadout.http` exists only where this repository's server runs without `--no-telemetry`; the per-request `X-Loadout-Telemetry: off` header also suppresses it. It is a line in the server's log, not a session entry.
 - After a low-confidence or failed turn the ratchet keeps narrowing locked until compaction or `/loadout on|off`. This is visible in `ratchet` but unchanged.
 - The Laya HTTP server has no request deadline.
 - No durability guarantee: see section 7.
+- A history scan in the host (`/loadout stats` with a historical scope) blocks the host until it finishes. Extension commands run while a turn streams, so a prompt classified meanwhile can record a timeout (section 11b).
+- Print mode (`-p`) has no UI, so no `/loadout` output and no per-turn notice is shown there (section 11b).
+- `/loadout explain` covers only the latest invocation of this process. When that invocation was a skip, `previous decision:` shows the latest non-skipped decision.
+- After a restart or a resume, `status` and `explain` have observed nothing yet and the counters start at zero. The earlier records are in the session file, which only `stats` reads.
+- `/loadout stats export` puts the whole export in one notification, so use `loadout-report` for large scopes (section 11b).
+- The text view's `loadout decisions:` line counts attempts, skipped records excluded. The JSON `decisions.total` includes skipped records (section 11b).
+- A config reload (a cwd or project-trust change) can change the telemetry setting in the middle of a session, while the latest observation and the counters carry over. Afterwards `explain` names the reason in force now for a record built earlier (it can read `record not stored: telemetry off (default)` for a record that was suppressed before the reload), and `stats` can say that nothing from this process was stored although the process handed records to the host before the reload.
+- A tarball packed from a development checkout also holds that checkout's git-ignored Python bytecode (for example `python/__pycache__/*.pyc`): `files` in `package.json` names the whole `python` directory, and a root `.gitignore` does not narrow it. The local activation runs the plugin and the service from the checkout, so no tarball is published.
+- A failed HTTP call carries the start of the response body into the failure message. `src/classify/http.ts` keeps up to 200 characters of a non-2xx body, and the Laya HTTP server's 500 body is its exception text (`{"error": "<type>: <text>"}`), which is not filtered and can carry content from the request it was handling. The server never logs that text (section 8), but its response carries it. The failure warning (shown even with `notify: false`) shows the message, and `/loadout explain` shows its first 200 characters as `failure text (memory only, never stored)`. No `loadout.decision` record holds it (a record keeps the failure code and the HTTP status), no export carries it, and a `loadout.http` line keeps only the error class.

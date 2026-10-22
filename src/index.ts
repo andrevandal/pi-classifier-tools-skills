@@ -21,6 +21,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
+import { explainText, noticeText, type Observation, statsText, statusText } from "./diagnostics.ts";
 import {
   buildQuestions,
   decideSkills,
@@ -29,10 +30,12 @@ import {
   skillCandidates,
   skillsAskable,
 } from "./select.ts";
+import { runStats, type StatsResult, splitArgs } from "./stats.ts";
 import {
   type ApplicationStatus,
   buildDecisionRecord,
   DECISION_ENTRY,
+  type DecisionOutcome,
   type DecisionRecordV3,
   newId,
   type PersistResult,
@@ -43,7 +46,7 @@ import {
   type SkillDelivery,
   type SkipReason,
   settingsSnapshot,
-  type ToolsRecord,
+  USAGE_ENTRY,
 } from "./telemetry.ts";
 import { errorText, runTurn, type TurnOutcome } from "./turn.ts";
 import type {
@@ -52,13 +55,26 @@ import type {
   LoadoutConfig,
   SkillCandidate,
   SkillsDecision,
-  SkillsReason,
   TelemetryState,
 } from "./types.ts";
+import {
+  armDecision,
+  clearRetry,
+  createUsageTracker,
+  deliverMessage,
+  dropArmed,
+  endContext,
+  endRun,
+  noteRetry,
+  observeTurn,
+  openTurn,
+  startRun,
+  type UsageTracker,
+} from "./usage.ts";
 
 const PREFIX = "[loadout]";
 const COMMAND = "loadout";
-const SUBCOMMANDS = ["status", "on", "off", "explain"] as const;
+const SUBCOMMANDS = ["status", "on", "off", "explain", "stats"] as const;
 const HINT_MESSAGE = "loadout.skills";
 
 /** The parts of the prompt event this extension reads; `systemPromptOptions` is pi-only. */
@@ -87,10 +103,14 @@ interface SessionState {
   allowNarrow: boolean;
   /** Latest non-skipped record; a skip never replaces it. */
   lastRecord: DecisionRecordV3 | null;
-  /** Failure text of `lastRecord`; memory only, never persisted. */
-  lastMessage: string | null;
+  /** The latest hook call of any outcome, skips included; memory only. */
+  latest: Observation | null;
+  /** Records built by this process, by outcome; memory only. */
+  seen: Record<DecisionOutcome, number>;
   /** The latest record built, skips included; null when building it threw. */
   lastDecisionId: string | null;
+  /** Run and decision links for usage observations; session-local, carried across config reloads. */
+  usage: UsageTracker;
   collection: { handedOff: number; suppressed: number; failed: number; lastFailure: string | null };
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
   lastFailure: string | null;
@@ -226,8 +246,10 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     baseline: existing?.baseline ?? null,
     lastApplied: existing?.lastApplied ?? null,
     lastRecord: existing?.lastRecord ?? null,
-    lastMessage: existing?.lastMessage ?? null,
+    latest: existing?.latest ?? null,
+    seen: existing?.seen ?? { classified: 0, failed: 0, skipped: 0 },
     lastDecisionId: existing?.lastDecisionId ?? null,
+    usage: existing?.usage ?? createUsageTracker(),
     collection: existing?.collection ?? { handedOff: 0, suppressed: 0, failed: 0, lastFailure: null },
     // A config reload is not a new session: keep the ratchet, so a cwd change cannot reopen narrowing.
     appliedRank: existing?.appliedRank ?? null,
@@ -277,29 +299,6 @@ function refreshBaseline(pi: ExtensionAPI, state: SessionState): string[] {
 async function restoreBaseline(pi: ExtensionAPI, state: SessionState): Promise<"restored" | "unchanged" | null> {
   if (state.baseline === null || state.lastApplied === null) return null;
   return (await activateTools(pi, state, state.baseline)) ? "restored" : "unchanged";
-}
-
-function summarize(
-  tools: Pick<ToolsRecord, "active" | "profile" | "risk" | "reason">,
-  skills: { selected: string[] | null; reason: SkillsReason | null },
-  baselineSize: number,
-): string {
-  const toolPart =
-    tools.active === null
-      ? `tools: all (${tools.reason})`
-      : `tools: ${tools.profile} (risk ${tools.risk?.toFixed(2) ?? "-"}) -> ${tools.active.length}/${baselineSize}`;
-  const skillPart =
-    skills.selected === null
-      ? `skills: all (${skills.reason})`
-      : `skills: ${skills.selected.length > 0 ? skills.selected.join(", ") : "none"}`;
-  return `${toolPart} | ${skillPart}`;
-}
-
-function describe(record: DecisionRecordV3, message: string | null, baselineSize: number): string {
-  if (record.tools === null || record.skills === null) {
-    return `failed (${record.failure ?? "error"}): ${message ?? "no details kept"}`;
-  }
-  return summarize(record.tools, record.skills, baselineSize);
 }
 
 /** The user-facing reason a turn fell back to the baseline. */
@@ -420,12 +419,6 @@ async function runHook(
   }
 
   state.lastFailure = null;
-  notify(
-    ctx,
-    config,
-    `${config.dryRun ? "(dry run) " : ""}${summarize(decision.tools, decision.skills, baseline.length)}`,
-    "info",
-  );
   const selected = decision.skills.selected;
   if (config.dryRun) {
     trace.status = "dry-run";
@@ -507,18 +500,25 @@ function recordDecision(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionS
       },
     });
     state.lastDecisionId = record.decisionId;
-    if (record.outcome !== "skipped") {
-      state.lastRecord = record;
-      state.lastMessage = trace.message;
-    }
-    countRecord(
-      ctx,
-      state,
-      persistRecord((type, data) => pi.appendEntry(type, data), state.telemetry, DECISION_ENTRY, record),
-    );
+    if (record.outcome !== "skipped") state.lastRecord = record;
+    const stored = persistRecord((type, data) => pi.appendEntry(type, data), state.telemetry, DECISION_ENTRY, record);
+    state.latest = { record, message: trace.message, stored };
+    state.seen[record.outcome]++;
+    countRecord(ctx, state, stored);
   } catch {
     state.lastDecisionId = null;
+    state.latest = { record: null, message: trace.message, stored: { outcome: "failed", code: "error" } };
     countRecord(ctx, state, { outcome: "failed", code: "error" });
+  }
+}
+
+function announce(ctx: ExtensionContext, state: SessionState): void {
+  try {
+    const record = state.latest?.record;
+    const text = record ? noticeText(record, state.baseline?.length) : null;
+    if (text !== null) notify(ctx, state.config, text, "info");
+  } catch {
+    // A notice must not affect the turn.
   }
 }
 
@@ -562,71 +562,124 @@ async function onBeforeAgentStart(pi: ExtensionAPI, event: PromptEvent, ctx: Ext
     }
   }
   recordDecision(pi, ctx, state, trace);
+  if (state) {
+    armDecision(state.usage, state.lastDecisionId);
+    announce(ctx, state);
+  }
   return result;
 }
 
-function commandStatus(ctx: ExtensionContext, state: SessionState): void {
-  const { config, collection } = state;
-  const telemetry = state.telemetry.persist
-    ? `on | handed to host ${collection.handedOff} | failed ${collection.failed}${collection.lastFailure ? ` (${collection.lastFailure})` : ""}`
-    : `off (${state.telemetry.reason}) | suppressed ${collection.suppressed}`;
-  const lines = [
-    `${config.enabled ? "enabled" : "disabled"}${config.dryRun ? " (dry run)" : ""} | backend ${config.backend}`,
-    `config: ${state.source ?? "built-in defaults"}`,
-    `tools: ${config.tools.enabled ? `profiles ${Object.keys(config.tools.profiles).join(", ")}` : "off"} | skills: ${config.skills.enabled ? config.skills.mode : "off"}`,
-    `baseline tools: ${state.baseline?.join(", ") ?? "not captured yet"}`,
-    `last decision: ${state.lastRecord ? describe(state.lastRecord, state.lastMessage, state.baseline?.length ?? 0) : "none"}`,
-    `telemetry: ${telemetry}`,
-  ];
-  for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
-}
-
-function applicationLine(record: DecisionRecordV3): string {
-  const { application } = record;
-  const restore = application.restoration ? ` (restore: ${application.restoration})` : "";
-  const error = application.error ? ` [${application.error}]` : "";
-  return `application: ${application.status}${restore}${error} | actual tools: ${application.actualTools?.join(", ") ?? "unknown"}`;
-}
-
-function commandExplain(ctx: ExtensionContext, state: SessionState): void {
-  const record = state.lastRecord;
-  if (!record) {
-    ctx.ui.notify(`${PREFIX} no decision yet`, "info");
-    return;
+/** Command output: one notification, whatever the `notify` setting says, because the user asked. */
+function say(ctx: ExtensionContext, text: string, level: "info" | "warning"): void {
+  try {
+    ctx.ui.notify(text, level);
+  } catch {
+    // A headless host may have no UI.
   }
-  const { tools, skills } = record;
-  const latency = `latency: ${record.classifier?.elapsedMs ?? "-"}ms`;
-  if (tools === null || skills === null) {
-    const baselineSize = state.baseline?.length ?? 0;
-    for (const line of [describe(record, state.lastMessage, baselineSize), latency, applicationLine(record)]) {
-      ctx.ui.notify(`${PREFIX} ${line}`, "info");
+}
+
+/** The host's current session file; undefined until the host has written one, or when it keeps none. */
+function sessionFileOf(ctx: ExtensionContext): string | undefined {
+  try {
+    const file = ctx.sessionManager.getSessionFile();
+    return typeof file === "string" && file !== "" ? file : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type View = "status" | "explain" | "stats";
+
+function renderView(
+  ctx: ExtensionContext,
+  state: SessionState,
+  view: View,
+  args: string,
+): { text: string; level: "info" | "warning" } {
+  if (view === "status") {
+    const { config, source, scope, telemetry, collection, baseline, lastRecord, latest, seen } = state;
+    const modelTurns = state.usage.observed;
+    return {
+      text: statusText({
+        config,
+        source,
+        scope,
+        telemetry,
+        collection,
+        baseline,
+        lastRecord,
+        latest,
+        seen,
+        modelTurns,
+      }),
+      level: "info",
+    };
+  }
+  if (view === "explain") {
+    const { latest, lastRecord, telemetry } = state;
+    return {
+      text: explainText({ latest, lastRecord, baselineSize: state.baseline?.length, telemetry }),
+      level: "info",
+    };
+  }
+  const tokens = splitArgs(args.trim().slice(view.length));
+  const result: StatsResult =
+    tokens === null
+      ? { kind: "refused", level: "warning", text: `${PREFIX} stats: unterminated quote in the arguments` }
+      : runStats(tokens, sessionFileOf(ctx));
+  if (result.kind === "refused") return { text: result.text, level: result.level };
+  if (result.kind === "json") return { text: result.text, level: "info" };
+  const { telemetry, collection } = state;
+  return {
+    text: statsText({ summary: result.summary, compare: result.compare, telemetry, collection }),
+    level: "info",
+  };
+}
+
+/** One notification each; a failure becomes one warning and never reaches the host. */
+function showView(ctx: ExtensionContext, state: SessionState, view: View, args: string): void {
+  try {
+    const { text, level } = renderView(ctx, state, view, args);
+    say(ctx, text, level);
+  } catch (error) {
+    say(ctx, `${PREFIX} ${view}: failed: ${errorText(error)}`, "warning");
+  }
+}
+
+function track(ctx: ExtensionContext, update: (usage: UsageTracker) => void): void {
+  try {
+    const state = sessions.get(sessionKey(ctx));
+    if (state) update(state.usage);
+  } catch {
+    // Usage tracking must not affect the agent.
+  }
+}
+
+/** Registered tool names only: any other name in a model message is model output and must not reach a record. */
+function registeredToolNames(pi: ExtensionAPI): ReadonlySet<string> {
+  const names = new Set<string>();
+  try {
+    for (const tool of pi.getAllTools() as ReadonlyArray<{ name?: unknown } | null>) {
+      if (typeof tool?.name === "string") names.add(tool.name);
     }
-    return;
+  } catch {
+    return new Set();
   }
-  const scores = Object.entries(skills.scores)
-    .sort(([, a], [, b]) => b - a)
-    .map(([name, score]) => `${name}=${score.toFixed(2)}`)
-    .join(", ");
-  const probabilities = Object.entries(tools.probabilities)
-    .sort(([, a], [, b]) => b - a)
-    .map(([name, p]) => `${name}=${p.toFixed(2)}`)
-    .join(", ");
-  const risks = tools.risks?.map(({ profile, risk }) => `${profile}=${risk?.toFixed(2) ?? "-"}`).join(" ");
-  const { ratchet } = record;
-  const lines = [
-    `tools: profile ${tools.profile ?? "-"} | risk ${tools.risk?.toFixed(2) ?? "-"} | reason ${tools.reason}`,
-    `profile probabilities: ${probabilities || "none"}`,
-    risks ? `risks: ${risks} (max ${tools.maxRisk.toFixed(2)})` : "risks: none",
-    `proposed: ${tools.active?.join(", ") ?? "baseline"}`,
-    ratchet
-      ? `ratchet: ${ratchet.before ?? "-"} -> ${ratchet.after ?? "-"} (${ratchet.admitted ? "admitted" : "blocked"}, narrowing ${ratchet.narrowAllowed ? "open" : "locked"})`
-      : "ratchet: none",
-    applicationLine(record),
-    `skills: reason ${skills.reason ?? "-"} | selected ${skills.selected?.join(", ") ?? "all"} | discovered ${skills.discovered} eligible ${skills.eligible} cap ${skills.maxCandidates} asked ${skills.asked}`,
-    `skill scores: ${scores || "none"}`,
-    latency,
-  ];
-  for (const line of lines) ctx.ui.notify(`${PREFIX} ${line}`, "info");
+  return names;
+}
+
+/** One `loadout.usage` per assistant model turn. Returns nothing: pi reads a `turn_end` result as boundary entries. */
+function onTurnEnd(pi: ExtensionAPI, event: unknown, ctx: ExtensionContext): void {
+  const state = sessions.get(sessionKey(ctx));
+  if (!state) return;
+  try {
+    const record = observeTurn(state.usage, hostSessionId(ctx), event, registeredToolNames(pi));
+    if (!record) return;
+    const append = (type: string, data: unknown) => pi.appendEntry(type, data);
+    countRecord(ctx, state, persistRecord(append, state.telemetry, USAGE_ENTRY, record));
+  } catch {
+    countRecord(ctx, state, { outcome: "failed", code: "error" });
+  }
 }
 
 export default function loadout(pi: ExtensionAPI): void {
@@ -649,10 +702,31 @@ export default function loadout(pi: ExtensionAPI): void {
   pi.on("session_compact", (_event, ctx) => {
     // Compaction summarizes the history, so the next decision may narrow again.
     const state = sessions.get(sessionKey(ctx));
-    if (state) state.allowNarrow = true;
+    if (!state) return;
+    state.allowNarrow = true;
+    // The usage run ends too; a pending decision stays because omp compacts between the hook and the run.
+    endRun(state.usage);
   });
 
   pi.on("before_agent_start", (event, ctx) => onBeforeAgentStart(pi, event as PromptEvent, ctx));
+
+  pi.on("agent_start", (_event, ctx) => track(ctx, startRun));
+  pi.on("turn_start", (_event, ctx) => track(ctx, openTurn));
+  pi.on("message_start", (event, ctx) => track(ctx, (usage) => deliverMessage(usage, event)));
+  pi.on("turn_end", (event, ctx) => onTurnEnd(pi, event, ctx));
+  pi.on("agent_end", (_event, ctx) => track(ctx, dropArmed));
+  pi.on("session_tree", (_event, ctx) => track(ctx, endContext));
+  // omp-only events: pi's typed `on` does not list them and pi never emits them.
+  const onHost = pi.on.bind(pi) as unknown as (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void,
+  ) => void;
+  onHost("auto_retry_start", (event, ctx) =>
+    track(ctx, (usage) => noteRetry(usage, (event as { attempt?: unknown } | null)?.attempt)),
+  );
+  onHost("auto_retry_end", (_event, ctx) => track(ctx, clearRetry));
+  onHost("session_branch", (_event, ctx) => track(ctx, endContext));
+  onHost("session_switch", (_event, ctx) => track(ctx, endContext));
 
   pi.registerCommand(COMMAND, {
     description: "Inspect and control classifier-driven tool and skill selection",
@@ -665,10 +739,9 @@ export default function loadout(pi: ExtensionAPI): void {
       const subcommand = args.trim().split(/\s+/)[0] || "status";
       switch (subcommand) {
         case "status":
-          commandStatus(ctx, state);
-          return;
         case "explain":
-          commandExplain(ctx, state);
+        case "stats":
+          showView(ctx, state, subcommand, args);
           return;
         case "on":
           state.config.enabled = true;

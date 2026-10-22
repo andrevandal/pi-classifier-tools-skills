@@ -61,6 +61,34 @@ Point the plugin at it in `~/.omp/loadout.json`:
 {"backend":"laya","laya":{"transport":"http","endpoint":"http://127.0.0.1:8765/","apiKeyEnvVar":"","timeoutMs":20000}}
 ```
 
+Request telemetry is on by default. Each POST writes one `loadout.http` line to
+stderr, and systemd sends stderr to the journal. The line has this shape, with
+`null` where a value is absent or not measured:
+
+```json
+{"type":"loadout.http","v":1,"requestId":"<lowercase UUIDv4>","idStatus":"valid|absent|invalid","at":"<UTC time>","outcome":"ok|rejected|error|client-gone","status":<HTTP status>,"queueMs":<ms>,"inferenceMs":<ms>,"totalMs":<ms>,"errorClass":"<exception class>"}
+```
+
+It holds no request content. An `X-Request-Id` that is not one lowercase UUIDv4 is
+logged as `invalid` and never copied.
+
+To turn it off, add `--no-telemetry` to the `ExecStart` line above, or to the GPU
+`ExecStart` in step 7 of section 3, then run
+`systemctl --user daemon-reload && systemctl --user restart laya-server`. The flag
+stops the line and the `Server-Timing` header for every request. The plugin sends
+`X-Loadout-Telemetry: off` when its own telemetry is off, and that request gets no
+line and no header.
+
+To join these lines to the plugin's decision records, capture the journal and pass
+it to `loadout-report`:
+
+```bash
+journalctl --user -u laya-server -o cat > laya.log
+loadout-report summary --session <file> --service-log laya.log
+```
+
+The join is by request id. See [Reporting: loadout-report](../../README.md#reporting-loadout-report).
+
 ## 3. Using the AMD GPU (ROCm on WSL2)
 
 The GPU is exposed to WSL through `/dev/dxg`. There is no `/dev/kfd`, and you

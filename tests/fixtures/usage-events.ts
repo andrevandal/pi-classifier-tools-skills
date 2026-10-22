@@ -1,0 +1,137 @@
+/** Synthetic host `turn_end` events with canary strings planted in every field the plugin must never copy. */
+
+import type { TurnEndEvent } from "@earendil-works/pi-coding-agent";
+
+/** One canary per place a host puts content. A record that contains any of them leaked. */
+export const CANARY = {
+  text: "CANARY_TEXT_T1",
+  args: "CANARY_ARGS_A2",
+  result: "CANARY_RESULT_R3",
+  error: "CANARY_ERROR_E4",
+  detail: "CANARY_DETAIL_D5",
+  extra: "CANARY_EXTRA_X6",
+  tool: "CANARY_TOOL_N7",
+} as const;
+
+/** Tool names a model can write that no host registered; each passes the record schema's identifier check. */
+export const INVENTED_TOOL_NAMES = [CANARY.tool, "src/secret.ts", "user@example.com", "sk-live-0123456789abcdef"];
+
+interface Counters {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cost?: number;
+}
+
+function usageObject(o: Counters): Record<string, unknown> {
+  const { input = 100, output = 10, cacheRead = 0, cacheWrite = 0, cost = 0.0005 } = o;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    totalTokens: input + output + cacheRead + cacheWrite,
+    cost: { input: cost / 2, output: cost / 2, cacheRead: 0, cacheWrite: 0, total: cost },
+  };
+}
+
+/** OMP calls the reasoning count `reasoningTokens`. */
+export function ompUsage(o: Counters & { reasoningTokens?: number } = {}): Record<string, unknown> {
+  const usage = usageObject(o);
+  if (o.reasoningTokens !== undefined) usage.reasoningTokens = o.reasoningTokens;
+  return usage;
+}
+
+/** pi calls the reasoning count `reasoning`. */
+export function piUsage(o: Counters & { reasoning?: number } = {}): Record<string, unknown> {
+  const usage = usageObject(o);
+  if (o.reasoning !== undefined) usage.reasoning = o.reasoning;
+  return usage;
+}
+
+/** A tool-result message. Its content, details and own usage numbers must never reach a record. */
+export function toolResult(name = "read", isError = false): Record<string, unknown> {
+  const own = { input: 9_000_000, output: 9_000_000, cacheRead: 9_000_000, cacheWrite: 9_000_000, cost: { total: 99 } };
+  return {
+    role: "toolResult",
+    toolCallId: "call_1",
+    toolName: name,
+    content: [{ type: "text", text: CANARY.result }],
+    details: { note: CANARY.detail, usage: own },
+    usage: own,
+    isError,
+    timestamp: 1_760_000_000_000,
+  };
+}
+
+/** A key present with the value `undefined` leaves that field out of the event (no `usage`, no `toolResults`). */
+export interface TurnSpec {
+  turnIndex?: number;
+  stopReason?: string;
+  usage?: unknown;
+  /** Content blocks after the text block: a string becomes a `toolCall` block of that name. */
+  calls?: Array<string | Record<string, unknown>>;
+  results?: unknown[];
+  errorStatus?: number;
+  entryId?: string;
+}
+
+function given<T>(spec: TurnSpec, key: keyof TurnSpec, fallback: T): T {
+  return Object.hasOwn(spec, key) ? (spec[key] as T) : fallback;
+}
+
+function defined<T extends Record<string, unknown>>(object: T): T {
+  for (const key of Object.keys(object)) if (object[key] === undefined) delete object[key];
+  return object;
+}
+
+/** A fresh message object each call: a replay guard keyed on identity must see two calls as two messages. */
+function assistantMessage(spec: TurnSpec, defaultUsage: Record<string, unknown>): Record<string, unknown> {
+  const stopReason = given<string | undefined>(spec, "stopReason", "stop");
+  const calls = (spec.calls ?? []).map((call, index) =>
+    typeof call === "string"
+      ? { type: "toolCall", id: `call_${index + 1}`, name: call, arguments: { path: CANARY.args } }
+      : call,
+  );
+  return defined({
+    role: "assistant",
+    content: [{ type: "thinking", thinking: CANARY.text }, { type: "text", text: CANARY.text }, ...calls],
+    usage: given(spec, "usage", defaultUsage),
+    stopReason,
+    errorStatus: spec.errorStatus,
+    errorMessage: stopReason === "error" || stopReason === "aborted" ? CANARY.error : undefined,
+    responseId: "resp-1",
+    provider: "synthetic",
+    model: "synthetic-1",
+    timestamp: 1_760_000_000_000,
+    note: CANARY.extra,
+  });
+}
+
+export function ompTurnEnd(spec: TurnSpec = {}): Record<string, unknown> {
+  return defined({
+    type: "turn_end",
+    turnIndex: given(spec, "turnIndex", 0),
+    message: assistantMessage(spec, ompUsage()),
+    toolResults: given<unknown[] | undefined>(spec, "results", []),
+  });
+}
+
+export function piTurnEnd(spec: TurnSpec = {}): Record<string, unknown> {
+  const piFields = {
+    type: "turn_end",
+    turnIndex: given(spec, "turnIndex", 0),
+    messageEntryId: given(spec, "entryId", "a1b2c3d4"),
+    toolResultEntryIds: [],
+  } satisfies Pick<TurnEndEvent, "type" | "turnIndex" | "messageEntryId" | "toolResultEntryIds">;
+  return defined({
+    ...piFields,
+    message: assistantMessage(spec, piUsage()),
+    toolResults: given<unknown[] | undefined>(spec, "results", []),
+    outcome: "completed",
+    entries: [],
+    continue: false,
+    context: { note: CANARY.extra },
+  });
+}

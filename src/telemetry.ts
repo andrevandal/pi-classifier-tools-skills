@@ -1,6 +1,6 @@
 /**
- * Trace records the plugin writes into the host session, and the readers that
- * turn stored records back into typed views.
+ * Trace records (the plugin's session entries and the Laya HTTP server's log
+ * line), and the readers that turn stored records back into typed views.
  *
  * Privacy rule: a record holds allowlisted identifiers, counts and durations
  * only. Free text from a prompt, a skill description, a rubric or a backend
@@ -8,8 +8,8 @@
  * primitives below, and the readers apply the same primitives again, so a
  * hostile or corrupted record cannot smuggle text into a report.
  *
- * Record types: `loadout.decision` v3 is produced by the extension.
- * `loadout.usage` v1 and `loadout.http` v1 are defined here for later slices.
+ * Record types: `loadout.decision` v3 and `loadout.usage` v1 are session entries the extension writes;
+ * `loadout.http` v1 is a log line `python/laya_http_server.py` writes, only read here.
  */
 
 import { randomUUID } from "node:crypto";
@@ -214,7 +214,7 @@ export interface DecisionRecordV3 {
   application: ApplicationRecord;
 }
 
-/** One assistant message's usage. Defined here; produced by a later slice. */
+/** One assistant message's usage; one per observed model turn. */
 export interface UsageObservationV1 {
   v: 1;
   eventId: string;
@@ -239,7 +239,7 @@ export interface UsageObservationV1 {
   retryAttempt: number | null;
 }
 
-/** One Laya HTTP server request. Defined here; produced by a later slice. */
+/** One Laya HTTP server request, read from the server's log line. */
 export interface HttpServerRecordV1 {
   type: "loadout.http";
   v: 1;

@@ -25,17 +25,9 @@ import { parseArgs } from "node:util";
 
 import { parseConfig, readMachineTelemetry } from "../src/config.ts";
 import { profileOrder } from "../src/select.ts";
-import {
-  cacheRate,
-  defaultSessionsDir,
-  listSessionFiles,
-  metricsFor,
-  percentile,
-  promptTokensPerRequest,
-  sessionCwd,
-  totalToolCalls,
-  type UsageMetrics,
-} from "./lib/sessions.ts";
+import { defaultSessionsDir, listSessionFiles, readHeader, readSessions } from "../src/report/read.ts";
+import { cacheRate, percentile, promptTokensPerRequest, sumOf, transcriptTotals } from "../src/report/summary.ts";
+import type { DecisionView } from "../src/telemetry.ts";
 
 const USAGE = `usage: node scripts/bench.ts --repo <path> --tasks <file.json> [options]
 
@@ -189,9 +181,9 @@ function runOmp(task: Task, cwd: string, configFile: string, logFile: string, ti
   });
 }
 
-function summarizeRun(metrics: UsageMetrics, expectDryRun: boolean): Partial<RunResult> & { mismatch: boolean } {
-  const decision = metrics.decisions.find((d) => d.outcome !== "skipped");
-  const mismatch = metrics.decisions.some((d) => d.dryRun !== null && d.dryRun !== expectDryRun);
+function summarizeRun(decisions: DecisionView[], expectDryRun: boolean): Partial<RunResult> & { mismatch: boolean } {
+  const decision = decisions.find((d) => d.outcome !== "skipped");
+  const mismatch = decisions.some((d) => d.dryRun !== null && d.dryRun !== expectDryRun);
   const failure = decision?.failure ?? null;
   // v2 keeps its meaning (the ratchet's profile); v3 reports one only when the plugin really settled on it.
   const status = decision?.application?.status;
@@ -207,8 +199,8 @@ function summarizeRun(metrics: UsageMetrics, expectDryRun: boolean): Partial<Run
         ? decision.application.actualTools
         : (decision.tools?.active ?? null);
   const noDecision =
-    metrics.decisions.length > 0
-      ? `only skipped decisions recorded (${metrics.decisions[0]?.skip})`
+    decisions.length > 0
+      ? `only skipped decisions recorded (${decisions[0]?.skip})`
       : "no loadout.decision recorded (plugin not loaded, or telemetry is off)";
   return {
     mismatch,
@@ -288,10 +280,14 @@ for (let run = 1; run <= runs; run++) {
       const outcome = await runOmp(task, cwd, configs[arm], logFile, timeoutMs);
 
       const sessionFiles = listSessionFiles(values["sessions-dir"]!).filter(
-        (file) => !before.has(file) && (sessionCwd(file) ?? "").startsWith(cwd),
+        (file) => !before.has(file) && (readHeader(file)?.cwd ?? "").startsWith(cwd),
       );
-      const metrics = metricsFor(sessionFiles);
-      const { mismatch, ...decision } = summarizeRun(metrics, arm === "control");
+      const read = readSessions(sessionFiles);
+      const totals = transcriptTotals(read.turns, read.toolResults);
+      const { mismatch, ...decision } = summarizeRun(
+        read.decisions.map((event) => event.view),
+        arm === "control",
+      );
       if (mismatch) {
         fail(`${task.id}/${arm}: the session ran with the wrong dryRun setting, so LOADOUT_CONFIG was not applied`);
       }
@@ -314,18 +310,18 @@ for (let run = 1; run <= runs; run++) {
         arm,
         ...outcome,
         pass,
-        requests: metrics.requests,
-        errors: metrics.errors,
-        input: metrics.input,
-        output: metrics.output,
-        cacheRead: metrics.cacheRead,
-        cacheWrite: metrics.cacheWrite,
-        cacheRate: cacheRate(metrics),
-        ptpr: promptTokensPerRequest(metrics),
-        cost: metrics.cost,
-        toolCalls: totalToolCalls(metrics),
-        toolErrors: metrics.toolErrors,
-        toolsUsed: metrics.toolCalls,
+        requests: totals.turns,
+        errors: totals.outcomes.error,
+        input: totals.tokens.input.sum,
+        output: totals.tokens.output.sum,
+        cacheRead: totals.tokens.cacheRead.sum,
+        cacheWrite: totals.tokens.cacheWrite.sum,
+        cacheRate: cacheRate(totals.tokens),
+        ptpr: promptTokensPerRequest(totals),
+        cost: totals.cost.sum,
+        toolCalls: totals.toolCalls.total,
+        toolErrors: totals.toolErrors ?? 0,
+        toolsUsed: totals.toolCalls.byTool,
         decided: false,
         failure: null,
         applied: null,
@@ -340,7 +336,9 @@ for (let run = 1; run <= runs; run++) {
         sessionFiles,
       };
       if (sessionFiles.length === 0) result.warning = "no session file found for this run";
-      else if (metrics.errors > 0) result.warning ??= `${metrics.errors} model request(s) ended in error; see the log`;
+      else if (totals.outcomes.error > 0) {
+        result.warning ??= `${totals.outcomes.error} model request(s) ended in error; see the log`;
+      }
       results.push(result);
       fs.appendFileSync(resultsFile, `${JSON.stringify(result)}\n`);
       console.log(
@@ -393,7 +391,11 @@ const money = (n: number) => `$${n.toFixed(4)}`;
 const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
 
 function armRow(label: string, rows: RunResult[]) {
-  const totals = { input: sum(rows, "input"), cacheRead: sum(rows, "cacheRead"), cacheWrite: sum(rows, "cacheWrite") };
+  const totals = {
+    input: sumOf(rows.map((r) => r.input)),
+    cacheRead: sumOf(rows.map((r) => r.cacheRead)),
+    cacheWrite: sumOf(rows.map((r) => r.cacheWrite)),
+  };
   return [
     label,
     passRate(rows),

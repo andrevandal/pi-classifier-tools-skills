@@ -96,7 +96,19 @@ const classified = buildDecisionRecord({
   },
 });
 
-const entries = [
+// Like the real host: every entry after the header has an id, its parent's id and a timestamp.
+const link = (list) => {
+  let parentId = null;
+  return list.map((e, i) => {
+    if (e.type === "session") return e;
+    const id = `e${i}`;
+    const linked = { ...e, id, parentId, timestamp: e.timestamp ?? new Date().toISOString() };
+    parentId = id;
+    return linked;
+  });
+};
+
+const entries = link([
   { type: "session", version: 3, id: "s", timestamp: new Date().toISOString(), cwd },
   ...(config.telemetry === false ? [] : [entry(skip), entry(classified)]),
   {
@@ -118,6 +130,6 @@ const entries = [
       stopReason: "stop",
     },
   },
-];
+]);
 fs.writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`);
 console.log("fake omp done\nANSWER: 42");

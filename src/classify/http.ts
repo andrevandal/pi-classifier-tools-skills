@@ -10,8 +10,12 @@
  * never logged or embedded in errors. Every request is bounded by `timeoutMs`,
  * composed with the caller's own signal so either side can abort, and the
  * timer is always cleared.
+ *
+ * With `correlation` (our own Laya server only) the call sends `X-Request-Id`, or `X-Loadout-Telemetry: off` when the
+ * caller opted out, and reads `Server-Timing` back; failures after the body was read keep the HTTP status and timing.
  */
 
+import { ID_PATTERN } from "../telemetry.ts";
 import { ClassifierError } from "../types.ts";
 import type {
   Answers,
@@ -22,6 +26,7 @@ import type {
   ClassifyOptions,
   Questions,
   Readiness,
+  ServerTiming,
 } from "../types.ts";
 import type { ClassifierDeps } from "./index.ts";
 
@@ -37,6 +42,34 @@ export interface HttpClassifierOptions {
   /** Env var holding the bearer token; when unset or empty, no Authorization header is sent. */
   apiKeyEnvVar: string;
   timeoutMs: number;
+  /** Own Laya server only: send the correlation headers and read `Server-Timing`. Jev never sees them. Default false. */
+  correlation?: boolean;
+}
+
+function correlationHeaders(options: ClassifyOptions | undefined): Record<string, string> {
+  if (options?.telemetryOff) return { "X-Loadout-Telemetry": "off" };
+  const requestId = options?.requestId;
+  return requestId !== undefined && ID_PATTERN.test(requestId) ? { "X-Request-Id": requestId } : {};
+}
+
+const DURATION = /^dur=(\d{1,9}(?:\.\d{1,6})?)$/;
+
+/** `queue`/`infer` ms of a `Server-Timing` header; a repeated or non-plain-`dur` metric stays unknown, never zero. */
+function parseServerTiming(header: string | null): ServerTiming | undefined {
+  if (header === null) return undefined;
+  const found = new Map<string, number | null>();
+  for (const metric of header.split(",")) {
+    const [name = "", ...params] = metric.split(";").map((part) => part.trim());
+    if (name !== "queue" && name !== "infer") continue;
+    const duration = params.map((param) => DURATION.exec(param)?.[1]).find((value) => value !== undefined);
+    found.set(name, found.has(name) || duration === undefined ? null : Number(duration));
+  }
+  const timing: ServerTiming = {};
+  const queueMs = found.get("queue");
+  const inferenceMs = found.get("infer");
+  if (queueMs != null) timing.queueMs = queueMs;
+  if (inferenceMs != null) timing.inferenceMs = inferenceMs;
+  return Object.keys(timing).length > 0 ? timing : undefined;
 }
 
 export function createHttpClassifier(options: HttpClassifierOptions, deps: ClassifierDeps = {}): Classifier {
@@ -78,6 +111,7 @@ export function createHttpClassifier(options: HttpClassifierOptions, deps: Class
 
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (bearer !== "") headers["Authorization"] = `Bearer ${bearer}`;
+      if (options.correlation) Object.assign(headers, correlationHeaders(classifyOptions));
 
       const body: Record<string, unknown> = { state, questions };
       if (options.model !== null) body["model"] = options.model;
@@ -103,6 +137,11 @@ export function createHttpClassifier(options: HttpClassifierOptions, deps: Class
           signal: controller.signal,
         });
 
+        // Kept on every failure after the body was read; unknown stays unknown.
+        const seen = {
+          status: response.status,
+          timing: options.correlation ? parseServerTiming(response.headers.get("server-timing")) : undefined,
+        };
         const bodyText = await response.text();
         if (!response.ok) {
           const code: ClassifierErrorCode =
@@ -112,28 +151,32 @@ export function createHttpClassifier(options: HttpClassifierOptions, deps: Class
                 ? "unavailable"
                 : "protocol";
           const collapsed = bodyText.replace(/\s+/g, " ").trim().slice(0, SNIPPET_LIMIT);
-          throw new ClassifierError(backend, code, `${backend} endpoint returned ${response.status}: ${collapsed}`);
+          throw new ClassifierError(
+            backend,
+            code,
+            `${backend} endpoint returned ${response.status}: ${collapsed}`,
+            seen,
+          );
         }
 
         let parsed: unknown;
         try {
           parsed = JSON.parse(bodyText);
         } catch (error) {
-          throw new ClassifierError(backend, "protocol", `${backend} response was not JSON`, {
-            cause: error,
-          });
+          throw new ClassifierError(backend, "protocol", `${backend} response was not JSON`, { cause: error, ...seen });
         }
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new ClassifierError(backend, "protocol", `${backend} response was not a JSON object`);
+          throw new ClassifierError(backend, "protocol", `${backend} response was not a JSON object`, seen);
         }
 
         const record = parsed as Record<string, unknown>;
         const answers = record["answers"];
         if (answers === null || typeof answers !== "object" || Array.isArray(answers)) {
-          throw new ClassifierError(backend, "protocol", `${backend} response has no answers object`);
+          throw new ClassifierError(backend, "protocol", `${backend} response has no answers object`, seen);
         }
 
         const result: ClassificationResult = { answers: answers as Answers };
+        if (seen.timing) result.timing = seen.timing;
         if (typeof record["model"] === "string") result.model = record["model"];
         const usage = record["usage"];
         if (usage !== null && typeof usage === "object" && !Array.isArray(usage)) {

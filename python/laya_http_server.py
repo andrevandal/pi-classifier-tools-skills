@@ -12,16 +12,25 @@ Binds to 127.0.0.1 by default. Another host needs --allow-remote and
 LAYA_SERVER_TOKEN. A token set in LAYA_SERVER_TOKEN is enforced on any host:
 every POST must then carry `Authorization: Bearer <token>`. Bodies over 1 MiB
 are refused with 413 before they are read.
+
+Every POST writes one content-free `loadout.http` JSON line to stderr (schema: docs/telemetry.md) and returns
+`Server-Timing`. `X-Request-Id` must be a lowercase UUIDv4, else it is logged as invalid, never copied.
+`X-Loadout-Telemetry` other than `on`, or `--no-telemetry`, opts out. A client disconnect is only noticed when
+the answer is written, after inference has run.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hmac
 import json
 import os
+import re
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
 
@@ -30,46 +39,132 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 LOCK = threading.Lock()  # one prediction at a time; the model is not thread-safe
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 MAX_BODY_BYTES = 1_048_576
+REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+ERROR_CLASS = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 ARGS: argparse.Namespace
 TOKEN = ""
 # Set by main() once the flags are accepted: importing laya_worker imports laya, which is slow.
 worker: ModuleType
 
 
+def class_name(exc: BaseException) -> str:
+    """The exception's class name, never its text, and only if it fits the record's allowlist."""
+    name = type(exc).__name__
+    return name if ERROR_CLASS.fullmatch(name) else "Error"
+
+
+class Trace:
+    def __init__(self, headers) -> None:
+        self.start = time.monotonic()
+        # Fail closed: "on" is the only value that keeps telemetry, so a garbled opt-out still opts out.
+        optouts = headers.get_all("X-Loadout-Telemetry", [])
+        self.enabled = not ARGS.no_telemetry and all(value.strip().lower() == "on" for value in optouts)
+        ids = [value.strip() for value in headers.get_all("X-Request-Id", [])]
+        self.request_id = ids[0] if len(ids) == 1 and REQUEST_ID.fullmatch(ids[0]) else None
+        self.id_status = "valid" if self.request_id else "invalid" if ids else "absent"
+        self.queue_ms: float | None = None  # waiting for LOCK
+        self.infer_ms: float | None = None  # holding LOCK, up to the answer or the exception
+        self.status: int | None = None  # as sent; after a disconnect it may never have arrived
+        self.error: str | None = None  # class of the exception that made the answer a 500
+        self.gone: str | None = None  # class of the disconnect raised while writing the answer
+
+    def timing_header(self) -> str:
+        if not self.enabled:
+            return ""
+        phases = (("queue", self.queue_ms), ("infer", self.infer_ms))
+        return ", ".join(f"{name};dur={value:.3f}" for name, value in phases if value is not None)
+
+    def emit(self) -> None:
+        """Never raises: telemetry must not fail a request."""
+        if not self.enabled:
+            return
+        with contextlib.suppress(Exception):
+            if self.gone:
+                outcome, error_class = "client-gone", self.gone
+            elif self.status is None or self.status >= 500:
+                outcome, error_class = "error", self.error
+            elif self.status >= 400:
+                outcome, error_class = "rejected", None
+            else:
+                outcome, error_class = "ok", None
+            record = {
+                "type": "loadout.http",
+                "v": 1,
+                "requestId": self.request_id,
+                "idStatus": self.id_status,
+                "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "outcome": outcome,
+                "status": self.status,
+                "queueMs": self.queue_ms,
+                "inferenceMs": self.infer_ms,
+                "totalMs": round((time.monotonic() - self.start) * 1000, 3),
+                "errorClass": error_class,
+            }
+            sys.stderr.write(json.dumps(record, separators=(",", ":")) + "\n")
+            sys.stderr.flush()
+
+
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, status: int, payload: dict) -> None:
+    def _send(self, status: int, payload: dict, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _reply(self, trace: Trace, status: int, payload: dict) -> None:
+        if not trace.gone:  # the 500 retried after a failed write must not replace the status that failed
+            trace.status = status
+        timing = trace.timing_header()
+        try:
+            self._send(status, payload, {"Server-Timing": timing} if timing else None)
+        except ConnectionError as exc:
+            trace.gone = trace.gone or class_name(exc)
+            raise
 
     def do_GET(self) -> None:  # noqa: N802 - health check
         self._send(200, {"ok": True, "loaded": list(worker.STATE["loaded"])})
 
     def do_POST(self) -> None:  # noqa: N802
+        trace = Trace(self.headers)
+        try:
+            self._post(trace)
+        finally:
+            trace.emit()
+
+    def _post(self, trace: Trace) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 <= length <= MAX_BODY_BYTES:
                 # The body is left unread, so the connection cannot be reused.
                 self.close_connection = True
-                self._send(413, {"error": "request too large"})
+                self._reply(trace, 413, {"error": "request too large"})
                 return
             body = self.rfile.read(length)
             presented = self.headers.get("Authorization", "")
             if TOKEN and not hmac.compare_digest(presented.encode(), f"Bearer {TOKEN}".encode()):
-                self._send(401, {"error": "unauthorized"})
+                self._reply(trace, 401, {"error": "unauthorized"})
                 return
             request = json.loads(body)
             reply = {"op": "predict", "state": request.get("state"), "questions": request.get("questions")}
             if isinstance(request.get("model"), str):
                 reply["model"] = request["model"]
+            queued = time.monotonic()
             with LOCK:
-                result = worker.handle(reply, ARGS)
-            self._send(200, result["result"])
+                acquired = time.monotonic()
+                trace.queue_ms = round((acquired - queued) * 1000, 3)
+                try:
+                    result = worker.handle(reply, ARGS)
+                finally:
+                    trace.infer_ms = round((time.monotonic() - acquired) * 1000, 3)
+            self._reply(trace, 200, result["result"])
         except Exception as exc:  # noqa: BLE001
-            self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+            if not trace.gone:
+                trace.error = class_name(exc)
+            self._reply(trace, 500, {"error": f"{type(exc).__name__}: {exc}"})
 
     def log_message(self, fmt: str, *args: object) -> None:
         pass
@@ -90,6 +185,11 @@ def main() -> int:
         "--allow-remote",
         action="store_true",
         help="allow a non-loopback --host; requires LAYA_SERVER_TOKEN",
+    )
+    parser.add_argument(
+        "--no-telemetry",
+        action="store_true",
+        help="write no per-request loadout.http log line and send no Server-Timing header",
     )
     ARGS = parser.parse_args()
     if ARGS.host not in LOOPBACK_HOSTS and not ARGS.allow_remote:
