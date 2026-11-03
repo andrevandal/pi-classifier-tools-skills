@@ -122,6 +122,10 @@ interface SessionState {
   /** Run and decision links for usage observations; session-local, carried across config reloads. */
   usage: UsageTracker;
   collection: { handedOff: number; suppressed: number; failed: number; lastFailure: string | null };
+  /** `/loadout on|off`, kept across config reloads (cwd or trust change); null until the user toggles. */
+  enabledOverride: boolean | null;
+  /** The current config failed to load, so it is disabled and `/loadout on` must not lift that. */
+  configFailed: boolean;
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
   lastFailure: string | null;
 }
@@ -242,6 +246,7 @@ function ensureSession(ctx: ExtensionContext): SessionState {
   if (result.config.decideTool && !result.config.tools.alwaysOn.includes(DECIDE_TOOL)) {
     result.config.tools.alwaysOn = [...result.config.tools.alwaysOn, DECIDE_TOOL];
   }
+  if (existing?.enabledOverride != null && result.errors.length === 0) result.config.enabled = existing.enabledOverride;
 
   const classifierKey = classifierKeyFor(result.config);
   const keepClassifier = existing?.classifierKey === classifierKey && existing.holdsClassifier;
@@ -268,6 +273,8 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     appliedRank: existing?.appliedRank ?? null,
     allowNarrow: existing?.allowNarrow ?? true,
     lastFailure: null,
+    enabledOverride: existing?.enabledOverride ?? null,
+    configFailed: result.errors.length > 0,
   };
   sessions.set(key, state);
   // Start Laya's multi-second weight load now rather than on the first prompt.
@@ -815,13 +822,19 @@ export default function loadout(pi: ExtensionAPI): void {
           showView(ctx, state, subcommand, args);
           return;
         case "on":
+          if (state.configFailed) {
+            ctx.ui.notify(`${PREFIX} config has errors; fix them before enabling`, "error");
+            return;
+          }
           state.config.enabled = true;
+          state.enabledOverride = true;
           resetRatchet(state);
           classifierFor(state);
           ctx.ui.notify(`${PREFIX} selection enabled`, "info");
           return;
         case "off":
           state.config.enabled = false;
+          state.enabledOverride = false;
           resetRatchet(state);
           refreshBaseline(pi, state);
           await restoreBaseline(pi, state);

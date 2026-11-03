@@ -416,6 +416,27 @@ test("/loadout off keeps tools the user changed after a classified turn", async 
   host.shutdown();
 });
 
+test("/loadout off survives a cwd change, and /loadout on is refused while the config has errors", async () => {
+  const other = path.join(path.dirname(project), "other-cwd");
+  fs.mkdirSync(other, { recursive: true });
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  await host.command("off");
+  host.setCwd(other);
+  requests.length = 0;
+  await host.prompt("explain that");
+  assert.equal(requests.length, 0, "the reload must not turn selection back on");
+  host.shutdown();
+
+  fs.writeFileSync(GLOBAL_FILE(), JSON.stringify({ backend: "jev", jev: { timeoutMs: 30000 } }));
+  const broken = fakeHost("pi");
+  await broken.command("on");
+  assert.match(broken.notes.join("\n"), /fix them before enabling/);
+  await broken.prompt("explain this");
+  assert.equal(requests.length, 0);
+  broken.shutdown();
+});
+
 test("a failure that repeats is reported once, and again after a recovery", async () => {
   const host = fakeHost("pi");
   reply = { status: 500, answers: {} };
