@@ -614,7 +614,7 @@ test("status: prints the safe effective settings and nothing else", () => {
       timeoutMs: 2500,
     },
     tools: { ...base.tools, question: { ...base.tools.question, instructions: "CANARY_QUESTION_TEXT_T1" } },
-    skills: { ...base.skills, enabled: true, mode: "auto" },
+    skills: { ...base.skills, enabled: true, rank: "classifier", mode: "auto" },
   };
 
   const laya = statusOf({ config });

@@ -107,7 +107,7 @@ export async function runTurn(input: TurnInput): Promise<TurnOutcome> {
     const result = await classify(input, sent, budgetMs, evidence);
     const decision: LoadoutDecision = {
       tools: decideTools(config.tools, baseline, result.answers[TOOLS_QUESTION_ID]),
-      skills: decideSkills(config.skills, candidates, result.answers),
+      skills: decideSkills(config.skills, candidates, result.answers, sent),
     };
     // Decision first: a sanitizer bug must never turn a decided turn into failure "error".
     evidence.model = safeModel(result.model);

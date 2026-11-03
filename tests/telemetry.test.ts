@@ -61,9 +61,13 @@ function input(over: Partial<DecisionInput> = {}): DecisionInput {
     classifier: evidence(),
     decision: {
       tools: decideTools(config.tools, BASELINE, choice({ answer: 0.95, edit: 0.03, full: 0.02 })),
-      skills: decideSkills({ ...config.skills, enabled: true }, [{ name: "pdf", description: "d" }], {
-        "skill:pdf": { type: "noul", noul: 0.9, confidence: 0.8 },
-      }),
+      skills: decideSkills(
+        { ...config.skills, enabled: true, rank: "classifier" },
+        [{ name: "pdf", description: "d" }],
+        {
+          "skill:pdf": { type: "noul", noul: 0.9, confidence: 0.8 },
+        },
+      ),
     },
     order,
     maxRisk: config.tools.maxRisk,

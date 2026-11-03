@@ -83,6 +83,7 @@ export function defaultConfig(): LoadoutConfig {
     skills: {
       enabled: false,
       mode: "auto",
+      rank: "lexical",
       threshold: 0.5,
       maxSkills: 5,
       maxCandidates: 40,
@@ -92,6 +93,8 @@ export function defaultConfig(): LoadoutConfig {
     maxPromptChars: 8000,
     dryRun: false,
     notify: true,
+    decideTool: false,
+    advisory: false,
     telemetry: true,
   };
 }
@@ -339,6 +342,9 @@ export function parseConfig(raw: unknown): { config: LoadoutConfig; errors: stri
   }
   if (!["auto", "filter", "hint"].includes(config.skills.mode)) {
     errors.push(`"skills.mode" must be "auto", "filter" or "hint"`);
+  }
+  if (!["lexical", "classifier"].includes(config.skills.rank)) {
+    errors.push(`"skills.rank" must be "lexical" or "classifier"`);
   }
   checkRange(errors, "tools.maxRisk", config.tools.maxRisk, 0, 1);
   checkRange(errors, "skills.threshold", config.skills.threshold, 0, 1);

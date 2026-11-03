@@ -26,11 +26,25 @@
     "rules": {
       "preset": "recommended",
       "complexity": {
-        "useLiteralKeys": "off"
+        "useLiteralKeys": "off",
+        "noExcessiveLinesPerFunction": {
+          "level": "error",
+          "options": { "maxLines": 65, "skipBlankLines": true }
+        }
       },
       "style": {
         "noNonNullAssertion": "off"
       }
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": ["tests/**"],
+      "linter": { "rules": { "complexity": { "noExcessiveLinesPerFunction": "off" } } }
+    },
+    {
+      "includes": ["src/classify/http.ts", "src/classify/laya.ts"],
+      "linter": { "rules": { "complexity": { "noExcessiveLinesPerFunction": "off" } } }
+    }
+  ]
 }

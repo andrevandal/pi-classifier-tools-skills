@@ -53,7 +53,10 @@ function endpointConfig(query = ""): Record<string, unknown> {
 }
 
 function writeConfig(config: Record<string, unknown>): void {
-  fs.writeFileSync(GLOBAL_FILE(), JSON.stringify({ skills: { enabled: true }, ...config, ...endpointConfig() }));
+  fs.writeFileSync(
+    GLOBAL_FILE(),
+    JSON.stringify({ skills: { enabled: true, rank: "classifier" }, ...config, ...endpointConfig() }),
+  );
 }
 
 before(async () => {
@@ -104,8 +107,21 @@ beforeEach(() => {
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
+interface ToolStub {
+  name: string;
+  execute: (
+    id: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    update: undefined,
+    ctx: unknown,
+  ) => Promise<{ content: Array<{ text: string }> }>;
+}
+
 interface HostOptions {
   skills?: typeof SKILLS;
+  /** Tools the host has active on top of BASELINE. */
+  extraTools?: string[];
   /** The host's session file: `sessionManager.getSessionFile` returns it, and `appendEntry` also writes to it. */
   sessionFile?: string;
   sessionIdThrows?: boolean;
@@ -120,11 +136,12 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
   const skills = options.skills ?? SKILLS;
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+  const tools = new Map<string, ToolStub>();
   const entries: Array<{ type: string; data: unknown }> = [];
   const notes: string[] = [];
   const notices: Array<{ message: string; level: string; callsBefore: number }> = [];
   const calls: string[] = [];
-  let active = [...BASELINE];
+  let active = [...BASELINE, ...(options.extraTools ?? [])];
   let setCalls = 0;
   let appendCalls = 0;
   let appendFault: HostOptions["onAppend"] | null = options.onAppend ?? null;
@@ -145,6 +162,7 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
 
   const pi = {
     on: (name: string, handler: Handler) => handlers.set(name, handler),
+    registerTool: (tool: ToolStub) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
       commands.set(name, command),
     getActiveTools: () => [...active],
@@ -212,6 +230,8 @@ function fakeHost(kind: "pi" | "omp", options: HostOptions = {}) {
       return { event, result: result as { message?: { content: string } } | undefined };
     },
     command: (args: string) => commands.get("loadout")!.handler(args, ctx),
+    tools,
+    ctx,
     shutdown: () => handlers.get("session_shutdown")!({}, ctx),
     compact: () => handlers.get("session_compact")!({}, ctx),
     fire: (name: string, event?: unknown) => handlers.get(name)?.(event, ctx),
@@ -333,6 +353,98 @@ test("/loadout off restores the baseline and stops classifying", async () => {
   await host.prompt("explain that");
   assert.equal(requests.length, 1);
   host.shutdown();
+});
+
+test("ask_decision is registered only when decideTool is on, and answers from the classifier", async () => {
+  assert.equal(fakeHost("pi").tools.has("ask_decision"), false);
+
+  writeConfig({ decideTool: true });
+  const host = fakeHost("pi");
+  const tool = host.tools.get("ask_decision")!;
+  reply.answers = { ask: { type: "choice", choice: "grep", probabilities: { grep: 0.7, read: 0.3 }, confidence: 0.7 } };
+  const result = await tool.execute(
+    "id",
+    { ask: "find usages", options: ["grep", "read"] },
+    undefined,
+    undefined,
+    host.ctx,
+  );
+  assert.equal(result.content[0]!.text, "grep (p=0.70); others: read 0.30");
+  assert.deepEqual(Object.keys((requests.at(-1)!.questions as Record<string, { criteria: object }>).ask!.criteria), [
+    "grep",
+    "read",
+  ]);
+
+  const bad = await tool.execute("id", { ask: "x", options: ["only"] }, undefined, undefined, host.ctx);
+  assert.match(bad.content[0]!.text, /^invalid arguments/);
+
+  reply = { status: 500, answers: {} };
+  const failed = await tool.execute("id", { ask: "x", options: ["a", "b"] }, undefined, undefined, host.ctx);
+  assert.match(failed.content[0]!.text, /^no decision/);
+  host.shutdown();
+});
+
+test("decideTool keeps ask_decision active when a profile narrows tools", async () => {
+  writeConfig({ decideTool: true });
+  const host = fakeHost("pi", { extraTools: ["ask_decision"] });
+  await host.prompt("explain this");
+  assert.ok(host.active().includes("ask_decision"));
+  assert.ok(!host.active().includes("bash"));
+  host.shutdown();
+});
+
+test("advisory sends a tool and skill hint and changes nothing", async () => {
+  writeConfig({ advisory: true });
+  const host = fakeHost("pi");
+  const { event, result } = await host.prompt("what does parseConfig return?");
+
+  assert.deepEqual(host.active(), BASELINE);
+  assert.equal(setCount(host), 0);
+  assert.equal(event.systemPromptOptions?.skills.length, SKILLS.length);
+  assert.match(result?.message?.content ?? "", /looks like "answer" work/);
+  assert.match(result?.message?.content ?? "", /- pdf/);
+  assert.equal(record(host).application.status, "dry-run");
+  assert.equal(record(host).skills?.delivery, "hint");
+  host.shutdown();
+});
+
+test("lexical skills work without a classifier call when tools selection is off", async () => {
+  writeConfig({ tools: { enabled: false }, skills: { enabled: true, rank: "lexical", mode: "hint" } });
+  const host = fakeHost("pi");
+  const { result } = await host.prompt("please read and write this pdf file");
+  assert.equal(requests.length, 0);
+  assert.match(result?.message?.content ?? "", /- pdf/);
+  assert.equal(record(host).skills?.delivery, "hint");
+  host.shutdown();
+});
+test("/loadout off keeps tools the user changed after a classified turn", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  host.setActive(["read", "bash"]);
+  await host.command("off");
+  assert.deepEqual(host.active(), ["read", "bash"]);
+  host.shutdown();
+});
+
+test("/loadout off survives a cwd change, and /loadout on is refused while the config has errors", async () => {
+  const other = path.join(path.dirname(project), "other-cwd");
+  fs.mkdirSync(other, { recursive: true });
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  await host.command("off");
+  host.setCwd(other);
+  requests.length = 0;
+  await host.prompt("explain that");
+  assert.equal(requests.length, 0, "the reload must not turn selection back on");
+  host.shutdown();
+
+  fs.writeFileSync(GLOBAL_FILE(), JSON.stringify({ backend: "jev", jev: { timeoutMs: 30000 } }));
+  const broken = fakeHost("pi");
+  await broken.command("on");
+  assert.match(broken.notes.join("\n"), /fix them before enabling/);
+  await broken.prompt("explain this");
+  assert.equal(requests.length, 0);
+  broken.shutdown();
 });
 
 test("a failure that repeats is reported once, and again after a recovery", async () => {
@@ -549,7 +661,7 @@ test("application: a first-turn setter failure records the host's real tools and
 });
 
 test("skill overflow records the real counts and cap and invents no scores", async () => {
-  writeConfig({ skills: { enabled: true, maxCandidates: 1 } });
+  writeConfig({ skills: { enabled: true, rank: "classifier", maxCandidates: 1 } });
   const host = fakeHost("pi");
   await host.prompt("explain this");
 
@@ -635,7 +747,7 @@ test("skips: nothing to ask records the skill counts", async () => {
   );
   none.shutdown();
 
-  writeConfig({ tools: { enabled: false }, skills: { enabled: true, maxCandidates: 1 } });
+  writeConfig({ tools: { enabled: false }, skills: { enabled: true, rank: "classifier", maxCandidates: 1 } });
   const many = fakeHost("pi");
   await many.prompt("explain this");
   assert.equal(requests.length, 0);
@@ -697,7 +809,7 @@ test("machine telemetry off beats trusted-project, explicit-file and /loadout on
   fs.mkdirSync(path.join(project, ".omp"), { recursive: true });
   fs.writeFileSync(
     path.join(project, ".omp", "loadout.json"),
-    JSON.stringify({ skills: { enabled: true }, telemetry: true, ...endpointConfig() }),
+    JSON.stringify({ skills: { enabled: true, rank: "classifier" }, telemetry: true, ...endpointConfig() }),
   );
   const trusted = fakeHost("pi");
   await trusted.prompt("explain this");
@@ -709,7 +821,10 @@ test("machine telemetry off beats trusted-project, explicit-file and /loadout on
   requests.length = 0;
   fs.rmSync(path.join(project, ".omp"), { recursive: true, force: true });
   const explicit = path.join(home, "explicit.json");
-  fs.writeFileSync(explicit, JSON.stringify({ skills: { enabled: true }, telemetry: true, ...endpointConfig() }));
+  fs.writeFileSync(
+    explicit,
+    JSON.stringify({ skills: { enabled: true, rank: "classifier" }, telemetry: true, ...endpointConfig() }),
+  );
   process.env.LOADOUT_CONFIG = explicit;
   const viaEnv = fakeHost("pi");
   await viaEnv.prompt("explain this");
@@ -773,7 +888,11 @@ test("canaries never reach serialized telemetry", async () => {
   ];
   fs.writeFileSync(
     GLOBAL_FILE(),
-    JSON.stringify({ skills: { enabled: true }, tools: { question }, ...endpointConfig("?q=CANARY_QUERY_D4") }),
+    JSON.stringify({
+      skills: { enabled: true, rank: "classifier" },
+      tools: { question },
+      ...endpointConfig("?q=CANARY_QUERY_D4"),
+    }),
   );
   process.env[TOKEN_VAR] = "CANARY_TOKEN_E5";
   try {
@@ -1050,7 +1169,7 @@ function optOutLayers(): Array<{ reason: string; arrange: () => void }> {
       arrange: () => {
         fs.writeFileSync(
           explicit,
-          JSON.stringify({ skills: { enabled: true }, telemetry: false, ...endpointConfig() }),
+          JSON.stringify({ skills: { enabled: true, rank: "classifier" }, telemetry: false, ...endpointConfig() }),
         );
         process.env.LOADOUT_CONFIG = explicit;
       },
@@ -1451,7 +1570,7 @@ test("extension: outcomes through the real hook read differently", async () => {
   host.shutdown();
 
   // Skill overflow: two candidates over a limit of one, so no skill is asked and none is filtered.
-  writeConfig({ skills: { enabled: true, maxCandidates: 1 } });
+  writeConfig({ skills: { enabled: true, rank: "classifier", maxCandidates: 1 } });
   reply.answers.tool_profile = answerReply({ answer: 0.9 });
   host = fakeHost("pi");
   const overflow = onlyNotice(await promptInfo(host, "explain this")).message;
@@ -1521,7 +1640,7 @@ test("extension: outcomes through the real hook read differently", async () => {
   fs.writeFileSync(
     GLOBAL_FILE(),
     JSON.stringify({
-      skills: { enabled: true },
+      skills: { enabled: true, rank: "classifier" },
       backend: "jev",
       jev: { ...(endpointConfig().jev as Record<string, unknown>), timeoutMs: 50 },
     }),
@@ -1548,7 +1667,10 @@ test("extension: status prints safe effective settings only", async () => {
     apiKeyEnvVar: envName,
     timeoutMs: 2500,
   };
-  fs.writeFileSync(GLOBAL_FILE(), JSON.stringify({ skills: { enabled: true }, backend: "jev", jev }));
+  fs.writeFileSync(
+    GLOBAL_FILE(),
+    JSON.stringify({ skills: { enabled: true, rank: "classifier" }, backend: "jev", jev }),
+  );
   process.env[envName] = "test-token";
   try {
     const host = fakeHost("pi");
@@ -1703,7 +1825,7 @@ test("extension: per-turn notice: one compact line after application, honors not
   assert.doesNotMatch(low, /\bapplied\b/i);
   host.shutdown();
 
-  writeConfig({ skills: { enabled: true, maxCandidates: 1 } });
+  writeConfig({ skills: { enabled: true, rank: "classifier", maxCandidates: 1 } });
   reply.answers.tool_profile = answerReply({ answer: 0.9 });
   host = fakeHost("pi");
   const limited = onlyNotice(await promptInfo(host, "explain this")).message;
@@ -1811,7 +1933,7 @@ test("extension: commands add nothing to the model context or the session", asyn
   );
   // The next hook still returns only the skill hint: no command output reaches the model.
   const { result } = await host.prompt("explain that");
-  assert.match(result?.message?.content ?? "", /^Skills most relevant to this request/);
+  assert.match(result?.message?.content ?? "", /^- pdf$/m);
   assert.doesNotMatch(result?.message?.content ?? "", /\[loadout\]/);
   host.shutdown();
 });

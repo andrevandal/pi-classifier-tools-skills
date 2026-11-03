@@ -21,9 +21,18 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
+import {
+  buildDecision,
+  DECIDE_DESCRIPTION,
+  DECIDE_PARAMETERS,
+  DECIDE_QUESTION_ID,
+  DECIDE_TOOL,
+  formatDecision,
+} from "./decide.ts";
 import { explainText, noticeText, type Observation, statsText, statusText } from "./diagnostics.ts";
 import {
   buildQuestions,
+  clipPrompt,
   decideSkills,
   isSlashCommand,
   profileOrder,
@@ -57,6 +66,7 @@ import type {
   SkillsDecision,
   TelemetryState,
 } from "./types.ts";
+import { ClassifierError } from "./types.ts";
 import {
   armDecision,
   clearRetry,
@@ -112,6 +122,10 @@ interface SessionState {
   /** Run and decision links for usage observations; session-local, carried across config reloads. */
   usage: UsageTracker;
   collection: { handedOff: number; suppressed: number; failed: number; lastFailure: string | null };
+  /** `/loadout on|off`, kept across config reloads (cwd or trust change); null until the user toggles. */
+  enabledOverride: boolean | null;
+  /** The current config failed to load, so it is disabled and `/loadout on` must not lift that. */
+  configFailed: boolean;
   /** Last failure already reported; repeats stay quiet until a turn succeeds. */
   lastFailure: string | null;
 }
@@ -229,6 +243,10 @@ function ensureSession(ctx: ExtensionContext): SessionState {
   const result = loadConfig(ctx.cwd, { projectTrusted, explicitPath: process.env.LOADOUT_CONFIG || undefined });
   for (const error of result.errors) notify(ctx, result.config, `config error: ${error}`, "error");
   for (const warning of result.warnings) notify(ctx, result.config, `config warning: ${warning}`, "warning");
+  if (result.config.decideTool && !result.config.tools.alwaysOn.includes(DECIDE_TOOL)) {
+    result.config.tools.alwaysOn = [...result.config.tools.alwaysOn, DECIDE_TOOL];
+  }
+  if (existing?.enabledOverride != null && result.errors.length === 0) result.config.enabled = existing.enabledOverride;
 
   const classifierKey = classifierKeyFor(result.config);
   const keepClassifier = existing?.classifierKey === classifierKey && existing.holdsClassifier;
@@ -255,6 +273,8 @@ function ensureSession(ctx: ExtensionContext): SessionState {
     appliedRank: existing?.appliedRank ?? null,
     allowNarrow: existing?.allowNarrow ?? true,
     lastFailure: null,
+    enabledOverride: existing?.enabledOverride ?? null,
+    configFailed: result.errors.length > 0,
   };
   sessions.set(key, state);
   // Start Laya's multi-second weight load now rather than on the first prompt.
@@ -313,10 +333,23 @@ function failureNotice(failure: FailureReason, message: string | null): { text: 
 
 function skillHint(selected: string[]): string {
   return [
-    "Skills most relevant to this request, chosen by a classifier:",
+    "Skills that may fit this request (an automatic suggestion, not a certainty):",
     ...selected.map((name) => `- ${name}`),
-    "Load the relevant ones before starting. Other listed skills are unlikely to apply.",
+    "Load any that fit. Other listed skills may still apply.",
   ].join("\n");
+}
+
+/** The advisory-mode hint: what the classifier suggests, with nothing removed from the agent. Null when it suggests nothing. */
+function adviceFor(decision: NonNullable<TurnOutcome["decision"]>): string | null {
+  const { tools, skills } = decision;
+  const lines: string[] = [];
+  if (tools.reason === "selected" && tools.profile !== null && tools.risk !== null) {
+    lines.push(
+      `Tools: this request looks like "${tools.profile}" work (risk ${tools.risk.toFixed(2)}); no tool was removed.`,
+    );
+  }
+  if (skills.selected !== null && skills.selected.length > 0) lines.push(skillHint(skills.selected));
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 /** Everything one hook call learns, so a record can be built after apply/restore whatever happened. */
@@ -340,6 +373,117 @@ interface HookTrace {
 }
 
 type HookResult = { message: { customType: string; content: string; display: boolean } } | undefined;
+type TurnDecision = TurnOutcome["decision"];
+
+/** Hand the chosen skills to the agent: filter its skill list when allowed and possible, else one hint message. */
+function deliverSkills(
+  event: PromptEvent,
+  config: LoadoutConfig,
+  trace: HookTrace,
+  selected: string[],
+  mayFilter: boolean,
+): HookResult {
+  const promptSkills = event.systemPromptOptions?.skills;
+  const filter = config.skills.mode === "filter" || (config.skills.mode === "auto" && Array.isArray(promptSkills));
+  if (mayFilter && filter && event.systemPromptOptions && Array.isArray(promptSkills)) {
+    const keep = new Set([...selected, ...config.skills.exclude]);
+    const kept = promptSkills.filter((skill) => keep.has(skill.name));
+    // Reassign rather than splice: the array may be shared with the host's base prompt options.
+    event.systemPromptOptions.skills = kept;
+    trace.delivery = "filter";
+    trace.filteredOut = promptSkills.length - kept.length;
+    return;
+  }
+  if (selected.length === 0) return;
+  trace.delivery = "hint";
+  return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
+}
+
+/** Why this prompt is not classified, or null when it should be. */
+function gateFor(config: LoadoutConfig, prompt: string): SkipReason | null {
+  if (!config.enabled) return "disabled";
+  if (prompt.trim() === "") return "empty-prompt";
+  return isSlashCommand(prompt) ? "command" : null;
+}
+
+/** Put the user's tools back and note how that went. */
+async function restoreAndTrace(pi: ExtensionAPI, state: SessionState, trace: HookTrace): Promise<void> {
+  trace.restoration = await restoreBaseline(pi, state);
+  trace.status = trace.restoration ?? "not-attempted";
+}
+
+/** The skills this turn may pick from, noted in the trace. */
+function listCandidates(pi: ExtensionAPI, event: PromptEvent, config: LoadoutConfig, trace: HookTrace) {
+  const discovered = listSkills(pi, event);
+  const candidates = skillCandidates(discovered, config.skills);
+  trace.listed = true;
+  trace.discovered = discovered.length;
+  trace.eligible = candidates.length;
+  return candidates;
+}
+
+/** Lexical ranking needs no classifier, so its hint still goes out when there is nothing to ask. */
+function skillsOnly(
+  event: PromptEvent,
+  config: LoadoutConfig,
+  candidates: SkillCandidate[],
+  trace: HookTrace,
+): HookResult {
+  trace.gate = "no-questions";
+  const lexical = decideSkills(config.skills, candidates, {}, event.prompt);
+  trace.skillsDecision = lexical;
+  if (config.dryRun || lexical.selected === null) return;
+  return deliverSkills(event, config, trace, lexical.selected, !config.advisory);
+}
+
+/**
+ * Widen-only ratchet: once narrowed, a later turn may keep or widen the tools, never narrow them further.
+ * Returns whether this turn's rank was admitted.
+ */
+function stepRatchet(state: SessionState, config: LoadoutConfig, decision: TurnDecision, trace: HookTrace): boolean {
+  const order = profileOrder(config.tools);
+  // A failed turn and a "don't know" turn both want the baseline, which is the broadest rank.
+  const target = decision?.tools.active ? order.indexOf(decision.tools.profile ?? "") : order.length - 1;
+  const rankName = (rank: number | null): string | null =>
+    config.tools.enabled && rank !== null ? (order[rank] ?? null) : null;
+  const narrowAllowed = state.allowNarrow;
+  const before = rankName(state.appliedRank);
+  const admitted = state.allowNarrow || state.appliedRank === null || target >= state.appliedRank;
+  if (admitted) {
+    state.appliedRank = target;
+    state.allowNarrow = false;
+  }
+  trace.ratchet = { narrowAllowed, before, after: rankName(state.appliedRank), admitted };
+  return admitted;
+}
+
+async function reportFailedTurn(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: SessionState,
+  turn: TurnOutcome,
+  trace: HookTrace,
+): Promise<void> {
+  const notice = failureNotice(turn.failure ?? "error", turn.message);
+  if (notice.text !== state.lastFailure) {
+    state.lastFailure = notice.text;
+    notify(ctx, state.config, notice.text, notice.level);
+  }
+  await restoreAndTrace(pi, state, trace);
+}
+
+/** Dry-run and advisory: classified, nothing applied. Advisory sends a hint; dry-run sends nothing. */
+function observeOnly(config: LoadoutConfig, decision: NonNullable<TurnDecision>, trace: HookTrace): HookResult {
+  // Advisory reuses the "dry-run" status: classified, nothing applied, so the record reads the same.
+  trace.status = "dry-run";
+  const advice = config.dryRun ? null : adviceFor(decision);
+  if (advice === null) {
+    trace.delivery = config.dryRun && decision.skills.selected !== null ? "dry-run" : "none";
+    return;
+  }
+  trace.delivery = "hint";
+  return { message: { customType: HINT_MESSAGE, content: advice, display: false } };
+}
 
 async function runHook(
   pi: ExtensionAPI,
@@ -349,32 +493,18 @@ async function runHook(
   trace: HookTrace,
 ): Promise<HookResult> {
   const { config } = state;
-  const gate: SkipReason | null = !config.enabled
-    ? "disabled"
-    : event.prompt.trim() === ""
-      ? "empty-prompt"
-      : isSlashCommand(event.prompt)
-        ? "command"
-        : null;
+  const gate = gateFor(config, event.prompt);
   if (gate !== null) {
     trace.gate = gate;
-    trace.restoration = await restoreBaseline(pi, state);
-    trace.status = trace.restoration ?? "not-attempted";
+    refreshBaseline(pi, state);
+    await restoreAndTrace(pi, state, trace);
     return;
   }
 
   const baseline = refreshBaseline(pi, state);
-  const discovered = listSkills(pi, event);
-  const candidates = skillCandidates(discovered, config.skills);
-  trace.listed = true;
-  trace.discovered = discovered.length;
-  trace.eligible = candidates.length;
+  const candidates = listCandidates(pi, event, config, trace);
   const questions = buildQuestions(config, candidates);
-  if (Object.keys(questions).length === 0) {
-    trace.gate = "no-questions";
-    trace.skillsDecision = decideSkills(config.skills, candidates, {});
-    return;
-  }
+  if (Object.keys(questions).length === 0) return skillsOnly(event, config, candidates, trace);
   trace.asked = skillsAskable(config.skills, candidates) ? candidates.length : 0;
 
   const turn = await runTurn({
@@ -390,63 +520,22 @@ async function runHook(
   trace.message = turn.message;
   const { decision } = turn;
   trace.skillsDecision = decision?.skills ?? null;
-
-  const order = profileOrder(config.tools);
-  const broadest = order.length - 1;
-  // A failed turn and a "don't know" turn both want the baseline, which is the broadest rank.
-  const target = decision?.tools.active ? order.indexOf(decision.tools.profile ?? "") : broadest;
-  const rankName = (rank: number | null): string | null =>
-    config.tools.enabled && rank !== null ? (order[rank] ?? null) : null;
-  const narrowAllowed = state.allowNarrow;
-  const before = rankName(state.appliedRank);
-  // Widen-only ratchet: once narrowed, a later turn may keep or widen the tools, never narrow them further.
-  const admitted = state.allowNarrow || state.appliedRank === null || target >= state.appliedRank;
-  if (admitted) {
-    state.appliedRank = target;
-    state.allowNarrow = false;
-  }
-  trace.ratchet = { narrowAllowed, before, after: rankName(state.appliedRank), admitted };
+  const admitted = stepRatchet(state, config, decision, trace);
 
   if (decision === null) {
-    const notice = failureNotice(turn.failure ?? "error", turn.message);
-    if (notice.text !== state.lastFailure) {
-      state.lastFailure = notice.text;
-      notify(ctx, config, notice.text, notice.level);
-    }
-    trace.restoration = await restoreBaseline(pi, state);
-    trace.status = trace.restoration ?? "not-attempted";
+    await reportFailedTurn(pi, ctx, state, turn, trace);
     return;
   }
-
   state.lastFailure = null;
-  const selected = decision.skills.selected;
-  if (config.dryRun) {
-    trace.status = "dry-run";
-    trace.delivery = selected === null ? "none" : "dry-run";
-    return;
-  }
+  if (config.dryRun || config.advisory) return observeOnly(config, decision, trace);
 
   if (admitted) {
     trace.status = (await activateTools(pi, state, decision.tools.active ?? baseline)) ? "applied" : "unchanged";
   } else {
     trace.status = "not-admitted";
   }
-
-  if (selected === null) return;
-  const promptSkills = event.systemPromptOptions?.skills;
-  const filter = config.skills.mode === "filter" || (config.skills.mode === "auto" && Array.isArray(promptSkills));
-  if (filter && event.systemPromptOptions && Array.isArray(promptSkills)) {
-    const keep = new Set([...selected, ...config.skills.exclude]);
-    const kept = promptSkills.filter((skill) => keep.has(skill.name));
-    // Reassign rather than splice: the array may be shared with the host's base prompt options.
-    event.systemPromptOptions.skills = kept;
-    trace.delivery = "filter";
-    trace.filteredOut = promptSkills.length - kept.length;
-    return;
-  }
-  if (selected.length === 0) return;
-  trace.delivery = "hint";
-  return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
+  const { selected } = decision.skills;
+  return selected === null ? undefined : deliverSkills(event, config, trace, selected, true);
 }
 
 function countRecord(ctx: ExtensionContext, state: SessionState, result: PersistResult): void {
@@ -682,7 +771,47 @@ function onTurnEnd(pi: ExtensionAPI, event: unknown, ctx: ExtensionContext): voi
   }
 }
 
-export default function loadout(pi: ExtensionAPI): void {
+/** One `ask_decision` call: never throws, the agent reads the outcome as text. */
+async function decide(ctx: ExtensionContext, args: unknown, signal: AbortSignal | undefined): Promise<string> {
+  const built = buildDecision(args);
+  if (typeof built === "string") return `invalid arguments: ${built}`;
+  const state = ensureSession(ctx);
+  const classifier = classifierFor(state);
+  if (classifier.readiness() === "warming") return "no decision: the classifier is still loading";
+  try {
+    const sent = clipPrompt(built.state, state.config.maxPromptChars);
+    const result = await classifier.classify(
+      sent,
+      { [DECIDE_QUESTION_ID]: built.question },
+      { signal, telemetryOff: true },
+    );
+    return formatDecision(result.answers[DECIDE_QUESTION_ID]);
+  } catch (error) {
+    if (error instanceof ClassifierError) return `no decision: ${error.code}`;
+    return `no decision: ${error instanceof Error ? error.message : "error"}`;
+  }
+}
+
+/** Registered at load from the global config only: the host takes tools once, and a tool costs schema tokens on every turn. */
+function registerDecideTool(pi: ExtensionAPI): void {
+  const registered = loadConfig(process.cwd(), {
+    projectTrusted: false,
+    explicitPath: process.env.LOADOUT_CONFIG || undefined,
+  });
+  if (!registered.config.decideTool) return;
+  pi.registerTool({
+    name: DECIDE_TOOL,
+    label: "Ask decision",
+    description: DECIDE_DESCRIPTION,
+    parameters: DECIDE_PARAMETERS as never,
+    execute: async (_id, params, signal, _update, ctx) => ({
+      content: [{ type: "text", text: await decide(ctx, params, signal) }],
+      details: {},
+    }),
+  });
+}
+
+function registerSessionEvents(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     try {
       ensureSession(ctx);
@@ -709,7 +838,9 @@ export default function loadout(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event, ctx) => onBeforeAgentStart(pi, event as PromptEvent, ctx));
+}
 
+function registerUsageEvents(pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => track(ctx, startRun));
   pi.on("turn_start", (_event, ctx) => track(ctx, openTurn));
   pi.on("message_start", (event, ctx) => track(ctx, (usage) => deliverMessage(usage, event)));
@@ -727,37 +858,60 @@ export default function loadout(pi: ExtensionAPI): void {
   onHost("auto_retry_end", (_event, ctx) => track(ctx, clearRetry));
   onHost("session_branch", (_event, ctx) => track(ctx, endContext));
   onHost("session_switch", (_event, ctx) => track(ctx, endContext));
+}
 
+/** `/loadout on`: refused while the config has errors, because that config is disabled on purpose. */
+function enableSelection(ctx: ExtensionContext, state: SessionState): void {
+  if (state.configFailed) {
+    ctx.ui.notify(`${PREFIX} config has errors; fix them before enabling`, "error");
+    return;
+  }
+  state.config.enabled = true;
+  state.enabledOverride = true;
+  resetRatchet(state);
+  classifierFor(state);
+  ctx.ui.notify(`${PREFIX} selection enabled`, "info");
+}
+
+async function disableSelection(pi: ExtensionAPI, ctx: ExtensionContext, state: SessionState): Promise<void> {
+  state.config.enabled = false;
+  state.enabledOverride = false;
+  resetRatchet(state);
+  refreshBaseline(pi, state);
+  await restoreBaseline(pi, state);
+  ctx.ui.notify(`${PREFIX} selection disabled; full loadout restored`, "info");
+}
+
+async function onCommand(pi: ExtensionAPI, args: string, ctx: ExtensionContext): Promise<void> {
+  const state = ensureSession(ctx);
+  const subcommand = args.trim().split(/\s+/)[0] || "status";
+  switch (subcommand) {
+    case "status":
+    case "explain":
+    case "stats":
+      showView(ctx, state, subcommand, args);
+      return;
+    case "on":
+      enableSelection(ctx, state);
+      return;
+    case "off":
+      await disableSelection(pi, ctx, state);
+      return;
+    default:
+      ctx.ui.notify(`${PREFIX} usage: /${COMMAND} [${SUBCOMMANDS.join("|")}]`, "warning");
+  }
+}
+
+export default function loadout(pi: ExtensionAPI): void {
+  registerDecideTool(pi);
+  registerSessionEvents(pi);
+  registerUsageEvents(pi);
   pi.registerCommand(COMMAND, {
     description: "Inspect and control classifier-driven tool and skill selection",
     getArgumentCompletions: (prefix: string) => {
       const matches = SUBCOMMANDS.filter((name) => name.startsWith(prefix.trim()));
       return matches.length > 0 ? matches.map((name) => ({ value: name, label: name })) : null;
     },
-    handler: async (args: string, ctx) => {
-      const state = ensureSession(ctx);
-      const subcommand = args.trim().split(/\s+/)[0] || "status";
-      switch (subcommand) {
-        case "status":
-        case "explain":
-        case "stats":
-          showView(ctx, state, subcommand, args);
-          return;
-        case "on":
-          state.config.enabled = true;
-          resetRatchet(state);
-          classifierFor(state);
-          ctx.ui.notify(`${PREFIX} selection enabled`, "info");
-          return;
-        case "off":
-          state.config.enabled = false;
-          resetRatchet(state);
-          await restoreBaseline(pi, state);
-          ctx.ui.notify(`${PREFIX} selection disabled; full loadout restored`, "info");
-          return;
-        default:
-          ctx.ui.notify(`${PREFIX} usage: /${COMMAND} [${SUBCOMMANDS.join("|")}]`, "warning");
-      }
-    },
+    handler: (args: string, ctx) => onCommand(pi, args, ctx),
   });
 }

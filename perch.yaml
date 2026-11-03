@@ -1,0 +1,3 @@
+# Eval and benchmark scripts are one-off tooling, not the shipped plugin.
+ignore:
+  - scripts/**
