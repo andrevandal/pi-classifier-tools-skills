@@ -39,7 +39,8 @@
     "bench": "node scripts/bench.ts",
     "report": "node src/report/cli.ts",
     "decisions": "node scripts/decisions.ts",
-    "eval": "node scripts/eval-classifier.ts"
+    "eval": "node scripts/eval-classifier.ts",
+    "eval-skills": "node scripts/eval-skills.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
