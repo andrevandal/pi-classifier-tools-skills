@@ -752,7 +752,8 @@ async function decide(ctx: ExtensionContext, args: unknown, signal: AbortSignal 
     );
     return formatDecision(result.answers[DECIDE_QUESTION_ID]);
   } catch (error) {
-    return `no decision: ${error instanceof ClassifierError ? error.code : "error"}`;
+    if (error instanceof ClassifierError) return `no decision: ${error.code}`;
+    return `no decision: ${error instanceof Error ? error.message : "error"}`;
   }
 }
 
