@@ -358,6 +358,7 @@ async function runHook(
         : null;
   if (gate !== null) {
     trace.gate = gate;
+    refreshBaseline(pi, state);
     trace.restoration = await restoreBaseline(pi, state);
     trace.status = trace.restoration ?? "not-attempted";
     return;
@@ -752,6 +753,7 @@ export default function loadout(pi: ExtensionAPI): void {
         case "off":
           state.config.enabled = false;
           resetRatchet(state);
+          refreshBaseline(pi, state);
           await restoreBaseline(pi, state);
           ctx.ui.notify(`${PREFIX} selection disabled; full loadout restored`, "info");
           return;

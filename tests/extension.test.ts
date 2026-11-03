@@ -335,6 +335,15 @@ test("/loadout off restores the baseline and stops classifying", async () => {
   host.shutdown();
 });
 
+test("/loadout off keeps tools the user changed after a classified turn", async () => {
+  const host = fakeHost("pi");
+  await host.prompt("explain this");
+  host.setActive(["read", "bash"]);
+  await host.command("off");
+  assert.deepEqual(host.active(), ["read", "bash"]);
+  host.shutdown();
+});
+
 test("a failure that repeats is reported once, and again after a recovery", async () => {
   const host = fakeHost("pi");
   reply = { status: 500, answers: {} };
