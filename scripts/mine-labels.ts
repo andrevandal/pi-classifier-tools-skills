@@ -36,10 +36,11 @@ const EDIT: Record<string, true> = { edit: true, write: true, ast_edit: true };
 const MAX_CHARS = 3000;
 
 const READ_ONLY_COMMANDS = new RegExp(
-  `^(${["cat", "ls", "grep", "rg", "find", "head", "tail", "wc", "pwd", "echo", "which", "stat", "du", "df", "jq", "sort", "diff", "file", "tree", "ps", "date", "env", "printf", "cd", "test", "true"].join("|")})$`,
+  `^(${["cat", "ls", "grep", "rg", "find", "head", "tail", "wc", "pwd", "echo", "which", "stat", "du", "df", "jq", "sort", "diff", "file", "tree", "ps", "date", "printf", "cd", "test", "true"].join("|")})$`,
 );
+// `branch` and `remote` only in their listing forms: `git branch -D` and `git remote add` change things.
 const READ_ONLY_GIT =
-  /^git\s+(-C\s+\S+\s+)?(status|log|diff|show|branch|remote|rev-parse|ls-files|blame|describe|config\s+--get)\b/;
+  /^git\s+(-C\s+\S+\s+)?(status|log|diff|show|rev-parse|ls-files|blame|describe|config\s+--get|(branch|remote)(\s+(-a|-r|-v|--list|--show-current))*)\s*($|\s)/;
 
 /** A shell command that only reads: every segment starts with a read-only program and nothing redirects, deletes or executes. */
 function isReadOnlyShell(command: unknown): boolean {

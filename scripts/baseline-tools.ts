@@ -77,7 +77,8 @@ const all = fs
   .readFileSync(values.labels, "utf8")
   .split("\n")
   .filter(Boolean)
-  .map((line) => JSON.parse(line) as Row);
+  .map((line) => JSON.parse(line) as Row)
+  .filter((row) => ORDER.includes(row.expect));
 const cut = Math.floor(all.length * (1 - Number(values.test)));
 const trainRows = all.slice(0, cut);
 const testRows = all.slice(cut);

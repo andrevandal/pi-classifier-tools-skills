@@ -47,14 +47,15 @@ export function buildDecision(args: unknown): { question: ChoiceQuestion; state:
   if (!Array.isArray(options) || options.some((option) => typeof option !== "string" || option.trim() === "")) {
     return "options must be a list of non-empty strings";
   }
-  const unique = [...new Set(options.map((option) => option.trim()))];
+  // Truncate before deduplicating: two long options sharing a prefix must not collapse into one criteria key.
+  const unique = [...new Set(options.map((option) => option.trim().slice(0, MAX_OPTION_CHARS)))];
   if (unique.length < MIN_OPTIONS || unique.length > MAX_OPTIONS) {
     return `options needs ${MIN_OPTIONS} to ${MAX_OPTIONS} distinct entries`;
   }
   const question: ChoiceQuestion = {
     type: "choice",
     instructions: ask.slice(0, MAX_ASK_CHARS),
-    criteria: Object.fromEntries(unique.map((option) => [option.slice(0, MAX_OPTION_CHARS), null])),
+    criteria: Object.fromEntries(unique.map((option) => [option, null])),
   };
   return { question, state: typeof context === "string" && context !== "" ? context : ask, options: unique };
 }

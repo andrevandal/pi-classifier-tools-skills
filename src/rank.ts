@@ -23,8 +23,10 @@ const STOP: Record<string, true> = {
 
 function tokens(text: string): string[] {
   return text
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
     .toLowerCase()
-    .split(/[^a-z0-9]+/)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter((word) => word.length > 2 && STOP[word] === undefined);
 }
 
