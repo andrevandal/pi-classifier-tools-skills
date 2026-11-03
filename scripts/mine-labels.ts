@@ -90,16 +90,17 @@ const seen = new Set<string>();
 for (const file of listSessionFiles(values["sessions-dir"] ?? defaultSessionsDir())) {
   // Top-level sessions only: subagent files are not named by a leading timestamp.
   if (!/^\d{4}-\d\d-\d\dT/.test(path.basename(file))) continue;
-  let current: { prompt: string; at: string; tools: Set<string> } | null = null;
+  // `keep` is false for prompts too short, long or slash-led to label: their tools still count as session history.
+  let current: { prompt: string; at: string; tools: Set<string>; keep: boolean } | null = null;
   let prev: Row["expect"] | null = null;
   const before = new Set<string>();
   const flush = () => {
     if (current) {
       const history = before.size === 0 ? null : label(before);
-      if (!seen.has(current.prompt)) {
+      if (current.keep && !seen.has(current.prompt)) {
         seen.add(current.prompt);
         rows.push({
-          id: String(rows.length).padStart(5, "0"),
+          id: "",
           prompt: current.prompt,
           expect: label(current.tools),
           tools: [...current.tools].sort(),
@@ -125,9 +126,8 @@ for (const file of listSessionFiles(values["sessions-dir"] ?? defaultSessionsDir
     if (message?.role === "user" && message.attribution === "user") {
       flush();
       const prompt = userText(message.content);
-      if (prompt.length >= MIN_CHARS && prompt.length <= MAX_CHARS && !prompt.startsWith("/")) {
-        current = { prompt, at: entry.timestamp ?? "", tools: new Set() };
-      }
+      const keep = prompt.length >= MIN_CHARS && prompt.length <= MAX_CHARS && !prompt.startsWith("/");
+      current = { prompt, at: entry.timestamp ?? "", tools: new Set(), keep };
     } else if (current && message?.role === "assistant" && Array.isArray(message.content)) {
       for (const part of message.content as { type?: string; name?: string; arguments?: { command?: unknown } }[]) {
         if (part.type !== "toolCall" || !part.name) continue;
