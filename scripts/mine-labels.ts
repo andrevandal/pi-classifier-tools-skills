@@ -140,6 +140,9 @@ for (const file of listSessionFiles(values["sessions-dir"] ?? defaultSessionsDir
 }
 
 rows.sort((a, b) => a.at.localeCompare(b.at));
+rows.forEach((row, i) => {
+  row.id = String(i).padStart(5, "0");
+});
 fs.writeFileSync(values.out, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
 const counts: Record<string, number> = {};
 for (const row of rows) counts[row.expect] = (counts[row.expect] ?? 0) + 1;

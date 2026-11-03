@@ -18,8 +18,11 @@ const { values } = parseArgs({
   options: { labels: { type: "string" }, test: { type: "string", default: "0.3" } },
   strict: true,
 });
-if (!values.labels) {
-  console.error("usage: node scripts/baseline-tools.ts --labels <jsonl> [--test 0.3]");
+const testShare = Number(values.test);
+if (!values.labels || !(testShare > 0 && testShare < 1)) {
+  console.error(
+    "usage: node scripts/baseline-tools.ts --labels <jsonl> [--test 0.3]  (--test is a share between 0 and 1)",
+  );
   process.exit(2);
 }
 
@@ -34,8 +37,10 @@ interface Row {
 
 function features(prompt: string): string[] {
   const words = prompt
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
     .toLowerCase()
-    .split(/[^a-z0-9]+/)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter((word) => word.length > 1);
   return [...words, ...words.slice(1).map((word, i) => `${words[i]} ${word}`)];
 }
