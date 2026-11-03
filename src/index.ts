@@ -374,6 +374,30 @@ interface HookTrace {
 
 type HookResult = { message: { customType: string; content: string; display: boolean } } | undefined;
 
+/** Hand the chosen skills to the agent: filter its skill list when allowed and possible, else one hint message. */
+function deliverSkills(
+  event: PromptEvent,
+  config: LoadoutConfig,
+  trace: HookTrace,
+  selected: string[],
+  mayFilter: boolean,
+): HookResult {
+  const promptSkills = event.systemPromptOptions?.skills;
+  const filter = config.skills.mode === "filter" || (config.skills.mode === "auto" && Array.isArray(promptSkills));
+  if (mayFilter && filter && event.systemPromptOptions && Array.isArray(promptSkills)) {
+    const keep = new Set([...selected, ...config.skills.exclude]);
+    const kept = promptSkills.filter((skill) => keep.has(skill.name));
+    // Reassign rather than splice: the array may be shared with the host's base prompt options.
+    event.systemPromptOptions.skills = kept;
+    trace.delivery = "filter";
+    trace.filteredOut = promptSkills.length - kept.length;
+    return;
+  }
+  if (selected.length === 0) return;
+  trace.delivery = "hint";
+  return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
+}
+
 async function runHook(
   pi: ExtensionAPI,
   event: PromptEvent,
@@ -406,8 +430,11 @@ async function runHook(
   const questions = buildQuestions(config, candidates);
   if (Object.keys(questions).length === 0) {
     trace.gate = "no-questions";
-    trace.skillsDecision = decideSkills(config.skills, candidates, {}, event.prompt);
-    return;
+    // Lexical ranking needs no classifier, so its hint still goes out when there is nothing to ask.
+    const lexical = decideSkills(config.skills, candidates, {}, event.prompt);
+    trace.skillsDecision = lexical;
+    if (config.dryRun || lexical.selected === null) return;
+    return deliverSkills(event, config, trace, lexical.selected, !config.advisory);
   }
   trace.asked = skillsAskable(config.skills, candidates) ? candidates.length : 0;
 
@@ -473,20 +500,7 @@ async function runHook(
   }
 
   if (selected === null) return;
-  const promptSkills = event.systemPromptOptions?.skills;
-  const filter = config.skills.mode === "filter" || (config.skills.mode === "auto" && Array.isArray(promptSkills));
-  if (filter && event.systemPromptOptions && Array.isArray(promptSkills)) {
-    const keep = new Set([...selected, ...config.skills.exclude]);
-    const kept = promptSkills.filter((skill) => keep.has(skill.name));
-    // Reassign rather than splice: the array may be shared with the host's base prompt options.
-    event.systemPromptOptions.skills = kept;
-    trace.delivery = "filter";
-    trace.filteredOut = promptSkills.length - kept.length;
-    return;
-  }
-  if (selected.length === 0) return;
-  trace.delivery = "hint";
-  return { message: { customType: HINT_MESSAGE, content: skillHint(selected), display: false } };
+  return deliverSkills(event, config, trace, selected, true);
 }
 
 function countRecord(ctx: ExtensionContext, state: SessionState, result: PersistResult): void {

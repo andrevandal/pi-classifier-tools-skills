@@ -63,11 +63,12 @@ export function buildDecision(args: unknown): { question: ChoiceQuestion; state:
 /** One line: the choice, then the others by probability. Empty probabilities are never reported as zero. */
 export function formatDecision(answer: Answer | undefined): string {
   if (answer?.type !== "choice") return "no decision: the classifier returned no answer to this question";
-  const rest = Object.entries(answer.probabilities ?? {})
+  const probabilities = Object.entries(answer.probabilities ?? {}).filter(([, p]) => Number.isFinite(p));
+  const rest = probabilities
     .filter(([option]) => option !== answer.choice)
     .sort((a, b) => b[1] - a[1])
     .map(([option, p]) => `${option} ${p.toFixed(2)}`);
-  const own = answer.probabilities?.[answer.choice];
+  const own = probabilities.find(([option]) => option === answer.choice)?.[1];
   const head = `${answer.choice}${own === undefined ? "" : ` (p=${own.toFixed(2)})`}`;
   return rest.length > 0 ? `${head}; others: ${rest.join(", ")}` : head;
 }

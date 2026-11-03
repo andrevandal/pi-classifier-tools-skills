@@ -407,6 +407,16 @@ test("advisory sends a tool and skill hint and changes nothing", async () => {
   assert.equal(record(host).skills?.delivery, "hint");
   host.shutdown();
 });
+
+test("lexical skills work without a classifier call when tools selection is off", async () => {
+  writeConfig({ tools: { enabled: false }, skills: { enabled: true, rank: "lexical", mode: "hint" } });
+  const host = fakeHost("pi");
+  const { result } = await host.prompt("please read and write this pdf file");
+  assert.equal(requests.length, 0);
+  assert.match(result?.message?.content ?? "", /- pdf/);
+  assert.equal(record(host).skills?.delivery, "hint");
+  host.shutdown();
+});
 test("/loadout off keeps tools the user changed after a classified turn", async () => {
   const host = fakeHost("pi");
   await host.prompt("explain this");
