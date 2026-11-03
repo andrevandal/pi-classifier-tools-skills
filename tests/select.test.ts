@@ -91,14 +91,14 @@ test("profiles are ordered narrowest first, with the wildcard last", () => {
 });
 
 test("skills above the threshold are selected, highest first, capped at maxSkills", () => {
-  const config = { ...defaultConfig().skills, enabled: true, maxSkills: 1 };
+  const config = { ...defaultConfig().skills, enabled: true, rank: "classifier" as const, maxSkills: 1 };
   const decision = decideSkills(config, SKILLS, nouls({ pdf: 0.7, deploy: 0.9, review: 0.2 }));
   assert.deepEqual(decision.selected, ["deploy"]);
   assert.equal(decision.reason, "selected");
 });
 
 test("alwaysInclude is selected without being asked, and no relevant skill selects none", () => {
-  const config = { ...defaultConfig().skills, enabled: true, alwaysInclude: ["review"] };
+  const config = { ...defaultConfig().skills, enabled: true, rank: "classifier" as const, alwaysInclude: ["review"] };
   const candidates = skillCandidates(SKILLS, config);
   assert.deepEqual(
     candidates.map((s) => s.name),
@@ -108,7 +108,7 @@ test("alwaysInclude is selected without being asked, and no relevant skill selec
 });
 
 test("skill selection keeps every skill when it cannot decide", () => {
-  const config = { ...defaultConfig().skills, enabled: true };
+  const config = { ...defaultConfig().skills, enabled: true, rank: "classifier" as const };
   assert.equal(decideSkills(config, [], {}).reason, "no-candidates");
   assert.equal(decideSkills(config, SKILLS, {}).reason, "missing-answer");
   assert.equal(decideSkills({ ...config, maxCandidates: 2 }, SKILLS, {}).reason, "too-many-candidates");
@@ -116,7 +116,10 @@ test("skill selection keeps every skill when it cannot decide", () => {
 });
 
 test("questions hold the tool question plus one noul per candidate skill", () => {
-  const config = { ...defaultConfig(), skills: { ...defaultConfig().skills, enabled: true } };
+  const config = {
+    ...defaultConfig(),
+    skills: { ...defaultConfig().skills, enabled: true, rank: "classifier" as const },
+  };
   const questions = buildQuestions(config, SKILLS);
   assert.deepEqual(Object.keys(questions), [TOOLS_QUESTION_ID, "skill:pdf", "skill:deploy", "skill:review"]);
   assert.equal(questions["skill:pdf"]?.type, "noul");
@@ -186,4 +189,26 @@ test("pickProfile picks the narrowest profile within maxRisk", () => {
     assert.equal(picked?.profile ?? null, expected?.profile ?? null);
     if (expected) near(picked?.risk, expected.risk);
   }
+});
+
+test("lexical ranking selects skills by word overlap, asks nothing, and ignores unrelated prompts", () => {
+  const config = { ...defaultConfig().skills, enabled: true, maxSkills: 1 };
+  assert.equal(config.rank, "lexical");
+
+  const decision = decideSkills(config, SKILLS, {}, "please merge these two PDF files");
+  assert.deepEqual(decision.selected, ["pdf"]);
+  assert.deepEqual(decision.scores, {});
+  assert.deepEqual(decideSkills(config, SKILLS, {}, "hello there").selected, []);
+  assert.deepEqual(
+    decideSkills(
+      { ...config, alwaysInclude: ["review"] },
+      skillCandidates(SKILLS, { ...config, alwaysInclude: ["review"] }),
+      {},
+      "hello there",
+    ).selected,
+    ["review"],
+  );
+
+  const questions = buildQuestions({ ...defaultConfig(), skills: config }, SKILLS);
+  assert.deepEqual(Object.keys(questions), [TOOLS_QUESTION_ID]);
 });

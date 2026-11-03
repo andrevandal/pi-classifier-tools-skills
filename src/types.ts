@@ -256,6 +256,8 @@ export type SkillsMode = "auto" | "filter" | "hint";
 export interface SkillsSelectorConfig {
   enabled: boolean;
   mode: SkillsMode;
+  /** `lexical` ranks skills by word overlap with the prompt and asks the classifier nothing; `classifier` asks one question per skill. */
+  rank: "lexical" | "classifier";
   /** Minimum yes-probability for a skill to count as relevant. */
   threshold: number;
   /** Most skills selected per turn, highest probability first. */
@@ -280,6 +282,10 @@ export interface LoadoutConfig {
   /** Classify and record, but never change tools or skills. */
   dryRun: boolean;
   notify: boolean;
+  /** Register the `ask_decision` tool so agents can put a question to the classifier. Read from the global config at load. */
+  decideTool: boolean;
+  /** Classify and send the agent a hint (suggested tool class and skills), but never change or filter anything. */
+  advisory: boolean;
   /** Persist plugin-owned trace records; a machine-level `false` outranks this key. */
   telemetry: boolean;
 }
@@ -301,6 +307,8 @@ export interface LoadoutConfigInput {
   maxPromptChars?: number | null;
   dryRun?: boolean;
   notify?: boolean;
+  decideTool?: boolean;
+  advisory?: boolean;
   telemetry?: boolean;
 }
 

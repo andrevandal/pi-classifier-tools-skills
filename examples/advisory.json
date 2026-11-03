@@ -1,0 +1,18 @@
+{
+  "$comment": "Recommended start: the agent keeps every tool, gets a hint with the lexical top skills, and can ask the classifier a question with ask_decision. Laya over HTTP; copy to ~/.omp/loadout.json.",
+  "backend": "laya",
+  "laya": {
+    "transport": "http",
+    "endpoint": "http://127.0.0.1:8765/",
+    "apiKeyEnvVar": "LAYA_SERVER_TOKEN",
+    "timeoutMs": 4000
+  },
+  "advisory": true,
+  "decideTool": true,
+  "skills": {
+    "enabled": true,
+    "mode": "hint",
+    "rank": "lexical",
+    "maxSkills": 3
+  }
+}

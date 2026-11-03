@@ -20,6 +20,7 @@ import type {
   ToolsDecision,
   ToolsSelectorConfig,
 } from "./types.ts";
+import { rankSkills } from "./rank.ts";
 
 export const TOOLS_QUESTION_ID = "tool_profile";
 const SKILL_QUESTION_PREFIX = "skill:";
@@ -34,7 +35,7 @@ export function skillCandidates(all: SkillCandidate[], config: SkillsSelectorCon
   return all.filter((skill) => !skip.has(skill.name));
 }
 
-function skillQuestion(skill: SkillCandidate): NoulQuestion {
+export function skillQuestion(skill: SkillCandidate): NoulQuestion {
   return {
     type: "noul",
     instructions: `Would an AI coding agent handling this request benefit from loading the skill "${skill.name}"? Skill description: ${skill.description || "(none)"}`,
@@ -47,7 +48,9 @@ function skillQuestion(skill: SkillCandidate): NoulQuestion {
 
 /** Whether skill selection runs this turn, given the candidate count. */
 export function skillsAskable(config: SkillsSelectorConfig, candidates: SkillCandidate[]): boolean {
-  return config.enabled && candidates.length > 0 && candidates.length <= config.maxCandidates;
+  return (
+    config.rank === "classifier" && config.enabled && candidates.length > 0 && candidates.length <= config.maxCandidates
+  );
 }
 
 export function buildQuestions(config: LoadoutConfig, candidates: SkillCandidate[]): Questions {
@@ -145,9 +148,18 @@ export function decideSkills(
   config: SkillsSelectorConfig,
   candidates: SkillCandidate[],
   answers: Answers,
+  prompt = "",
 ): SkillsDecision {
   if (!config.enabled) return { selected: null, scores: {}, reason: "disabled" };
   if (candidates.length === 0) return { selected: null, scores: {}, reason: "no-candidates" };
+  if (config.rank === "lexical") {
+    // No scores: the lexical score is not a probability, so it never enters a record.
+    const ranked = rankSkills(prompt, candidates)
+      .filter((entry) => entry.score > 0)
+      .slice(0, config.maxSkills)
+      .map((entry) => entry.skill.name);
+    return { selected: [...new Set([...config.alwaysInclude, ...ranked])], scores: {}, reason: "selected" };
+  }
   if (candidates.length > config.maxCandidates) return { selected: null, scores: {}, reason: "too-many-candidates" };
 
   const scores: Record<string, number> = {};

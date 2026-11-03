@@ -21,9 +21,18 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { createClassifier } from "./classify/index.ts";
 import { loadConfig } from "./config.ts";
+import {
+  buildDecision,
+  DECIDE_DESCRIPTION,
+  DECIDE_PARAMETERS,
+  DECIDE_QUESTION_ID,
+  DECIDE_TOOL,
+  formatDecision,
+} from "./decide.ts";
 import { explainText, noticeText, type Observation, statsText, statusText } from "./diagnostics.ts";
 import {
   buildQuestions,
+  clipPrompt,
   decideSkills,
   isSlashCommand,
   profileOrder,
@@ -57,6 +66,7 @@ import type {
   SkillsDecision,
   TelemetryState,
 } from "./types.ts";
+import { ClassifierError } from "./types.ts";
 import {
   armDecision,
   clearRetry,
@@ -229,6 +239,9 @@ function ensureSession(ctx: ExtensionContext): SessionState {
   const result = loadConfig(ctx.cwd, { projectTrusted, explicitPath: process.env.LOADOUT_CONFIG || undefined });
   for (const error of result.errors) notify(ctx, result.config, `config error: ${error}`, "error");
   for (const warning of result.warnings) notify(ctx, result.config, `config warning: ${warning}`, "warning");
+  if (result.config.decideTool && !result.config.tools.alwaysOn.includes(DECIDE_TOOL)) {
+    result.config.tools.alwaysOn = [...result.config.tools.alwaysOn, DECIDE_TOOL];
+  }
 
   const classifierKey = classifierKeyFor(result.config);
   const keepClassifier = existing?.classifierKey === classifierKey && existing.holdsClassifier;
@@ -313,10 +326,23 @@ function failureNotice(failure: FailureReason, message: string | null): { text: 
 
 function skillHint(selected: string[]): string {
   return [
-    "Skills most relevant to this request, chosen by a classifier:",
+    "Skills that may fit this request (an automatic suggestion, not a certainty):",
     ...selected.map((name) => `- ${name}`),
-    "Load the relevant ones before starting. Other listed skills are unlikely to apply.",
+    "Load any that fit. Other listed skills may still apply.",
   ].join("\n");
+}
+
+/** The advisory-mode hint: what the classifier suggests, with nothing removed from the agent. Null when it suggests nothing. */
+function adviceFor(decision: NonNullable<TurnOutcome["decision"]>): string | null {
+  const { tools, skills } = decision;
+  const lines: string[] = [];
+  if (tools.reason === "selected" && tools.profile !== null && tools.risk !== null) {
+    lines.push(
+      `Tools: this request looks like "${tools.profile}" work (risk ${tools.risk.toFixed(2)}); no tool was removed.`,
+    );
+  }
+  if (skills.selected !== null && skills.selected.length > 0) lines.push(skillHint(skills.selected));
+  return lines.length > 0 ? lines.join("\n") : null;
 }
 
 /** Everything one hook call learns, so a record can be built after apply/restore whatever happened. */
@@ -373,7 +399,7 @@ async function runHook(
   const questions = buildQuestions(config, candidates);
   if (Object.keys(questions).length === 0) {
     trace.gate = "no-questions";
-    trace.skillsDecision = decideSkills(config.skills, candidates, {});
+    trace.skillsDecision = decideSkills(config.skills, candidates, {}, event.prompt);
     return;
   }
   trace.asked = skillsAskable(config.skills, candidates) ? candidates.length : 0;
@@ -421,10 +447,16 @@ async function runHook(
 
   state.lastFailure = null;
   const selected = decision.skills.selected;
-  if (config.dryRun) {
+  if (config.dryRun || config.advisory) {
+    // Advisory reuses the "dry-run" status: classified, nothing applied, so the record reads the same.
     trace.status = "dry-run";
-    trace.delivery = selected === null ? "none" : "dry-run";
-    return;
+    const advice = config.dryRun ? null : adviceFor(decision);
+    if (advice === null) {
+      trace.delivery = config.dryRun && selected !== null ? "dry-run" : "none";
+      return;
+    }
+    trace.delivery = "hint";
+    return { message: { customType: HINT_MESSAGE, content: advice, display: false } };
   }
 
   if (admitted) {
@@ -683,7 +715,45 @@ function onTurnEnd(pi: ExtensionAPI, event: unknown, ctx: ExtensionContext): voi
   }
 }
 
+/** One `ask_decision` call: never throws, the agent reads the outcome as text. */
+async function decide(ctx: ExtensionContext, args: unknown, signal: AbortSignal | undefined): Promise<string> {
+  const built = buildDecision(args);
+  if (typeof built === "string") return `invalid arguments: ${built}`;
+  const state = ensureSession(ctx);
+  const classifier = classifierFor(state);
+  if (classifier.readiness() === "warming") return "no decision: the classifier is still loading";
+  try {
+    const sent = clipPrompt(built.state, state.config.maxPromptChars);
+    const result = await classifier.classify(
+      sent,
+      { [DECIDE_QUESTION_ID]: built.question },
+      { signal, telemetryOff: true },
+    );
+    return formatDecision(result.answers[DECIDE_QUESTION_ID]);
+  } catch (error) {
+    return `no decision: ${error instanceof ClassifierError ? error.code : "error"}`;
+  }
+}
+
 export default function loadout(pi: ExtensionAPI): void {
+  // Registered at load from the global config only: the host takes tools once, and a tool costs schema tokens on every turn.
+  const registered = loadConfig(process.cwd(), {
+    projectTrusted: false,
+    explicitPath: process.env.LOADOUT_CONFIG || undefined,
+  });
+  if (registered.config.decideTool) {
+    pi.registerTool({
+      name: DECIDE_TOOL,
+      label: "Ask decision",
+      description: DECIDE_DESCRIPTION,
+      parameters: DECIDE_PARAMETERS as never,
+      execute: async (_id, params, signal, _update, ctx) => ({
+        content: [{ type: "text", text: await decide(ctx, params, signal) }],
+        details: {},
+      }),
+    });
+  }
+
   pi.on("session_start", (_event, ctx) => {
     try {
       ensureSession(ctx);

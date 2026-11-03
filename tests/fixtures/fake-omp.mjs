@@ -35,7 +35,7 @@ const answers = {
 };
 const decision = {
   tools: decideTools(full.tools, baseline, answers.tool_profile),
-  skills: decideSkills({ ...full.skills, enabled: true }, candidates, answers),
+  skills: decideSkills({ ...full.skills, enabled: true, rank: "classifier" }, candidates, answers),
 };
 const common = {
   sessionId: "s",

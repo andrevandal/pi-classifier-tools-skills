@@ -72,7 +72,9 @@ flowchart LR
 
 3. **Start a new session** (extensions load at session start) and run
    `/loadout status`. To see what it would choose before letting it act, add
-   `"dryRun": true` to `~/.omp/loadout.json`.
+   `"dryRun": true` to `~/.omp/loadout.json`. The recommended start is
+   [`examples/advisory.json`](examples/advisory.json): the agent keeps every tool, gets a hint with the
+   best-matching skills, and can call `ask_decision` (see `decideTool`).
 
 Upgrade a marketplace install with `omp plugin upgrade pi-classifier-tools-skills@andrevandal`.
 
@@ -107,6 +109,8 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `backend` | `"laya"` | `"laya"` (local sidecar by default, or a shared host via `laya.transport: "http"`) or `"jev"` |
 | `dryRun` | `false` | classify and record, never change anything |
 | `notify` | `true` | show a one-line notice per classified turn, after the tools were applied (skips get none); failures always show |
+| `decideTool` | `false` | register the `ask_decision` tool: an agent passes `ask`, `options` (2 to 12 strings) and optional `context`, and gets the classifier's likeliest option with probabilities (`grep (p=0.70); others: read 0.30`). Advisory, never changes tools; the text is not recorded. Read from the global `~/.omp/loadout.*` (or `LOADOUT_CONFIG`) at load, since the host registers tools once; it costs the tool's schema tokens every turn and is kept active under narrowing via `tools.alwaysOn`. Needs a classifier that answers arbitrary questions: base Laya is near chance, so expect weak answers from it |
+| `advisory` | `false` | classify and send the agent one hint (the suggested tool class, when the answer is within `tools.maxRisk`, and the selected skills), but never remove a tool or filter a skill. Recorded as a `dry-run` decision with a `hint` delivery. `dryRun: true` wins and sends no hint |
 | `telemetry` | `true` | write the plugin's trace records (`loadout.decision`, `loadout.usage`); `false` writes none. A machine-wide `false` in `~/.omp/loadout.*` cannot be overridden (see [Telemetry](#telemetry)) |
 | `maxPromptChars` | `8000` | longest prompt sent to the classifier (min 200; `null` = no limit) |
 | `tools.enabled` | `true` | select tools |
@@ -114,11 +118,12 @@ warnings. Sections merge one level deep over the defaults; `tools.question` and
 | `tools.profiles` | see below | profile id -> tool names, or `"*"` for the whole baseline |
 | `tools.alwaysOn` | `[]` | tools added to every profile (still limited to the baseline) |
 | `tools.maxRisk` | `0.1` | most probability mass allowed on profiles broader than the chosen one; above it the baseline is kept. Profiles must be nested: each one's tools fit inside the next |
-| `skills.enabled` | `false` | select skills; skipped above `maxCandidates`. Unmeasured: the bench and `npm run decisions` do not judge skill choices yet |
+| `skills.enabled` | `false` | select skills; with `rank: "classifier"` skipped above `maxCandidates` |
 | `skills.mode` | `"auto"` | `"auto"`, `"filter"` (pi only), or `"hint"` |
-| `skills.threshold` | `0.5` | minimum yes-probability for a skill to be selected |
+| `skills.rank` | `"lexical"` | `"lexical"` ranks skills by word overlap with the prompt (TF-IDF over name and description) and sends the classifier no skill questions; `"classifier"` asks one question per skill. The tools question is still asked each turn, so a classifier backend is needed either way, and a failed classification sends no hint |
+| `skills.threshold` | `0.5` | classifier rank only: minimum yes-probability for a skill to be selected |
 | `skills.maxSkills` | `5` | most skills selected per turn |
-| `skills.maxCandidates` | `40` | above this many skills, selection is skipped (cost bound) |
+| `skills.maxCandidates` | `40` | classifier rank only: above this many skills, selection is skipped (cost bound) |
 | `skills.alwaysInclude` | `[]` | always selected, never asked about |
 | `skills.exclude` | `[]` | never asked about, never hidden |
 
@@ -340,15 +345,14 @@ Where the records are kept, and how the plugin and the service are updated, rest
   list, which can invalidate the provider's cached prefix. Fewer, coarser
   profiles mean fewer changes. Nothing is called when the selection already
   matches the active tools.
-- **Cost scales with skills.** Every candidate skill is one more `noul`
-  question per turn. `maxCandidates` caps this, and `exclude` / `alwaysInclude`
-  take skills out of the question set.
+- **Cost scales with skills only under `skills.rank: "classifier"`.** There every candidate skill is one more `noul`
+  question per turn; `maxCandidates` caps this, and `exclude` / `alwaysInclude`
+  take skills out of the question set. The default `lexical` ranking asks the classifier nothing about skills.
 - **Wrong narrowing costs more than no narrowing.** Taking `bash` away from a
   turn that needed it hurts more than leaving it available. Keep
   `tools.maxRisk` conservative and use `dryRun` + `/loadout explain` to
   tune profiles against your real prompts.
-- **Laya accuracy.** Base checkpoints are close to chance on custom questions.
-  Use Jev, or a Laya checkpoint fine-tuned on your question set.
+- **Laya accuracy.** Measured on 300 of the author's own prompts, with labels from an LLM judge (subagents, not scripted here) that agreed 94% with what the agent actually used: base Laya at `maxRisk` 0.1 narrows 3% of turns (2% of all turns over-narrowed), so it saves almost nothing; at 0.3 it narrows 18% and over-narrows 12%. For skills it is near chance (right skill in the top 3 for 3-11% of prompts), while the lexical ranker finds it in the top 3 for 47% and the top 10 for 67%. That is why `skills.rank` defaults to `lexical` and why [`advisory`](#configuration) is the recommended start. A Laya checkpoint fine-tuned on your own prompts is untested here. `scripts/mine-labels.ts`, `eval-classifier.ts` and `eval-skills.ts --judged` reproduce the measurements from your own sessions.
 - **Privacy.** The default Laya sidecar keeps everything local. With Jev, prompt
   text (clipped to `maxPromptChars`) and skill names and descriptions are sent
   to TypeSafe. The `loadout.decision` entries hold no prompt text, descriptions or backend responses; see [Telemetry](#telemetry).
