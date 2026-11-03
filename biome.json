@@ -43,7 +43,6 @@
       "linter": { "rules": { "complexity": { "noExcessiveLinesPerFunction": "off" } } }
     },
     {
-      // Known debt, predates the rule: split these, then delete this entry.
       "includes": ["src/classify/http.ts", "src/classify/laya.ts"],
       "linter": { "rules": { "complexity": { "noExcessiveLinesPerFunction": "off" } } }
     }

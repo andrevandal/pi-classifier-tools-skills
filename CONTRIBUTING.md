@@ -112,6 +112,8 @@ npm run lint
 ```
 
 - Keep `src/select.ts` pure (no I/O).
+- Functions in `src/` stay under 65 lines (`npm run lint` enforces it). `src/classify/http.ts` and `src/classify/laya.ts`
+  are exempt in `biome.json` as known debt: split them and drop the exemption.
 - A selection must remain a **subset of the baseline**, and "don't know" must keep everything.
   Do not weaken those guarantees (see [Guarantees](README.md#guarantees)).
 - Add a test for behavior changes that a user could see. Do not add tests that only restate the
